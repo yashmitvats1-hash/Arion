@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arion"
+version = "0.1.0"
+description = "Arion - autonomous personal computing system (agentic spine vertical slice)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+arion = "arion.interfaces.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["arion*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
