@@ -71,6 +71,8 @@ class ArionEngine:
         actor: Actor | None = None,
         memory: Any | None = None,
         reflector: Any | None = None,
+        cognition: Any | None = None,
+        belief_deriver: Any | None = None,
     ):
         self.storage = storage
         self.registry = registry
@@ -82,6 +84,8 @@ class ArionEngine:
         self.actor = actor or Actor.agent("system")
         self.memory = memory  # optional MemoryStore (ADR-012); None disables memory
         self.reflector = reflector  # optional Reflector; deterministic by default
+        self.cognition = cognition  # optional CognitiveState facade (ADR-014)
+        self.belief_deriver = belief_deriver  # optional BeliefDeriver; deterministic by default
 
     # ---------- public API ----------
 
@@ -223,6 +227,21 @@ class ArionEngine:
             task_id=task.id,
             detail={"steps": [s.to_dict() for s in steps]},
         )
+        # Audit memory-driven plan transformation (non-mutating, provenance-
+        # carrying). The ORIGINAL plan + every decision are recorded; guidance
+        # remains informational - authorization still decides at execution.
+        transformation = getattr(self.planner, "last_transformation", None)
+        if transformation is not None and transformation.decisions:
+            self._emit(
+                "planning.memory.transformation",
+                task_id=task.id,
+                detail={
+                    "transformed_steps": len(transformation.transformed),
+                    "original_steps": len(transformation.original),
+                    "decisions": transformation.decisions[:20],
+                    "decision_count": len(transformation.decisions),
+                },
+            )
         self._checkpoint(task, reason="plan produced")
         return task
 
@@ -575,10 +594,49 @@ class ArionEngine:
                 detail={"reflection_id": reflection.reflection_id, "episode_id": episode.episode_id},
             )
 
+            # Cognitive state: derive + store beliefs (semantic/procedural)
+            # with full provenance (ADR-014). Informational only.
+            self._derive_beliefs(episode, reflection)
+
             # Consolidation: deterministic duplicate/lesson merging (never deletes).
             self._consolidate(task.id)
         except Exception:
             # Memory is best-effort; never break the task lifecycle.
+            pass
+
+    def _derive_beliefs(self, episode, reflection) -> None:
+        """Derive + store cognitive beliefs from the latest experience.
+
+        Every belief carries provenance (episode/reflection/guidance ids),
+        confidence, timestamps, and source. Best-effort: cognitive state must
+        never break the task loop. Informational only.
+        """
+        if self.cognition is None or self.belief_deriver is None:
+            return
+        try:
+            from arion.memory.guidance import DeterministicMemoryGuidance
+
+            guidance = DeterministicMemoryGuidance().build([episode], [reflection])
+            beliefs = self.belief_deriver.derive([episode], [reflection], guidance)
+            store = self.cognition.cognition  # SQLiteCognitiveStore behind the facade
+            for b in beliefs:
+                existing = store.list_beliefs(category=b.category, limit=1000)
+                if any(e.statement == b.statement and e.confidence >= b.confidence for e in existing):
+                    continue
+                store.record_belief(b)
+                self._emit(
+                    "belief.derived",
+                    task_id=episode.task_id,
+                    detail={
+                        "belief_id": b.belief_id,
+                        "category": b.category,
+                        "confidence": round(b.confidence, 3),
+                        "importance": round(b.importance, 3),
+                        "provenance": b.provenance,
+                        "source": b.source,
+                    },
+                )
+        except Exception:
             pass
 
     def _consolidate(self, task_id: str) -> None:

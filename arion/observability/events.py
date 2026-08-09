@@ -41,6 +41,8 @@ EVENT_KINDS = (
     "reflection.created",
     "planning.context.created",
     "planning.memory.influence",
+    "planning.memory.transformation",
+    "belief.derived",
     "capability.discovered",
     "capability.executed",
     "observation.recorded",

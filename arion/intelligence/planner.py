@@ -43,6 +43,7 @@ class DeterministicPlanner:
 
     def __init__(self, router: ModelRouter | None = None):
         self._router = router  # reserved: planner can consult the router later
+        self.last_transformation = None  # PlanTransformation | None (audit, ADR-013)
 
     def plan(
         self,
@@ -100,10 +101,21 @@ class DeterministicPlanner:
         # Memory-driven planning: if the context carries structured guidance
         # (from prior experience), re-target steps away from known-failing
         # resources. Informational only - authorization still decides.
+        # Non-mutating + auditable: the original plan is retained in
+        # self.last_transformation, and each transformed step carries its
+        # guidance provenance.
+        self.last_transformation = None
         if context is not None and getattr(context, "guidance", None):
-            from arion.memory.guidance import apply_guidance_to_steps
+            from arion.memory.guidance import apply_guidance_to_steps, registry_resource_param
 
-            steps, _ = apply_guidance_to_steps(steps, context.guidance)
+            transformation = apply_guidance_to_steps(
+                steps,
+                context.guidance,
+                resource_param_resolver=lambda cap, act: registry_resource_param(registry, cap, act),
+                action_meta_resolver=lambda cap, act: registry.action_spec(cap, act),
+            )
+            self.last_transformation = transformation
+            steps = transformation.transformed
         return steps
 
     @staticmethod

@@ -82,13 +82,28 @@ def build_parser() -> argparse.ArgumentParser:
     mem_consol = mem_sub.add_parser("consolidate", help="run deterministic consolidation", parents=[common, common_memory])
     mem_consol.add_argument("--limit", type=int, default=200)
 
+    cog = sub.add_parser("cognition", help="inspect the cognitive state / world model (ADR-014)")
+    cog.add_argument("--db", default=None, dest="db_cog", help=argparse.SUPPRESS)
+    cog_sub = cog.add_subparsers(dest="cognition_command", required=True)
+
+    cog_beliefs = cog_sub.add_parser("beliefs", help="list derived beliefs", parents=[common, common_memory])
+    cog_beliefs.add_argument("--category", default=None)
+
+    cog_prefs = cog_sub.add_parser("preferences", help="list user preferences", parents=[common, common_memory])
+
+    cog_env = cog_sub.add_parser("environment", help="list environment facts", parents=[common, common_memory])
+
+    cog_snap = cog_sub.add_parser("snapshot", help="full cognitive snapshot", parents=[common, common_memory])
+    cog_snap.add_argument("--refresh", action="store_true", help="re-derive beliefs from memory first")
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     root = Path(__file__).resolve().parent.parent.parent
-    db_path = args.db or args.db_global or getattr(args, "db_mem", None) or str(root / "arion_data" / "arion.db")
+    db_path = (args.db or args.db_global or getattr(args, "db_mem", None)
+               or getattr(args, "db_cog", None) or str(root / "arion_data" / "arion.db"))
 
     engine = build_engine(
         db_path=db_path,
@@ -124,9 +139,73 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  - {action['name']} (scope: {action['required_scope']})")
     elif args.command == "memory":
         return _memory_command(args, engine)
+    elif args.command == "cognition":
+        return _cognition_command(args, engine)
 
     storage.close()
     return 0
+
+
+def _cognition_command(args, engine) -> int:
+    """arion cognition beliefs|preferences|environment|snapshot"""
+    import json
+
+    cognition = getattr(engine, "cognition", None)
+    if cognition is None:
+        print("cognitive state is disabled for this engine")
+        return 1
+
+    def _emit(obj):
+        if getattr(args, "json", False):
+            print(json.dumps(obj, indent=2, default=str))
+        else:
+            print(obj)
+
+    if args.cognition_command == "beliefs":
+        beliefs = cognition.cognition.list_beliefs(category=args.category, limit=200)
+        if args.json:
+            _emit([b.to_dict() for b in beliefs])
+            return 0
+        for b in beliefs:
+            print(f"{b.belief_id}  [{b.category}] conf={b.confidence:.2f} src={b.source}  {b.statement[:100]}")
+        return 0
+
+    if args.cognition_command == "preferences":
+        prefs = cognition.cognition.list_preferences(limit=200)
+        if args.json:
+            _emit([p.to_dict() for p in prefs])
+            return 0
+        for p in prefs:
+            print(f"{p.preference_id}  {p.key}={p.value}  user={p.user} src={p.source}")
+        return 0
+
+    if args.cognition_command == "environment":
+        facts = cognition.cognition.list_environment_facts(limit=200)
+        if args.json:
+            _emit([f.to_dict() for f in facts])
+            return 0
+        for f in facts:
+            print(f"{f.key} = {json.dumps(f.value, default=str)[:120]}  src={f.source}")
+        return 0
+
+    if args.cognition_command == "snapshot":
+        if getattr(args, "refresh", False):
+            count = cognition.refresh_from_memory(limit=50)
+            print(f"re-derived {count} new belief(s) from memory")
+        snap = cognition.snapshot(limit_beliefs=50)
+        _emit(
+            f"beliefs: {snap.counts['beliefs']} | preferences: {snap.counts['preferences']} | "
+            f"environment: {snap.counts['environment']}"
+            if not args.json else snap.to_dict(limit_beliefs=50)
+        )
+        if args.json:
+            return 0
+        for b in snap.beliefs[:10]:
+            print(f"  belief [{b.category}] conf={b.confidence:.2f}: {b.statement[:90]}")
+        return 0
+
+    print(f"unknown cognition command: {args.cognition_command}")
+    return 1
 
 
 def _memory_command(args, engine) -> int:

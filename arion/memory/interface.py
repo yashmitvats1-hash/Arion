@@ -38,4 +38,14 @@ class MemoryStore(Protocol):
     def record_consolidation(self, record: Any) -> None: ...
     def list_consolidations(self, limit: int = 50) -> list: ...
 
+    # ---- archival / pruning seam (ADR-014) ----
+    # Consolidation PRESERVES history and therefore does not bound physical
+    # storage. This is the DESIGNED seam for a future archival/pruning policy
+    # (delete/archive episodes older than X, cap episode count, etc.). It is
+    # intentionally NOT implemented yet - memory is never deleted in this
+    # milestone. Implementations should raise NotImplementedError until the
+    # archival policy is designed and approved.
+
+    def prune(self, older_than: str | None = None, max_episodes: int | None = None) -> int: ...
+
     def close(self) -> None: ...

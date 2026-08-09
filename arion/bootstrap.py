@@ -12,6 +12,9 @@ from typing import Any
 
 from arion.capabilities.filesystem import FilesystemReadCapability
 from arion.capabilities.registry import CapabilityRegistry
+from arion.cognition.deriver import DeterministicBeliefDeriver
+from arion.cognition.state import CognitiveState
+from arion.cognition.store import SQLiteCognitiveStore
 from arion.intelligence.planner import DeterministicPlanner
 from arion.intelligence.router import DeterministicRouter
 from arion.observability.events import EventLogger, JsonlFileSink
@@ -36,6 +39,7 @@ def build_engine(
     planner: Any | None = None,
     router: Any | None = None,
     memory: bool = True,
+    cognition: bool = True,
 ) -> ArionEngine:
     storage = SQLiteStorage(db_path)
 
@@ -64,6 +68,25 @@ def build_engine(
     # + reflections. Memory is informational - never an authorization mechanism.
     memory_store = SQLiteMemoryStore(db_path) if memory else None
 
+    # Cognitive State / World Model v1 (ADR-014): semantic beliefs, procedural
+    # knowledge, preferences, environment facts - all with provenance, derived
+    # deterministically. Informational only.
+    cognition_facade = None
+    belief_deriver = None
+    if cognition and memory_store is not None:
+        from arion.cognition.models import EnvironmentFact
+
+        cognitive_store = SQLiteCognitiveStore(db_path)
+        belief_deriver = DeterministicBeliefDeriver()
+        cognition_facade = CognitiveState(memory_store, cognitive_store, belief_deriver)
+        # environment layer: record a current system fact (idempotent by key)
+        cognitive_store.record_environment_fact(EnvironmentFact(
+            fact_id="fact_capabilities",
+            key="registered_capabilities",
+            value=sorted(registry.list()),
+            source="system",
+        ))
+
     return ArionEngine(
         storage=storage,
         registry=registry,
@@ -74,4 +97,6 @@ def build_engine(
         approval_handler=approval_handler,
         memory=memory_store,
         reflector=DeterministicReflector() if memory else None,
+        cognition=cognition_facade,
+        belief_deriver=belief_deriver,
     )

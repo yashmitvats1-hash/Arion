@@ -67,6 +67,13 @@ count, importance). History is NEVER deleted. Importance decays with age
 (same source set not re-consolidated), so repeated identical lessons cannot
 pile up forever.
 
+**Storage semantics (clarified):** consolidation preserves history and
+therefore does NOT itself bound physical storage. Bounded memory growth is a
+separate concern: the archival/pruning seam is designed in ADR-014
+(`MemoryStore.prune` — intentionally raising NotImplementedError until the
+archival policy is approved). Consolidation optimizes retrieval/repetition,
+never storage size, and never deletes.
+
 ### 5. Provenance
 
 `PlanningContext` keeps structured `provenance` (episode_ids, reflection_ids,

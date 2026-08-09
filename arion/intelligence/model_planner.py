@@ -32,6 +32,7 @@ class RealModelPlanner:
     def __init__(self, router: ModelRouter, events: Any | None = None):
         self.router = router
         self.events = events  # duck-typed EventLogger (any object with .emit)
+        self.last_transformation = None  # PlanTransformation | None (audit, ADR-013)
 
     def plan(
         self,
@@ -50,6 +51,7 @@ class RealModelPlanner:
                 router_context["memory"] = context.digest()
             except Exception:
                 pass
+        self.last_transformation = None
         try:
             schema: PlanSchema = self.router.plan_structured(goal_description, catalog, router_context)
             steps = PlanValidator(registry).validate(schema)
@@ -72,6 +74,20 @@ class RealModelPlanner:
             )
             raise PlanValidationError(str(exc)) from exc
         self._emit("plan.validation.passed", task_id=task_id, detail={"steps": len(steps)})
+
+        # Memory-driven guidance applied AFTER validation (registry-aware,
+        # non-mutating, auditable). Informational only - authorization decides.
+        if context is not None and getattr(context, "guidance", None):
+            from arion.memory.guidance import apply_guidance_to_steps, registry_resource_param
+
+            transformation = apply_guidance_to_steps(
+                steps,
+                context.guidance,
+                resource_param_resolver=lambda cap, act: registry_resource_param(registry, cap, act),
+                action_meta_resolver=lambda cap, act: registry.action_spec(cap, act),
+            )
+            self.last_transformation = transformation
+            steps = transformation.transformed
         return steps
 
     def _emit(self, kind: str, task_id: str | None, success: bool = True, detail: dict[str, Any] | None = None) -> None:

@@ -62,6 +62,7 @@ class PlanStep:
     result: dict[str, Any] | None = None
     error: str | None = None
     depends_on: list[int] = field(default_factory=list)  # indices of prerequisite steps
+    guidance: list[dict[str, Any]] = field(default_factory=list)  # memory-driven transformation provenance (informational)
 
     def to_dict(self) -> dict[str, Any]:
         d = {
@@ -80,6 +81,8 @@ class PlanStep:
         }
         if self.depends_on:
             d["depends_on"] = self.depends_on
+        if self.guidance:
+            d["guidance"] = self.guidance
         return d
 
     @classmethod
@@ -99,6 +102,7 @@ class PlanStep:
             result=d.get("result"),
             error=d.get("error"),
             depends_on=list(d.get("depends_on", []) or []),
+            guidance=list(d.get("guidance", []) or []),
         )
 
 

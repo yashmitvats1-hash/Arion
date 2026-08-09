@@ -150,6 +150,33 @@ Memory is INFORMATIONAL — it never authorizes (`Memory ≠ Authority`):
 - **Poisoning defenses**: adversarial memory/reflection content stays
   informational; all authorization answers come from the current policy.
 
+## Cognitive State / World Model v1 (ADR-014)
+
+Five cognitive layers, distinct from episodic memory:
+
+- **episodic** (what happened) — `arion/memory` episodes/reflections
+- **semantic** (what Arion believes) — `arion/cognition` Beliefs
+- **procedural** (how to do things) — reflections + guidance + procedural beliefs
+- **preference** (user-specific) — `arion/cognition` Preferences
+- **environment** (current world state) — `arion/cognition` EnvironmentFacts
+
+Every derived belief carries provenance (episode/reflection/guidance ids),
+confidence, timestamps, and source (deterministic|model);
+`DeterministicBeliefDeriver` is the reference path. `CognitiveState` facade +
+`SQLiteCognitiveStore` (same DB file; restart-safe). **Informational only** —
+beliefs can never authorize (tested).
+
+- **Archival/pruning seam:** consolidation preserves history, so it does not
+  bound storage; `MemoryStore.prune` is the designed (not-yet-implemented)
+  seam for a future archival policy — memory is never deleted.
+- **Strategy-level learning:** `apply_guidance_to_steps` is non-mutating,
+  registry-aware (ActionSpec.resource_param — no hardcoded `path`), and can
+  substitute actions (different decomposition) with verification adopted from
+  the registry. `PlanTransformation` retains original + transformed plans with
+  per-decision provenance; audited via `planning.memory.transformation`; each
+  transformed step carries its provenance.
+- CLI: `arion cognition beliefs|preferences|environment|snapshot [--json]`.
+
 ## Structured intelligence boundary (ADR-011)
 
 ```

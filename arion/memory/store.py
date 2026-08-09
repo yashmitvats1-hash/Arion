@@ -258,6 +258,19 @@ class SQLiteMemoryStore:
             ))
         return out
 
+    def prune(self, older_than: str | None = None, max_episodes: int | None = None) -> int:
+        """Archival/pruning seam (ADR-014) - intentionally NOT implemented.
+
+        Consolidation preserves history and therefore does not bound physical
+        storage; this seam is where a future archival policy (age-based,
+        count-capped, or importance-weighted pruning/archival) will live.
+        Memory is never deleted in this milestone.
+        """
+        raise NotImplementedError(
+            "archival/pruning seam (ADR-014): not yet implemented - memory is never deleted; "
+            "design the archival policy before enabling this"
+        )
+
     def close(self) -> None:
         self._conn.close()
 

@@ -1,4 +1,4 @@
-"""Memory-driven planning guidance (learning milestone).
+"""Memory-driven planning guidance (learning milestone, hardened).
 
 Converts relevant prior experience into STRUCTURED planning guidance that a
 planner can consume to choose a different (safer) strategy. The mechanism is
@@ -6,7 +6,7 @@ reusable across capabilities:
 
     previous outcome + capability/action + failure category
     + recommendation + confidence + importance + relevance
-    -> MemoryGuidance(category, capability, action, resource, ...)
+    -> MemoryGuidance(category, capability, action, resource, strategy)
 
 Categories:
   avoid   - do not target (capability, action, resource) - prior denial/failure
@@ -17,21 +17,36 @@ Guidance is deterministic, bounded, and traceable (episode_id, reflection_id).
 It is INFORMATIONAL: it can only change what the planner PROPOSES. The
 authorization layer decides what may actually run.
 
-apply_guidance_to_steps implements the deterministic plan transform: a step
-targeting an "avoid" resource is re-targeted to a "prefer" resource for the
-same capability/action, or dropped if no safe alternative exists.
+apply_guidance_to_steps implements the deterministic, NON-MUTATING plan
+transform:
+
+- resources are resolved through a resolver callback (capability registry
+  ActionSpec.resource_param), NEVER a hardcoded "path" assumption;
+- the ORIGINAL plan is retained (deep copies) alongside the transformed plan;
+- every transformation records provenance (guidance_id, episode_id,
+  reflection_id) both in the decisions list and on the transformed PlanStep;
+- strategy-level changes: an avoid'ed step is (1) resource-substituted when a
+  'prefer' exists for the same action, (2) action-substituted when a 'prefer'
+  exists for a DIFFERENT action of the same capability (materially different
+  execution strategy), or (3) dropped.
 """
 
 from __future__ import annotations
 
+import copy
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from arion.memory.models import Episode, Reflection
 from arion.state.models import PlanStep, new_id
 
 GUIDANCE_CATEGORIES = ("avoid", "prefer", "informational")
+
+# resource_param resolver: (capability, action) -> param key holding the resource
+ResourceParamResolver = Callable[[str, str], str | None]
+# action metadata resolver: (capability, action) -> ActionSpec | None (registry)
+ActionMetaResolver = Callable[[str, str], Any | None]
 
 
 @dataclass
@@ -43,6 +58,7 @@ class MemoryGuidance:
     capability: str | None = None
     action: str | None = None
     resource: str | None = None
+    strategy: str | None = None        # e.g. "alternative_action", "defer", "verify_alt"
     reason: str = ""
     recommendation: str = ""
     episode_id: str = ""
@@ -57,6 +73,7 @@ class MemoryGuidance:
             "capability": self.capability,
             "action": self.action,
             "resource": self.resource,
+            "strategy": self.strategy,
             "reason": self.reason,
             "recommendation": self.recommendation,
             "episode_id": self.episode_id,
@@ -64,6 +81,33 @@ class MemoryGuidance:
             "confidence": self.confidence,
             "importance": round(self.importance, 2),
         }
+
+
+@dataclass
+class PlanTransformation:
+    """Auditable, non-mutating result of applying guidance to a plan.
+
+    original    - the plan BEFORE guidance (deep copies of the input)
+    transformed - the plan AFTER guidance (new objects; originals untouched)
+    decisions   - provenance for every transformation applied
+    """
+
+    original: list[PlanStep]
+    transformed: list[PlanStep]
+    decisions: list[dict[str, Any]]
+
+
+def registry_resource_param(registry, capability: str, action: str) -> str | None:
+    """Resolve an action's resource parameter from the capability registry."""
+    if registry is None:
+        return None
+    try:
+        spec = registry.action_spec(capability, action)
+    except Exception:
+        return None
+    if spec is not None and spec.resource_kind and spec.resource_param:
+        return spec.resource_param
+    return None
 
 
 def _entry_for_resource(episode: Episode, resource: str) -> dict | None:
@@ -135,6 +179,7 @@ def build_guidance_for_episode(episode: Episode, reflection: Reflection | None =
             capability=cap,
             action=act,
             resource=resource,
+            strategy="defer",  # authorization-driven avoidance: defer / do not attempt
             reason="; ".join(str(r) for r in reasons if r)[:300] or "authorization denied",
             **base,
         )
@@ -156,6 +201,7 @@ def build_guidance_for_episode(episode: Episode, reflection: Reflection | None =
             capability=cap,
             action=act,
             resource=resource,
+            strategy="alternative_action",  # strategy-level: prefer a different approach
             reason=reason,
             **base,
         )
@@ -211,32 +257,51 @@ class DeterministicMemoryGuidance:
 
 
 # ---------------------------------------------------------------------------
-# Deterministic plan transform
+# Deterministic, non-mutating plan transform
 # ---------------------------------------------------------------------------
 
 
-def apply_guidance_to_steps(steps: list[PlanStep], guidance: list[MemoryGuidance]) -> tuple[list[PlanStep], list[dict[str, Any]]]:
-    """Re-target steps away from known-failing resources.
+def apply_guidance_to_steps(
+    steps: list[PlanStep],
+    guidance: list[MemoryGuidance],
+    resource_param_resolver: ResourceParamResolver | None = None,
+    action_meta_resolver: ActionMetaResolver | None = None,
+) -> PlanTransformation:
+    """Re-target steps away from known-failing resources WITHOUT mutating inputs.
 
-    For each step targeting (capability, action, resource) with an 'avoid'
-    guidance entry, substitute the corresponding 'prefer' resource (same
-    capability+action) if one exists; otherwise drop the step. Returns the
-    transformed steps plus a record of every applied decision (for audit).
+    Resource params are resolved via the resolver (capability registry
+    ActionSpec.resource_param) - never a hardcoded 'path' assumption.
 
-    Deterministic and explainable - no model involved.
+    Strategy per avoid'ed step:
+      1. resource_substitution - a 'prefer' exists for the same capability+action
+      2. action_substitution   - a 'prefer' exists for a DIFFERENT action of the
+                                 same capability (materially different strategy)
+      3. step_skipped          - no safe alternative: drop the doomed step
+
+    Returns PlanTransformation(original, transformed, decisions); every
+    decision records provenance (guidance/episode/reflection ids), and each
+    transformed step carries its provenance in step.guidance.
     """
+    original = [copy.deepcopy(s) for s in steps]
+    resolver = resource_param_resolver or (lambda capability, action: "path")
+
     avoid = [g for g in guidance if g.category == "avoid" and g.capability and g.resource]
-    prefer = {
+    prefer_by_action = {
         (g.capability, g.action): g
         for g in guidance
         if g.category == "prefer" and g.capability and g.resource
     }
-    applied: list[dict[str, Any]] = []
-    out: list[PlanStep] = []
-    for step in steps:
-        target = step.params.get("path")  # resource param used by filesystem actions
+    prefer_by_capability: dict[str, list[MemoryGuidance]] = {}
+    for g in prefer_by_action.values():
+        prefer_by_capability.setdefault(g.capability, []).append(g)
+
+    decisions: list[dict[str, Any]] = []
+    transformed: list[PlanStep] = []
+    for step in original:
+        param_key = resolver(step.capability, step.action)
+        target = step.params.get(param_key) if param_key else None
         if not isinstance(target, str):
-            out.append(step)
+            transformed.append(copy.deepcopy(step))
             continue
         hit = next(
             (g for g in avoid
@@ -244,29 +309,83 @@ def apply_guidance_to_steps(steps: list[PlanStep], guidance: list[MemoryGuidance
             None,
         )
         if hit is None:
-            out.append(step)
+            transformed.append(copy.deepcopy(step))
             continue
-        alt = prefer.get((step.capability, step.action))
+
+        s = copy.deepcopy(step)
+
+        # Strategy 1: resource substitution (same capability+action, safe resource)
+        alt = prefer_by_action.get((step.capability, step.action))
         if alt is not None and alt.resource:
-            step.params["path"] = alt.resource
-            applied.append({
-                "step_index": step.index,
+            s.params[param_key] = alt.resource
+            provenance = {
                 "category": "resource_substitution",
-                "avoid": {"capability": hit.capability, "action": hit.action, "resource": hit.resource},
-                "prefer": {"capability": alt.capability, "action": alt.action, "resource": alt.resource},
+                "capability": step.capability,
+                "action": step.action,
+                "original_resource": target,
+                "new_resource": alt.resource,
                 "guidance_id": alt.guidance_id,
                 "episode_id": alt.episode_id,
                 "reflection_id": alt.reflection_id,
-            })
-            out.append(step)
-        else:
-            applied.append({
-                "step_index": step.index,
-                "category": "step_skipped",
-                "avoid": {"capability": hit.capability, "action": hit.action, "resource": hit.resource},
-                "guidance_id": hit.guidance_id,
-                "episode_id": hit.episode_id,
-                "reflection_id": hit.reflection_id,
-            })
-            # no safe alternative: drop the doomed step
-    return out, applied
+            }
+            decisions.append({"step_index": step.index, **provenance})
+            s.guidance.append(provenance)
+            transformed.append(s)
+            continue
+
+        # Strategy 2: action substitution (different action, same capability)
+        alt_action = None
+        for g in prefer_by_capability.get(step.capability, []):
+            if g.action != step.action and g.resource:
+                alt_action = g
+                break
+        if alt_action is not None:
+            new_key = resolver(step.capability, alt_action.action)
+            s.action = alt_action.action
+            if new_key:
+                s.params = {new_key: alt_action.resource}
+            # adopt the NEW action's verification expectations from the
+            # registry (e.g. list -> non_empty, not the old read's schema_keys)
+            if action_meta_resolver is not None:
+                try:
+                    new_spec = action_meta_resolver(step.capability, s.action)
+                    if new_spec is not None and new_spec.default_verification:
+                        from arion.state.models import VerificationPolicy
+
+                        dv = new_spec.default_verification
+                        s.verification = VerificationPolicy(
+                            policy=dv.get("policy", "non_empty"),
+                            args=dv.get("args", {}),
+                        )
+                except Exception:
+                    pass
+            provenance = {
+                "category": "action_substitution",
+                "strategy": "alternative_action",
+                "capability": step.capability,
+                "original_action": step.action,
+                "new_action": alt_action.action,
+                "original_resource": target,
+                "new_resource": alt_action.resource,
+                "guidance_id": alt_action.guidance_id,
+                "episode_id": alt_action.episode_id,
+                "reflection_id": alt_action.reflection_id,
+            }
+            decisions.append({"step_index": step.index, **provenance})
+            s.guidance.append(provenance)
+            transformed.append(s)
+            continue
+
+        # Strategy 3: no safe alternative -> skip the doomed step
+        provenance = {
+            "category": "step_skipped",
+            "capability": step.capability,
+            "action": step.action,
+            "resource": target,
+            "guidance_id": hit.guidance_id,
+            "episode_id": hit.episode_id,
+            "reflection_id": hit.reflection_id,
+        }
+        decisions.append({"step_index": step.index, **provenance})
+
+    return PlanTransformation(original=original, transformed=transformed, decisions=decisions)
