@@ -69,6 +69,8 @@ class ArionEngine:
         policy: PermissionPolicy | None = None,
         approval_handler: ApprovalHandler | None = None,
         actor: Actor | None = None,
+        memory: Any | None = None,
+        reflector: Any | None = None,
     ):
         self.storage = storage
         self.registry = registry
@@ -78,6 +80,8 @@ class ArionEngine:
         self.policy = policy or ResourcePolicy()
         self.approval_handler = approval_handler or PendingApprovalHandler()
         self.actor = actor or Actor.agent("system")
+        self.memory = memory  # optional MemoryStore (ADR-012); None disables memory
+        self.reflector = reflector  # optional Reflector; deterministic by default
 
     # ---------- public API ----------
 
@@ -131,6 +135,7 @@ class ArionEngine:
         if not task.steps:
             task = self._plan(task)
             if task.status == TaskStatus.FAILED:
+                self._record_memory(task)
                 return task
         elif checkpoint is None:
             # Dependency-aware execution: for hand-built plans, validate and
@@ -148,6 +153,7 @@ class ArionEngine:
                     "category": getattr(exc, "category", "unknown"),
                 })
                 self._emit("task.failed", task_id=task.id, detail={"error": task.error})
+                self._record_memory(task)
                 return task
 
         while True:
@@ -170,6 +176,7 @@ class ArionEngine:
                 task.completed_at = utcnow()
                 self.storage.save_task(task)
                 self._emit("task.failed", task_id=task.id, detail={"step_index": step.index, "error": task.error})
+                self._record_memory(task)
                 return task
 
             if step.index + 1 >= len(task.steps):
@@ -178,6 +185,7 @@ class ArionEngine:
                 self.storage.save_task(task)
                 self._checkpoint(task, reason="task completed")
                 self._emit("task.completed", task_id=task.id, detail={"steps": len(task.steps)})
+                self._record_memory(task)
                 return task
 
             task.current_step += 1
@@ -192,8 +200,9 @@ class ArionEngine:
     def _plan(self, task: Task) -> Task:
         self._emit("task.planning", task_id=task.id)
         task.status = TaskStatus.PLANNING
+        context = self._build_planning_context(task)
         try:
-            steps = self.planner.plan(task.description, task.id, self.registry)
+            steps = self.planner.plan(task.description, task.id, self.registry, context=context)
         except Exception as exc:  # planner/validator/provider failure: degrade gracefully
             task.status = TaskStatus.FAILED
             task.error = f"planning failed: {exc}"
@@ -454,6 +463,86 @@ class ArionEngine:
             task_id=task.id,
             detail={"checkpoint_id": ckpt.id, "step_index": ckpt.step_index, "reason": reason},
         )
+
+    # ---------- memory integration (ADR-012) ----------
+
+    def _build_planning_context(self, task: Task):
+        """Retrieve relevant, bounded memory for the planner (or None if memory
+        is disabled). Memory informs planning; it never authorizes."""
+        if self.memory is None:
+            return None
+        try:
+            from arion.memory.models import ContextBudget
+            from arion.memory.retrieval import MemoryRetriever, build_planning_context
+
+            retriever = MemoryRetriever(self.memory)
+            ctx = build_planning_context(retriever, task.description, ContextBudget())
+            self._emit(
+                "memory.retrieval.completed",
+                task_id=task.id,
+                detail={
+                    "episodes": len(ctx.episodes),
+                    "reflections": len(ctx.reflections),
+                    "tags": ctx.all_tags()[:20],
+                    "budget": {"max_episodes": ctx.budget.max_episodes, "max_chars": ctx.budget.max_chars},
+                },
+            )
+            self._emit(
+                "planning.context.created",
+                task_id=task.id,
+                detail={"episodes": len(ctx.episodes), "reflections": len(ctx.reflections)},
+            )
+            return ctx
+        except Exception:
+            # Memory must never break planning.
+            return None
+
+    def _record_memory(self, task: Task) -> None:
+        """Record a structured episode + reflection for a terminal task.
+
+        Runs best-effort: memory failure never changes task outcome. Stores
+        structured summaries only - never secrets, credentials, raw prompts,
+        or raw model responses.
+        """
+        if self.memory is None:
+            return
+        try:
+            from arion.memory.lifecycle import build_episode_from_task
+            from arion.memory.reflector import DeterministicReflector
+
+            events = []
+            try:
+                events = self.storage.list_events(task.id)
+            except Exception:
+                events = []
+            episode = build_episode_from_task(task, events)
+            self.memory.record_episode(episode)
+            self._emit(
+                "memory.episode.recorded",
+                task_id=task.id,
+                detail={
+                    "episode_id": episode.episode_id,
+                    "outcome": episode.outcome,
+                    "tags": episode.tags[:20],
+                    "importance": round(episode.importance, 2),
+                },
+            )
+
+            reflector = self.reflector or DeterministicReflector()
+            reflection = reflector.reflect(episode)
+            self.memory.record_reflection(reflection)
+            try:
+                self.memory.link_reflection(episode.episode_id, reflection.reflection_id)
+            except Exception:
+                pass
+            self._emit(
+                "reflection.created",
+                task_id=task.id,
+                detail={"reflection_id": reflection.reflection_id, "episode_id": episode.episode_id},
+            )
+        except Exception:
+            # Memory is best-effort; never break the task lifecycle.
+            pass
 
     def _emit(
         self,

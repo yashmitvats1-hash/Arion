@@ -33,11 +33,25 @@ class RealModelPlanner:
         self.router = router
         self.events = events  # duck-typed EventLogger (any object with .emit)
 
-    def plan(self, goal_description: str, task_id: str, registry: CapabilityRegistry) -> list[PlanStep]:
+    def plan(
+        self,
+        goal_description: str,
+        task_id: str,
+        registry: CapabilityRegistry,
+        context: Any | None = None,
+    ) -> list[PlanStep]:
         catalog = registry.capabilities_summary()
         self._emit("planning.requested", task_id=task_id, detail={"goal": goal_description[:200]})
+        # Memory context is informational: a bounded digest handed to the model.
+        # It can never authorize anything - the validator + policy decide that.
+        router_context: dict[str, Any] = {"task_id": task_id}
+        if context is not None and hasattr(context, "digest"):
+            try:
+                router_context["memory"] = context.digest()
+            except Exception:
+                pass
         try:
-            schema: PlanSchema = self.router.plan_structured(goal_description, catalog, {"task_id": task_id})
+            schema: PlanSchema = self.router.plan_structured(goal_description, catalog, router_context)
             steps = PlanValidator(registry).validate(schema)
         except PlanningError as exc:
             # Typed planning failure: propagate the category so audit/recovery

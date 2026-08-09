@@ -1,0 +1,240 @@
+"""Memory domain models: Episodes, Reflections, filters, and the bounded
+planning context (ADR-012).
+
+Memory is structured, not a transcript archive: episodes summarize what
+happened (goal, plan, actions, outcome, failures, authorization, recovery),
+and reflections are structured lessons. No raw prompts/responses or secrets
+are stored by default - params appear only as their KEY NAMES, never values.
+
+Memory is INFORMATIONAL ONLY. It lives entirely outside the authorization
+chain: nothing here can grant permissions, alter actors, change boundaries,
+approve actions, or register capabilities.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from typing import Any
+
+from arion.state.models import new_id, utcnow
+
+# Outcome vocabulary for episodes.
+EPISODE_OUTCOMES = ("completed", "failed", "denied", "recovered")
+
+
+@dataclass
+class Episode:
+    """A structured record of one meaningful task experience."""
+
+    episode_id: str
+    goal: str
+    outcome: str  # completed | failed | denied | recovered
+    task_id: str | None = None
+    goal_id: str | None = None
+    plan_summary: list[dict[str, Any]] = field(default_factory=list)  # steps: intent/capability/action/status/params_keys
+    actions: list[dict[str, Any]] = field(default_factory=list)      # capability/action/status/attempts
+    verification: dict[str, Any] = field(default_factory=dict)       # passed/failed step indices
+    failures: list[dict[str, Any]] = field(default_factory=list)     # step, capability, action, error (bounded), category
+    authorization: dict[str, Any] = field(default_factory=dict)      # denials, approvals_required
+    recovery: dict[str, Any] = field(default_factory=dict)           # resumed, re_executed
+    tags: list[str] = field(default_factory=list)                    # capability names, outcome, categories, context tags
+    importance: float = 0.5                                          # 0..1 salience
+    reflection_id: str | None = None
+    created_at: str = field(default_factory=utcnow)
+    updated_at: str = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        if self.outcome not in EPISODE_OUTCOMES:
+            raise ValueError(f"unknown episode outcome {self.outcome!r} (allowed: {EPISODE_OUTCOMES})")
+        if not self.episode_id:
+            raise ValueError("episode_id must be non-empty")
+        if not (0.0 <= self.importance <= 1.0):
+            raise ValueError("importance must be within [0, 1]")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "episode_id": self.episode_id,
+            "task_id": self.task_id,
+            "goal_id": self.goal_id,
+            "goal": self.goal,
+            "plan_summary": self.plan_summary,
+            "actions": self.actions,
+            "outcome": self.outcome,
+            "verification": self.verification,
+            "failures": self.failures,
+            "authorization": self.authorization,
+            "recovery": self.recovery,
+            "tags": self.tags,
+            "importance": self.importance,
+            "reflection_id": self.reflection_id,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Episode":
+        return cls(
+            episode_id=d["episode_id"],
+            task_id=d.get("task_id"),
+            goal_id=d.get("goal_id"),
+            goal=d.get("goal", ""),
+            plan_summary=d.get("plan_summary", []) or [],
+            actions=d.get("actions", []) or [],
+            outcome=d.get("outcome", "failed"),
+            verification=d.get("verification", {}) or {},
+            failures=d.get("failures", []) or [],
+            authorization=d.get("authorization", {}) or {},
+            recovery=d.get("recovery", {}) or {},
+            tags=d.get("tags", []) or [],
+            importance=float(d.get("importance", 0.5)),
+            reflection_id=d.get("reflection_id"),
+            created_at=d.get("created_at", utcnow()),
+            updated_at=d.get("updated_at", utcnow()),
+        )
+
+
+@dataclass
+class Reflection:
+    """Structured reflection on an episode (deterministic or model-backed).
+
+    Reflection is informational: it can RECOMMEND future behavior but can
+    never trigger execution. Only a future plan + capability + authorization
+    may act.
+    """
+
+    reflection_id: str
+    episode_id: str
+    what_happened: str
+    what_worked: str
+    what_failed: str
+    why: str
+    lesson: str
+    recommendation: str
+    confidence: str  # low | medium | high
+    importance: float = 0.5
+    created_at: str = field(default_factory=utcnow)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "reflection_id": self.reflection_id,
+            "episode_id": self.episode_id,
+            "what_happened": self.what_happened,
+            "what_worked": self.what_worked,
+            "what_failed": self.what_failed,
+            "why": self.why,
+            "lesson": self.lesson,
+            "recommendation": self.recommendation,
+            "confidence": self.confidence,
+            "importance": self.importance,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Reflection":
+        return cls(
+            reflection_id=d["reflection_id"],
+            episode_id=d["episode_id"],
+            what_happened=d.get("what_happened", ""),
+            what_worked=d.get("what_worked", ""),
+            what_failed=d.get("what_failed", ""),
+            why=d.get("why", ""),
+            lesson=d.get("lesson", ""),
+            recommendation=d.get("recommendation", ""),
+            confidence=d.get("confidence", "medium"),
+            importance=float(d.get("importance", 0.5)),
+            created_at=d.get("created_at", utcnow()),
+        )
+
+
+@dataclass
+class EpisodeFilter:
+    """Structured filters for deterministic retrieval."""
+
+    outcome: str | None = None            # completed | failed | denied | recovered
+    capability: str | None = None         # capability name appearing in tags
+    failure_category: str | None = None   # e.g. provider_unavailable, schema_validation, ...
+    tag: str | None = None                # arbitrary tag
+    text: str | None = None               # substring match on goal text
+    limit: int = 50
+
+
+@dataclass
+class ContextBudget:
+    """Bounded, deterministic context-selection policy (ADR-012).
+
+    The model receives recent relevant episodes + high-importance relevant
+    episodes + recent reflections, all capped by these limits and a total
+    character budget. Retrieval is bounded and deterministic.
+    """
+
+    max_episodes: int = 5
+    max_reflections: int = 3
+    max_chars: int = 4000
+    recency_window: int = 20  # how many recent episodes are considered
+
+
+@dataclass
+class PlanningContext:
+    """Explicit context object handed to the planner/model.
+
+    Contains only relevant, bounded memory - never the whole database.
+    digest() produces the serializable form shown to a model (summaries, no
+    secrets, no raw transcripts).
+    """
+
+    goal: str
+    episodes: list[Episode] = field(default_factory=list)
+    reflections: list[Reflection] = field(default_factory=list)
+    budget: ContextBudget = field(default_factory=ContextBudget)
+
+    def digest(self) -> dict[str, Any]:
+        """Bounded, privacy-safe serialization for model consumption."""
+        budget = self.budget
+        episodes = self.episodes[: budget.max_episodes]
+        reflections = self.reflections[: budget.max_reflections]
+
+        ep = [
+            {
+                "episode_id": e.episode_id,
+                "goal": e.goal[:300],
+                "outcome": e.outcome,
+                "tags": e.tags[:20],
+                "importance": round(e.importance, 2),
+                "plan": [f"{s.get('capability')}/{s.get('action')}" for s in e.plan_summary[:10]],
+                "failures": [f.get("error", "")[:200] for f in e.failures[:5]],
+                "created_at": e.created_at,
+            }
+            for e in episodes
+        ]
+        ref = [
+            {
+                "reflection_id": r.reflection_id,
+                "what_happened": r.what_happened[:200],
+                "lesson": r.lesson[:200],
+                "recommendation": r.recommendation[:200],
+                "confidence": r.confidence,
+                "importance": round(r.importance, 2),
+            }
+            for r in reflections
+        ]
+        # Enforce the character budget across the whole digest (truncate).
+        total = {"episodes": ep, "reflections": ref, "counts": {"episodes": len(ep), "reflections": len(ref)}}
+        text = json.dumps(total, separators=(",", ":"))
+        if len(text) > budget.max_chars:
+            budget_left = budget.max_chars - 80
+            # drop reflections first (least essential), then episodes, until it fits
+            while len(json.dumps(total, separators=(",", ":"))) > budget_left and (ref or ep):
+                if ref:
+                    ref = ref[: len(ref) - 1]
+                elif ep:
+                    ep = ep[: len(ep) - 1]
+                total = {"episodes": ep, "reflections": ref, "counts": {"episodes": len(ep), "reflections": len(ref)}}
+            return {"episodes": ep, "reflections": ref, "counts": {"episodes": len(ep), "reflections": len(ref)}, "truncated": True}
+        return total
+
+    def all_tags(self) -> list[str]:
+        seen: set[str] = set()
+        for e in self.episodes:
+            seen.update(e.tags)
+        return sorted(seen)

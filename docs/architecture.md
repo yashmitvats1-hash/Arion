@@ -92,9 +92,37 @@ Every step is decided by a permission policy over
 - `arion/observability` — `AuditEvent` vocabulary, `EventLogger`, JSONL sink.
 - `arion/interfaces` — CLI (`run`, `resume`, `status`, `tasks`, `events`,
   `capabilities`).
-- `arion/bootstrap.py` — composition root wiring all layers.
-- `docs/adr/ADR-001..011` — approved architecture decisions.
+- `arion/memory` — `MemoryStore` protocol + `SQLiteMemoryStore` (episodic
+  memories + reflections tables), `MemoryRetriever` (deterministic scoring +
+  relevance gate), `DeterministicReflector`, `PlanningContext` (bounded
+  digest), `build_episode_from_task` (structured summaries only).
+- `arion/bootstrap.py` — composition root wiring all layers (memory on by
+  default).
+- `docs/adr/ADR-001..012` — approved architecture decisions.
 - `tests/` — deterministic, LLM-independent tests.
+
+## Persistent cognitive memory (ADR-012)
+
+Memory is INFORMATIONAL — it never authorizes (`Memory ≠ Authority`):
+
+- **Episodes:** one structured row per meaningful task experience (goal, plan
+  summary with param KEY names only, actions, outcome, verification, failures
+  with typed categories, authorization denials, recovery, tags, importance).
+  No raw prompts/responses, no secrets, no transcript archives.
+- **Reflections:** structured lessons (`what_happened/worked/failed/why`,
+  `lesson`, `recommendation`, `confidence`, `importance`) from a
+  `DeterministicReflector` (offline; `ModelReflector` later). A reflection can
+  recommend but never executes anything.
+- **Retrieval:** deterministic scoring (goal-token overlap, capability tags,
+  outcome salience, importance, recency tie-break) with a relevance gate;
+  bounded `PlanningContext` (max episodes/reflections/chars) handed to the
+  planner — relevant memory, not the whole DB.
+- **Lifecycle:** the engine records an episode + reflection at task
+  completion/failure/denial and injects retrieved context before planning.
+  Restart persistence is inherent (same SQLite file). Memory failure never
+  breaks the task loop.
+- **Events:** `memory.episode.recorded`, `memory.retrieval.completed`,
+  `reflection.created`, `planning.context.created` (IDs/counts/tags only).
 
 ## Structured intelligence boundary (ADR-011)
 

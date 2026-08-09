@@ -1,6 +1,7 @@
-# ADR-012 — Episodic Memory + Reflection + Context (PROPOSED — DRAFT)
+# ADR-012 — Episodic Memory + Reflection + Context
 
-- **Status:** Proposed (draft for architect review) — NOT yet implemented
+- **Status:** Approved & implemented (2026-08-09); was initially drafted as
+  PROPOSED, implemented per the memory milestone, now accepted.
 - **Date:** 2026-08-09
 - **Deciders:** ChatGPT (architect/manager), Arena AI (engineering agent)
 
@@ -13,53 +14,77 @@ goals. This ADR proposes the design around the existing SQLite `Storage`
 abstraction. **Memory is intelligence-side state; it must never authorize
 anything.**
 
-## Decision (proposal)
+## Decision (implemented)
+
+### 0. What was built
+
+A new `arion/memory/` package behind the existing SQLite abstraction:
+
+- `models.py` — `Episode`, `Reflection`, `EpisodeFilter`, `ContextBudget`,
+  `PlanningContext` (with a privacy-safe, bounded `digest()`).
+- `interface.py` — the `MemoryStore` protocol (`record_episode`, `get_episode`,
+  `search_episodes`, `list_recent`, `record_reflection`, `get_reflection`,
+  `list_recent_reflections`, `link_reflection`).
+- `store.py` — `SQLiteMemoryStore` (same DB file as core state; restart-safe).
+- `retrieval.py` — `MemoryRetriever` (deterministic scoring + relevance gate)
+  and `build_planning_context` (bounded context policy).
+- `reflector.py` — `Reflector` protocol + `DeterministicReflector` (offline).
+- `lifecycle.py` — `build_episode_from_task` (structured summaries only;
+  param key names, never values).
+- Engine integration: `ArionEngine(memory=..., reflector=...)` records episodes
+  + reflections at terminal states and injects `PlanningContext` into the
+  planner before planning.
 
 ### 1. Episodic memory
 
-A new `episodic_memories` table behind the `Storage` protocol. One row per
+A new `episodic_memories` table behind the `MemoryStore` protocol. One row per
 significant task experience, NOT per token/raw conversation:
 
-- `memory_id`, `task_id`, `goal_id`
-- `goal` (short description), `plan_summary` (intents + capabilities used)
-- `outcome` (completed | failed | denied | recovered)
-- `steps_count`, `actions` (JSON: capability/action/params-hash)
-- `verification_results` (JSON), `failures` (JSON: error + typed category)
-- `authorization_denials` (JSON: scope/resource/reason)
-- `recovery` (whether resume/re-execution occurred)
-- `timestamps` (created/updated), `relevant_context` (JSON tags:
-  resource kinds, capabilities, risk levels)
+- `episode_id`, `task_id`, `goal_id`
+- `goal` (short description, bounded 500 chars), `plan_summary` (JSON: step
+  intents, capabilities, actions, statuses, param KEY names only)
+- `actions` (JSON), `outcome` (completed | failed | denied | recovered)
+- `verification` (JSON: passed/failed step indices)
+- `failures` (JSON: step, capability, action, error text bounded to 500 chars,
+  typed category), `authorization` (JSON: denials scope/resource/reason,
+  approvals_required)
+- `recovery` (JSON: resumed), `tags` (JSON: capabilities, outcome, categories)
+- `importance` (0..1), `reflection_id`, `created_at`, `updated_at`
 
-Storage adds: `save_episodic_memory`, `list_episodic_memories` (with filters
-and a deterministic full-text search), `load_episodic_memory`.
+Validation: `Episode.__post_init__` rejects unknown outcomes, empty ids, and
+out-of-range importance (malformed records cannot be stored).
 
 ### 2. Reflection
 
-After a meaningful completion/failure, the intelligence layer produces a
-structured reflection (a `Reflection` dataclass, JSON-serializable):
+After a meaningful completion/failure, the engine produces a structured
+reflection (a `Reflection` dataclass, JSON-serializable):
 
+- `reflection_id`, `episode_id`
 - `what_happened`, `what_worked`, `what_failed`, `why`
-- `what_should_be_remembered` (explicit, curated — not raw dumps)
-- `confidence` (low|medium|high), `future_recommendation`
-- `source_memory_id`, `created_at`
+- `lesson`, `recommendation` (curated, not raw dumps)
+- `confidence` (low|medium|high), `importance`, `created_at`
 
-Reflection runs through a deterministic template planner by default
-(LLM-independent, ADR-008); a model-backed reflector can be added behind the
-same seam. Reflections are stored as rows in a `reflections` table.
+`DeterministicReflector` (template-based, LLM-independent per ADR-008) handles
+success/failure/denial/recovery variants; a `ModelReflector` can implement the
+same `Reflector` protocol later. Reflections are stored in a `reflections`
+table and linked to their episode.
 
 ### 3. Context retrieval (deterministic first)
 
-Before planning, the orchestrator asks the memory layer:
+Before planning, the orchestrator builds a bounded `PlanningContext`:
 
 ```
-retrieve_context(goal, top_k=N) -> list[(memory, reflection)]
+build_planning_context(retriever, goal, ContextBudget(max_episodes, max_reflections, max_chars))
 ```
 
-Deterministic retrieval over SQLite (metadata filters + `LIKE`/FTS5 where
-available): match on shared capabilities, resource kinds, outcome=denied/failed
-for the same capability, recency. The model then receives
-`current goal + relevant memory` (a compact digest), never the full database.
-Embeddings/vector DB are a later optimization, explicitly deferred.
+`MemoryRetriever.retrieve` scores episodes deterministically: goal-token
+overlap, shared capability tags, outcome salience (failed/denied/recovered),
+importance, recency tie-break — with a relevance GATE (an episode must share a
+goal token or capability to be retrieved at all; unrelated episodes are never
+included just for being recent). The model then receives
+`current goal + relevant memory` (a compact, character-bounded digest), never
+the full database. Embeddings/vector DB are a later optimization, explicitly
+deferred.
 
 ### 4. Memory authority (non-negotiable)
 
@@ -73,19 +98,27 @@ This is enforced by (a) the memory API living in the state/intelligence layer,
 
 ### 5. Integration points
 
-- `ArionEngine` gains an optional `memory` hook: on task completion/failure it
-  writes an episodic memory (observability events already exist); before
-  planning it injects retrieved context into the planner call.
-- `Planner` protocol stays unchanged in shape; the planner receives an
-  optional `context` argument (goal + memory digest).
-- Storage stays SQLite-first; new tables behind the same `Storage` protocol.
+- `ArionEngine` gains optional `memory` (MemoryStore) and `reflector`
+  (Reflector) hooks. On terminal states (completed/failed/denied) it writes an
+  episodic memory + reflection (best-effort; memory failure never changes task
+  outcome). Before planning it builds a `PlanningContext` and passes it to
+  `planner.plan(..., context=ctx)`; `RealModelPlanner` forwards
+  `ctx.digest()` into the ModelRouter's context.
+- New observability events: `memory.episode.recorded`, `memory.retrieval.completed`,
+  `reflection.created`, `planning.context.created` — IDs/counts/tags only,
+  never full memory contents.
+- `bootstrap.build_engine(..., memory=True)` wires `SQLiteMemoryStore` +
+  `DeterministicReflector` by default.
 
 ## Consequences
 
 - Arion learns from outcomes without becoming a chatbot or an authorization
   mechanism.
 - Everything remains deterministic-testable without an LLM.
-- Adds schema surface to `Storage` (migrations needed when implemented).
+- Memory is a separate bounded component: the `Storage` protocol is untouched;
+  `MemoryStore` is its own protocol (Postgres/vector/encrypted later).
+- Restart persistence is inherent: episodes/reflections live in the same DB
+  file as core state.
 
 ## Out of scope (still deferred)
 

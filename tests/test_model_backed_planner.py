@@ -20,7 +20,7 @@ class MockModelPlanner:
     def __init__(self, model: ModelRouter | None = None):
         self.model = model
 
-    def plan(self, goal_description: str, task_id: str, registry: CapabilityRegistry) -> list[PlanStep]:
+    def plan(self, goal_description: str, task_id: str, registry: CapabilityRegistry, context=None) -> list[PlanStep]:
         if "file" in goal_description.lower():
             return [
                 PlanStep(

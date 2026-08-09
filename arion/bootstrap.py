@@ -15,6 +15,8 @@ from arion.capabilities.registry import CapabilityRegistry
 from arion.intelligence.planner import DeterministicPlanner
 from arion.intelligence.router import DeterministicRouter
 from arion.observability.events import EventLogger, JsonlFileSink
+from arion.memory.reflector import DeterministicReflector
+from arion.memory.store import SQLiteMemoryStore
 from arion.orchestration.authz import (
     ApprovalHandler,
     PermissionPolicy,
@@ -33,6 +35,7 @@ def build_engine(
     approval_handler: ApprovalHandler | None = None,
     planner: Any | None = None,
     router: Any | None = None,
+    memory: bool = True,
 ) -> ArionEngine:
     storage = SQLiteStorage(db_path)
 
@@ -57,6 +60,10 @@ def build_engine(
     if policy is None:
         policy = ResourcePolicy(boundaries={"filesystem:path": RelativePathBoundary()})
 
+    # Persistent cognitive memory (ADR-012): same DB file, structured episodes
+    # + reflections. Memory is informational - never an authorization mechanism.
+    memory_store = SQLiteMemoryStore(db_path) if memory else None
+
     return ArionEngine(
         storage=storage,
         registry=registry,
@@ -65,4 +72,6 @@ def build_engine(
         events=events,
         policy=policy,
         approval_handler=approval_handler,
+        memory=memory_store,
+        reflector=DeterministicReflector() if memory else None,
     )

@@ -17,7 +17,13 @@ from arion.state.models import PlanStep, VerificationPolicy
 
 
 class Planner(Protocol):
-    def plan(self, goal_description: str, task_id: str, registry: CapabilityRegistry) -> list[PlanStep]: ...
+    def plan(
+        self,
+        goal_description: str,
+        task_id: str,
+        registry: CapabilityRegistry,
+        context: Any | None = None,  # PlanningContext (memory digest) - informational only
+    ) -> list[PlanStep]: ...
 
 
 # Action templates keyed by the capability.plan intent keyword.
@@ -38,7 +44,13 @@ class DeterministicPlanner:
     def __init__(self, router: ModelRouter | None = None):
         self._router = router  # reserved: planner can consult the router later
 
-    def plan(self, goal_description: str, task_id: str, registry: CapabilityRegistry) -> list[PlanStep]:
+    def plan(
+        self,
+        goal_description: str,
+        task_id: str,
+        registry: CapabilityRegistry,
+        context: Any | None = None,
+    ) -> list[PlanStep]:
         if not registry.has("filesystem.read"):
             raise ValueError("capability 'filesystem.read' not registered - cannot plan")
 
