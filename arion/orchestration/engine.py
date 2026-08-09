@@ -46,6 +46,7 @@ from arion.orchestration.authz import (
 from arion.state.models import (
     Checkpoint,
     Goal,
+    GoalStateError,
     PlanStep,
     StepStatus,
     Task,
@@ -123,7 +124,7 @@ class ArionEngine:
         return task
 
     def run_goal(self, goal_id: str, max_replans: int = 5) -> Goal:
-        """Long-horizon goal loop (ADR-016):
+        """Long-horizon goal loop (ADR-016/017):
 
           Goal -> Goal State -> Strategy -> Plan -> Execute -> Observe ->
           Learn -> Replan
@@ -134,6 +135,15 @@ class ArionEngine:
         - returns as soon as a task FAILS (goal stays ACTIVE with the failure
           persisted) so the caller can seed/decide before the next advance -
           each call is one long-horizon cycle;
+        - a task reaching AWAITING_APPROVAL stops the loop CLEANLY (never
+          spins, never re-executes the awaiting task): the goal becomes
+          durably BLOCKED with an approval_pending blocker and is returned;
+        - a BLOCKED goal (missing capability / approval) is returned without
+          planning; blockers are re-checked against the CURRENT world state so
+          a newly available capability or resolved approval unblocks it;
+        - a goal whose planner-required capability is not registered becomes
+          durably BLOCKED (missing_capability) instead of repeatedly
+          replanning;
         - replanning produces a NEW (immutable) plan version (never mutates
           the previous plan), bounded across calls by max_replans;
         - replay-safe: pending tasks for the latest plan version are resumed,
@@ -147,13 +157,30 @@ class ArionEngine:
         while True:
             result, _goal = gm.evaluate(goal_id)
             action = result.next_action
-            if action in ("none", "paused", "resolve_blocker"):
+            if action in ("none", "paused"):
+                return gm.get_goal(goal_id)
+            if action == "await_approval":
+                # approval-pending: stop cleanly; never spin on the awaiting
+                # task. The goal is durably BLOCKED (approval_pending blocker).
+                return gm.get_goal(goal_id)
+            if action == "resolve_blocker":
+                # durably BLOCKED: re-check blockers against the CURRENT world
+                # state (capability appeared / approval resolved); if nothing
+                # changed, return without planning (no replan loop).
+                if gm.recheck_blockers(goal_id):
+                    continue
                 return gm.get_goal(goal_id)
             if action == "complete":
                 gm.complete_goal(goal_id, reason="all_work_complete")
                 return gm.get_goal(goal_id)
 
             if action == "replan":
+                if result.evidence.get("reason") == "capability_available":
+                    # unblock via recheck (emits capability.available + goal
+                    # state change); fall back to a blanket clear if needed
+                    if gm.recheck_blockers(goal_id):
+                        continue
+                    gm.clear_blockers(goal_id, reason="capability_available")
                 # bounded across calls (prevents runaway caller loops)
                 replan_count = sum(
                     1 for p in gm.plan_history(goal_id)
@@ -162,10 +189,12 @@ class ArionEngine:
                 if replan_count >= max_replans:
                     gm.fail_goal(goal_id, reason="max_replans_exceeded")
                     return gm.get_goal(goal_id)
+                if self._block_on_missing_capability(goal_id, gm):
+                    return gm.get_goal(goal_id)
                 task = self._plan_for_goal(goal_id, replan_reason=result.evidence.get("reason"))
                 if task is not None:
                     task = self.run_task(task.id)
-                    if task.status == TaskStatus.FAILED:
+                    if task.status in (TaskStatus.FAILED, TaskStatus.AWAITING_APPROVAL):
                         return gm.get_goal(goal_id)  # caller decides next step
                 continue
 
@@ -174,14 +203,130 @@ class ArionEngine:
             pending = gm.pending_task(goal_id)
             if pending is not None:
                 pending = self.run_task(pending.id)
-                if pending.status == TaskStatus.FAILED:
+                if pending.status in (TaskStatus.FAILED, TaskStatus.AWAITING_APPROVAL):
                     return gm.get_goal(goal_id)
                 continue
+            if self._block_on_missing_capability(goal_id, gm):
+                return gm.get_goal(goal_id)
             task = self._plan_for_goal(goal_id, replan_reason=None)
             if task is not None:
                 task = self.run_task(task.id)
-                if task.status == TaskStatus.FAILED:
+                if task.status in (TaskStatus.FAILED, TaskStatus.AWAITING_APPROVAL):
                     return gm.get_goal(goal_id)
+
+    def _block_on_missing_capability(self, goal_id: str, gm) -> bool:
+        """If the planner requires a capability absent from the live registry,
+        durably BLOCK the goal (missing_capability) instead of planning/failing
+        in a loop. Returns True when the goal was blocked."""
+        goal = gm.get_goal(goal_id)
+        if goal is None:
+            return False
+        missing = self._missing_required_capabilities(goal.description)
+        if not missing:
+            return False
+        gm.set_blocked(goal_id, {
+            "type": "missing_capability",
+            "capabilities": sorted(missing),
+            "strategy": "blocked_missing_capability",
+            "detail": f"goal needs capabilities {sorted(missing)} not registered",
+        }, reason="blocked_missing_capability")
+        self._emit("capability.unavailable", task_id=None, detail={
+            "goal_id": goal_id, "capabilities": sorted(missing), "reason": "not_registered",
+        })
+        return True
+
+    def _missing_required_capabilities(self, goal_description: str) -> list[str]:
+        """Ask the planner which capabilities this goal requires, then report
+        which of those are NOT registered (deterministic gate). Planners that
+        do not declare requirements are never gated."""
+        planner = getattr(self, "planner", None)
+        required = getattr(planner, "required_capabilities", None)
+        if required is None:
+            return []
+        try:
+            need = required(goal_description)
+        except Exception:
+            return []
+        return [c for c in need if not self.registry.has(c)]
+
+    def resolve_approval(self, task_id: str, outcome: "ApprovalOutcome", actor: str = "approver") -> Task:
+        """Seam for an approval decision on an awaiting task (ADR-017).
+
+        APPROVED: the task becomes resumable (RUNNING) and the goal's
+        approval_pending blocker is cleared; the next run resumes the EXACT
+        pending step - no re-planning, no re-request of the same approval
+        (the live metadata is re-verified at resume time).
+
+        DENIED: the step + task fail durably with reason 'approval denied'
+        (goal unblocked; a later run_goal replans around it).
+
+        Returns the updated Task. Fail-closed on wrong states.
+        """
+        if outcome not in (ApprovalOutcome.APPROVED, ApprovalOutcome.DENIED):
+            raise ValueError(f"resolve_approval accepts APPROVED or DENIED, got {outcome!r}")
+        task = self.storage.load_task(task_id)
+        if task is None:
+            raise KeyError(f"task not found: {task_id}")
+        if task.status != TaskStatus.AWAITING_APPROVAL:
+            raise GoalStateError(f"task {task_id} is not awaiting approval (status={task.status.value})")
+        step = task.active_step
+        if step is None:
+            raise GoalStateError(f"task {task_id} has no active step to resolve")
+        recs = [r for r in task.approvals
+                if r.get("step_index") == step.index and r.get("outcome") == "pending"]
+        if not recs:
+            raise GoalStateError(f"task {task_id} has no pending approval for step {step.index}")
+        rec = recs[-1]
+        rec["resolved_by"] = actor
+        rec["resolved_at"] = utcnow()
+
+        gm = self.goal_manager
+        if outcome == ApprovalOutcome.APPROVED:
+            rec["outcome"] = "approved"
+            task.status = TaskStatus.RUNNING  # resumable; not terminal
+            if gm is not None and task.goal_id:
+                try:
+                    gm.clear_blocker(task.goal_id, "approval_pending", reason="approval_granted")
+                except Exception:
+                    pass
+            self._emit("goal.approval.granted", task_id=task.id, detail={
+                "goal_id": task.goal_id,
+                "task_id": task.id,
+                "step_index": step.index,
+                "capability": rec.get("request", {}).get("capability"),
+                "action": rec.get("request", {}).get("action"),
+                "scope": rec.get("request", {}).get("scope"),
+                "actor": actor,
+            })
+        else:
+            rec["outcome"] = "denied"
+            step.status = StepStatus.FAILED
+            step.error = "approval denied"
+            task.status = TaskStatus.FAILED
+            task.error = "approval denied"
+            task.completed_at = utcnow()
+            if gm is not None and task.goal_id:
+                try:
+                    gm.clear_blocker(task.goal_id, "approval_pending", reason="approval_denied")
+                except Exception:
+                    pass
+            self._emit("approval.denied", task_id=task.id, step_id=_step_id(step),
+                       success=False, detail={
+                           "scope": rec.get("request", {}).get("scope"),
+                           "resource": rec.get("request", {}).get("resource"),
+                           "reason": "approval denied",
+                       })
+            self._emit("goal.approval.denied", task_id=task.id, detail={
+                "goal_id": task.goal_id, "task_id": task.id, "step_index": step.index,
+                "actor": actor, "reason": "approval denied",
+            })
+            self._emit("task.failed", task_id=task.id, detail={
+                "step_index": step.index, "error": "approval denied",
+            })
+            self._record_memory(task)
+        task.updated_at = utcnow()
+        self.storage.save_task(task)
+        return task
 
     def _plan_for_goal(self, goal_id: str, replan_reason: str | None = None) -> Task | None:
         """Create + plan a task for a goal (records an immutable plan version)."""
@@ -208,18 +353,25 @@ class ArionEngine:
             raise KeyError(f"task not found: {task_id}")
 
         checkpoint = self.storage.latest_checkpoint(task_id)
+        restored = None
         if checkpoint is not None:
             restored = Task.from_dict(checkpoint.snapshot)
+            if checkpoint.created_at >= task.updated_at:
+                # the checkpoint is the freshest state (normal crash recovery)
+                task = restored
+            # else: an out-of-band update (e.g. resolve_approval) wrote a
+            # NEWER task row - the task row is authoritative.
+        if checkpoint is not None:
             # mid_execution distinguishes a genuine recovery (a task that had
             # begun executing steps) from a plan-only checkpoint (the normal
             # start-of-run boundary, NOT an interruption). Memory uses this to
             # avoid labeling every completed task as 'recovered'.
+            src = restored if restored is not None else task
             mid_execution = checkpoint.status != TaskStatus.PLANNED.value
             self._emit(
                 "task.resumed", task_id=task_id,
-                detail={"step_index": restored.current_step, "mid_execution": mid_execution},
+                detail={"step_index": src.current_step, "mid_execution": mid_execution},
             )
-            task = restored
         else:
             self._emit("task.planning", task_id=task_id)
 
@@ -490,15 +642,42 @@ class ArionEngine:
 
         Returns True when the action may proceed (approved), False when it was
         denied or is still pending (the caller must not execute).
+
+        ADR-017: a previously APPROVED decision for this exact step is honored
+        on resume ONLY when the CURRENT request (rebuilt from live ActionSpec
+        + policy metadata) still fingerprints identically. Any change to
+        scope/risk/side-effects/resource kind/resource/action forces a FRESH
+        approval request - stale approvals never authorize.
         """
+        record = self._approved_record_for(task, step.index)
+        if record is not None:
+            if self._authz_fingerprint(request) == record.get("fingerprint"):
+                # the exact approved request is still valid against LIVE
+                # metadata: resume without re-requesting
+                self._emit("task.approval.resumed", task_id=task.id, step_id=_step_id(step), detail={
+                    "approval_record": record.get("record_id"),
+                    "resolved_by": record.get("resolved_by"),
+                    "scope": request.scope,
+                    "resource": request.resource,
+                })
+                if self.goal_manager is not None and task.goal_id:
+                    try:
+                        self.goal_manager.clear_blocker(task.goal_id, "approval_pending", reason="approval_resumed")
+                    except Exception:
+                        pass
+                return True
+            # stale approval (metadata changed): fall through to a fresh request
+
         self._emit("approval.requested", task_id=task.id, step_id=_step_id(step), detail=decision.to_dict())
         outcome = self.approval_handler.request(request, decision)
         if outcome == ApprovalOutcome.APPROVED:
+            self._append_approval_record(task, step, request, decision, "approved", actor="system")
             self._emit("approval.granted", task_id=task.id, step_id=_step_id(step), detail=decision.to_dict())
             return True
         if outcome == ApprovalOutcome.DENIED:
             step.status = StepStatus.FAILED
             step.error = "approval denied"
+            self._append_approval_record(task, step, request, decision, "denied", actor="system")
             self._emit(
                 "approval.denied",
                 task_id=task.id,
@@ -507,10 +686,84 @@ class ArionEngine:
                 detail=decision.to_dict(),
             )
             return False
-        # PENDING: pause the task; a later run_task (after approval) resumes here
+        # PENDING: pause the task durably; a later resolve_approval + run_task
+        # resumes the exact same step
         task.status = TaskStatus.AWAITING_APPROVAL
         step.status = StepStatus.PENDING
+        self._append_approval_record(task, step, request, decision, "pending", actor="system")
+        if self.goal_manager is not None and task.goal_id:
+            try:
+                self.goal_manager.set_blocked(task.goal_id, {
+                    "type": "approval_pending",
+                    "task_id": task.id,
+                    "step_index": step.index,
+                    "capability": request.capability,
+                    "action": request.action,
+                    "scope": request.scope,
+                    "resource": request.resource,
+                    "reason": decision.reason[:200],
+                }, reason="approval_pending")
+            except Exception:
+                pass
+            try:
+                self._emit("goal.approval.pending", task_id=task.id, detail={
+                    "goal_id": task.goal_id,
+                    "task_id": task.id,
+                    "step_index": step.index,
+                    "capability": request.capability,
+                    "action": request.action,
+                    "scope": request.scope,
+                    "resource": request.resource,
+                })
+            except Exception:
+                pass
         return False
+
+    # ---------- approval records (durable, restart-safe) ----------
+
+    def _append_approval_record(self, task: Task, step: PlanStep, request: AuthorizationRequest,
+                                decision: PolicyDecision, outcome: str, actor: str) -> None:
+        """Append a bounded approval record to the task (persisted via the
+        task snapshot / checkpoints). Never stores params values or secrets."""
+        task.approvals = list(task.approvals or []) + [{
+            "record_id": new_id("apr"),
+            "step_index": step.index,
+            "outcome": outcome,
+            "actor": actor,
+            "created_at": utcnow(),
+            "reason": decision.reason[:200],
+            "request": {
+                "capability": request.capability,
+                "action": request.action,
+                "scope": request.scope,
+                "risk": request.risk,
+                "side_effects": request.side_effects,
+                "resource_kind": request.resource_kind,
+                "resource": request.resource,
+                "params_keys": sorted(request.params.keys()),
+            },
+            "fingerprint": self._authz_fingerprint(request),
+        }]
+
+    def _approved_record_for(self, task: Task, step_index: int) -> dict | None:
+        """The most recent APPROVED record for a step, if any."""
+        for r in reversed(list(task.approvals or [])):
+            if r.get("step_index") == step_index and r.get("outcome") == "approved":
+                return r
+        return None
+
+    def _authz_fingerprint(self, request: AuthorizationRequest) -> dict[str, Any]:
+        """Everything an approval covers: capability/action/scope/risk/
+        side-effects/resource kind/resource. Any change forces fresh authz."""
+        return {
+            "capability": request.capability,
+            "action": request.action,
+            "scope": request.scope,
+            "risk": request.risk,
+            "side_effects": request.side_effects,
+            "resource_kind": request.resource_kind,
+            "resource": request.resource,
+        }
 
     @staticmethod
     def _extract_resource(spec, params: dict[str, Any]) -> str | None:

@@ -17,9 +17,12 @@ anything. It only recommends the next action for the goal loop.
 next_action values:
   none              - terminal goal (no action)
   paused            - goal is paused
+  await_approval    - a task is AWAITING_APPROVAL; stop cleanly (no spin), the
+                      goal is durably BLOCKED with an approval_pending blocker
   resolve_blocker   - goal is blocked; do not execute
   continue          - run the next task for outstanding plan steps
-  replan            - a task failed or the world materially changed; produce a
+  replan            - a task failed, the world materially changed, or a
+                      missing-capability blocker became satisfiable; produce a
                       NEW plan version
   complete          - all plan steps succeeded and no blockers
 """
@@ -55,22 +58,39 @@ class ProgressResult:
 
 
 class ProgressEvaluator(Protocol):
-    def evaluate(self, goal: Goal, tasks: list, latest_plan: dict | None, world_changes: list | None = None) -> ProgressResult: ...
+    def evaluate(self, goal: Goal, tasks: list, latest_plan: dict | None,
+                 world_changes: list | None = None, world_state: dict | None = None) -> ProgressResult: ...
 
 
 class DeterministicProgressEvaluator:
     """Deterministic progress evaluation (reference path, offline).
 
     Rules (first match wins):
-      1. terminal goal status        -> next_action "none"
-      2. paused                      -> next_action "paused"
-      3. blockers present            -> status BLOCKED, next_action "resolve_blocker"
-      4. world changes since last eval -> next_action "replan" (material)
-      5. any task failed             -> next_action "replan"
-      6. no plan / no tasks          -> next_action "continue" (first plan)
-      7. all plan steps succeeded    -> next_action "complete"
-      8. outstanding steps remain    -> next_action "continue"
+      1. terminal goal status           -> next_action "none"
+      2. paused                         -> next_action "paused"
+      3. any task AWAITING_APPROVAL     -> next_action "await_approval" (durable
+                                          BLOCKED; never spin)
+      4. blockers present:
+         - missing_capability blockers whose capabilities are ALL present in
+           the current world state -> next_action "replan" (capability_available)
+         - otherwise                -> next_action "resolve_blocker"
+      5. world changes since last eval -> next_action "replan" (material)
+      6. any task failed               -> next_action "replan"
+      7. no plan / no tasks            -> next_action "continue" (first plan)
+      8. all plan steps succeeded      -> next_action "complete"
+      9. outstanding steps remain      -> next_action "continue"
     """
+
+    @staticmethod
+    def _registered_capabilities(world_state: dict | None) -> list:
+        if not world_state:
+            return []
+        reg = world_state.get("registered_capabilities") or {}
+        if isinstance(reg, dict):
+            return list(reg.get("value", []) or [])
+        if isinstance(reg, list):
+            return list(reg)
+        return []
 
     def evaluate(
         self,
@@ -78,6 +98,7 @@ class DeterministicProgressEvaluator:
         tasks: list,
         latest_plan: dict | None,
         world_changes: list | None = None,
+        world_state: dict | None = None,
     ) -> ProgressResult:
         world_changes = world_changes or []
         status = goal.status_value
@@ -100,11 +121,13 @@ class DeterministicProgressEvaluator:
             "goal_version": goal.version,
             "tasks": len(tasks),
             "completed": 0, "failed": 0, "skipped": 0, "pending": 0,
+            "awaiting_approval": 0,
             "plan_versions": 0,
             "world_changes": [w.to_dict() if hasattr(w, "to_dict") else w for w in world_changes[:10]],
         }
         blockers = list(goal.blockers or [])
 
+        awaiting: list[dict[str, Any]] = []
         for t in tasks:
             st = t.status.value if hasattr(t.status, "value") else str(t.status)
             if st == TaskStatus.COMPLETED.value:
@@ -113,6 +136,13 @@ class DeterministicProgressEvaluator:
                 evidence["failed"] += 1
             else:
                 evidence["pending"] += 1
+                if st == TaskStatus.AWAITING_APPROVAL.value:
+                    evidence["awaiting_approval"] += 1
+                    awaiting.append({
+                        "task_id": t.id,
+                        "step_index": t.current_step,
+                        "plan_version": t.plan_version,
+                    })
         for t in tasks:
             for s in getattr(t, "steps", []):
                 if s.status == StepStatus.SKIPPED:
@@ -145,15 +175,52 @@ class DeterministicProgressEvaluator:
         if total_steps:
             progress = min(1.0, succeeded_steps / total_steps)
 
-        # Rule 3: blockers -> BLOCKED
+        # Rule 3: a task awaiting approval -> stop cleanly (never spin), the
+        # goal stays durably BLOCKED; approval-pending is distinct from a task
+        # failure and from a missing capability.
+        if awaiting:
+            return ProgressResult(
+                goal_id=goal.id, progress=progress,
+                status=GoalStatus.BLOCKED.value if blockers else goal.status_value,
+                blockers=blockers, next_action="await_approval",
+                evidence={**evidence, "reason": "awaiting_approval",
+                          "approval_pending_steps": awaiting[:10]},
+            )
+
+        # Rule 4: blockers.
+        # A missing_capability blocker whose required capabilities are ALL
+        # present in the CURRENT world state is resolved -> replan
+        # (capability_available). Any other blocker (e.g. approval_pending,
+        # or a missing capability that is STILL missing) -> resolve_blocker.
         if blockers:
+            missing_blocks = [
+                b for b in blockers
+                if (b.get("key") or b.get("type")) == "missing_capability"
+                and (b.get("capabilities") or [])
+            ]
+            non_missing = [
+                b for b in blockers
+                if (b.get("key") or b.get("type")) != "missing_capability"
+            ]
+            caps = self._registered_capabilities(world_state)
+            still_missing = [
+                cap for b in missing_blocks for cap in (b.get("capabilities") or [])
+                if cap not in caps
+            ]
+            if missing_blocks and not non_missing and not still_missing:
+                return ProgressResult(
+                    goal_id=goal.id, progress=progress, status=GoalStatus.ACTIVE.value,
+                    blockers=[], next_action="replan",
+                    evidence={**evidence, "reason": "capability_available",
+                              "cleared_blockers": ["missing_capability"]},
+                )
             return ProgressResult(
                 goal_id=goal.id, progress=progress, status=GoalStatus.BLOCKED.value,
                 blockers=blockers, next_action="resolve_blocker",
-                evidence=evidence,
+                evidence={**evidence, "reason": "blocked"},
             )
 
-        # Rule 4: world changed materially -> replan
+        # Rule 5: world changed materially -> replan
         if world_changes:
             return ProgressResult(
                 goal_id=goal.id, progress=progress, status=GoalStatus.ACTIVE.value,
@@ -182,7 +249,7 @@ class DeterministicProgressEvaluator:
         ]
         evidence["latest_plan_failed"] = len(latest_failed)
 
-        # Rule 7: ALL plan steps of the LATEST version handled (succeeded or
+        # Rule 8: ALL plan steps of the LATEST version handled (succeeded or
         # explicitly skipped) with no unresolved failure -> complete.
         if plan_steps > 0 and handled_steps >= plan_steps and not latest_failed:
             return ProgressResult(
@@ -191,7 +258,7 @@ class DeterministicProgressEvaluator:
                 evidence={**evidence, "reason": "all_work_complete"},
             )
 
-        # Rule 8: unresolved failed work on the latest plan -> replan
+        # Rule 9: unresolved failed work on the latest plan -> replan
         if latest_failed:
             return ProgressResult(
                 goal_id=goal.id, progress=progress, status=GoalStatus.ACTIVE.value,
@@ -199,7 +266,7 @@ class DeterministicProgressEvaluator:
                 evidence={**evidence, "reason": "task_failed"},
             )
 
-        # Rule 9: outstanding work remains -> continue
+        # Rule 10: outstanding work remains -> continue
         return ProgressResult(
             goal_id=goal.id, progress=progress, status=GoalStatus.ACTIVE.value,
             blockers=[], next_action="continue",

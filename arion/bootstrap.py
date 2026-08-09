@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from arion.capabilities.filesystem import FilesystemReadCapability
+from arion.capabilities.git import GitLogCapability
 from arion.capabilities.registry import CapabilityRegistry
 from arion.cognition.deriver import DeterministicBeliefDeriver
 from arion.cognition.goals import GoalManager
@@ -49,6 +50,7 @@ def build_engine(
 
     registry = CapabilityRegistry()
     registry.register(FilesystemReadCapability(sandbox_root))
+    registry.register(GitLogCapability(sandbox_root))
 
     events = EventLogger()
     events.add_sink(storage)  # Storage implements EventSink.append_event
@@ -65,8 +67,12 @@ def build_engine(
     # Fail-closed by default: the filesystem resource kind gets an explicit
     # boundary (relative, non-traversal paths - the capability enforces the
     # real sandbox root). Any other resource kind is DENIED until configured.
+    # git.log (read-only history inspection) is allowed under its own scope.
     if policy is None:
-        policy = ResourcePolicy(boundaries={"filesystem:path": RelativePathBoundary()})
+        policy = ResourcePolicy(
+            allowed_scopes={"filesystem:read", "git:read"},
+            boundaries={"filesystem:path": RelativePathBoundary()},
+        )
 
     # Persistent cognitive memory (ADR-012): same DB file, structured episodes
     # + reflections. Memory is informational - never an authorization mechanism.

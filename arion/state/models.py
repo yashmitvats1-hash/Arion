@@ -121,6 +121,7 @@ class Task:
     current_step: int = 0
     error: str | None = None
     plan_version: int | None = None  # goal plan version this task implements (ADR-016)
+    approvals: list[dict[str, Any]] = field(default_factory=list)  # approval records per step (ADR-017)
     created_at: str = field(default_factory=utcnow)
     updated_at: str = field(default_factory=utcnow)
     completed_at: str | None = None
@@ -140,6 +141,7 @@ class Task:
             "steps": [s.to_dict() for s in self.steps],
             "current_step": self.current_step,
             "error": self.error,
+            "approvals": self.approvals,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "completed_at": self.completed_at,
@@ -159,6 +161,7 @@ class Task:
             current_step=d.get("current_step", 0),
             error=d.get("error"),
             plan_version=d.get("plan_version"),
+            approvals=list(d.get("approvals", []) or []),
             created_at=d.get("created_at", utcnow()),
             updated_at=d.get("updated_at", utcnow()),
             completed_at=d.get("completed_at"),

@@ -137,19 +137,96 @@ class GoalManager:
             goal.updated_at = utcnow()
             self.storage.save_goal(goal)
         if goal.status == GoalStatus.ACTIVE:
-            return self.transition(goal_id, GoalStatus.BLOCKED.value, reason)
+            goal = self.transition(goal_id, GoalStatus.BLOCKED.value, reason)
+        self._emit("goal.blocked", goal_id=goal_id, detail={
+            "goal_id": goal_id,
+            "blocker_key": key,
+            "blocker_type": blocker.get("type", key),
+            "reason": reason[:200],
+        })
+        return self.get_goal(goal_id)
+
+    def clear_blocker(self, goal_id: str, key: str, reason: str = "blocker_resolved") -> Goal:
+        """Remove ONE blocker by key; unblocks the goal when none remain."""
+        goal = self.get_goal(goal_id)
+        if goal is None:
+            raise KeyError(f"goal not found: {goal_id}")
+        kept = [b for b in (goal.blockers or []) if (b.get("key") or b.get("type")) != key]
+        if len(kept) == len(goal.blockers or []):
+            return self.get_goal(goal_id)  # nothing to clear
+        goal.blockers = kept
+        goal.updated_at = utcnow()
+        self.storage.save_goal(goal)
+        self._emit("goal.unblocked", goal_id=goal_id, detail={
+            "goal_id": goal_id, "blocker_key": key, "reason": reason[:200],
+        })
+        if goal.status == GoalStatus.BLOCKED and not kept:
+            goal = self.transition(goal_id, GoalStatus.ACTIVE.value, reason)
         return self.get_goal(goal_id)
 
     def clear_blockers(self, goal_id: str, reason: str = "blocker_resolved") -> Goal:
         goal = self.get_goal(goal_id)
         if goal is None:
             raise KeyError(f"goal not found: {goal_id}")
+        if not goal.blockers:
+            return self.get_goal(goal_id)
         goal.blockers = []
         goal.updated_at = utcnow()
         self.storage.save_goal(goal)
+        self._emit("goal.unblocked", goal_id=goal_id, detail={
+            "goal_id": goal_id, "blocker_key": "*", "reason": reason[:200],
+        })
         if goal.status == GoalStatus.BLOCKED:
             return self.transition(goal_id, GoalStatus.ACTIVE.value, reason)
         return self.get_goal(goal_id)
+
+    def recheck_blockers(self, goal_id: str) -> bool:
+        """Re-evaluate the goal's blockers against the CURRENT world state.
+
+        Drops a `missing_capability` blocker whose required capabilities are
+        now registered, and an `approval_pending` blocker whose task is no
+        longer awaiting approval. Returns True when blockers were cleared
+        (the goal may need re-evaluation/replanning); False otherwise.
+        """
+        goal = self.get_goal(goal_id)
+        if goal is None or goal.status != GoalStatus.BLOCKED or not goal.blockers:
+            return False
+        world = self.world_monitor.current_state() if self.world_monitor else {}
+        reg = world.get("registered_capabilities") or {}
+        caps = list(reg.get("value", [])) if isinstance(reg, dict) else []
+        dropped_keys: set[str] = set()
+        newly_available: set[str] = set()
+        for b in list(goal.blockers):
+            key = b.get("key") or b.get("type")
+            if key == "missing_capability":
+                need = list(b.get("capabilities") or [])
+                if need and all(c in caps for c in need):
+                    dropped_keys.add(key)
+                    newly_available.update(c for c in need if c in caps)
+            elif key == "approval_pending":
+                tid = b.get("task_id")
+                task = self.storage.load_task(tid) if tid else None
+                if task is None or task.status != TaskStatus.AWAITING_APPROVAL:
+                    dropped_keys.add(key)
+        if not dropped_keys:
+            return False
+        goal.blockers = [
+            b for b in (goal.blockers or [])
+            if (b.get("key") or b.get("type")) not in dropped_keys
+        ]
+        goal.updated_at = utcnow()
+        self.storage.save_goal(goal)
+        for cap in sorted(newly_available):
+            self._emit("capability.available", goal_id=goal_id, detail={
+                "goal_id": goal_id, "capability": cap, "source": "world_state",
+            })
+        if not goal.blockers:
+            self._emit("goal.unblocked", goal_id=goal_id, detail={
+                "goal_id": goal_id, "blocker_key": ",".join(sorted(dropped_keys)),
+                "reason": "blockers_resolved",
+            })
+            goal = self.transition(goal_id, GoalStatus.ACTIVE.value, "blockers_resolved")
+        return True
 
     # ------------------------------------------------------------------ #
     # Plan versioning (immutable, monotonic, replay-safe)
@@ -272,7 +349,8 @@ class GoalManager:
         tasks = self.task_history(goal_id)
         latest_plan = self.latest_plan(goal_id)
         world_changes = self._relevant_world_changes(goal)
-        result = self.progress_evaluator.evaluate(goal, tasks, latest_plan, world_changes)
+        world_state = self.world_monitor.current_state() if self.world_monitor else None
+        result = self.progress_evaluator.evaluate(goal, tasks, latest_plan, world_changes, world_state)
 
         goal.progress_metadata = result.to_dict()
         goal.last_evaluated_at = utcnow()

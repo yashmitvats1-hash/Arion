@@ -24,9 +24,13 @@ def _print_task(engine: ArionEngine, task_id: str) -> None:
     print(f"  goal: {task.description}")
     for step in task.steps:
         mark = {"pending": "-", "running": ">", "succeeded": "ok", "failed": "x"}[step.status.value]
+        if task.status.value == "awaiting_approval" and step.status.value == "pending":
+            mark = "A"
         print(f"  [{mark}] step {step.index}: {step.intent} ({step.capability}/{step.action})")
         if step.error:
             print(f"        error: {step.error}")
+        if task.status.value == "awaiting_approval" and step.status.value == "pending":
+            print("        awaiting approval: run `arion goals approve <goal_id>` or `arion goals deny <goal_id>`")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -123,6 +127,14 @@ def build_parser() -> argparse.ArgumentParser:
     goals_cancel = goals_sub.add_parser("cancel", help="cancel a goal", parents=[common, common_memory])
     goals_cancel.add_argument("goal_id")
 
+    goals_approve = goals_sub.add_parser("approve", help="approve the pending approval of a goal's task", parents=[common, common_memory])
+    goals_approve.add_argument("goal_id")
+    goals_approve.add_argument("--actor", default="cli-approver", help="who approved (audit only; never changes authorization identity)")
+
+    goals_deny = goals_sub.add_parser("deny", help="deny the pending approval of a goal's task", parents=[common, common_memory])
+    goals_deny.add_argument("goal_id")
+    goals_deny.add_argument("--actor", default="cli-approver", help="who denied (audit only)")
+
     return parser
 
 
@@ -141,11 +153,25 @@ def main(argv: list[str] | None = None) -> int:
     storage = engine.storage
 
     if args.command == "run":
-        task = engine.execute_goal(args.goal, source=args.source)
+        # Durable goal loop (ADR-016/017): submit a goal and drive the
+        # long-horizon lifecycle (plan -> execute -> observe -> verify ->
+        # complete / replan / block / await approval).
+        goal = engine.submit_goal(args.goal, source=args.source)
+        goal = engine.run_goal(goal.id)
         print("goal executed")
-        print(f"task_id: {task.id}")
-        print(f"status: {task.status.value}")
-        _print_task(engine, task.id)
+        print(f"goal_id: {goal.id}")
+        print(f"status: {goal.status_value}")
+        if goal.blockers:
+            print(f"blockers: {goal.blockers}")
+        tasks = [t for t in storage.list_tasks() if t.goal_id == goal.id]
+        if tasks:
+            latest = max(tasks, key=lambda t: t.created_at)
+            print(f"task_id: {latest.id}")
+            _print_task(engine, latest.id)
+        if goal.status_value == "failed":
+            print(f"goal error: {goal.last_replan_reason or 'failed'}")
+            storage.close()
+            return 1
     elif args.command == "resume":
         task = engine.run_task(args.task_id)
         print("resumed")
@@ -213,6 +239,9 @@ def _goals_command(args, engine) -> int:
         print(f"  strategy: {summary['strategy'] or '-'}")
         print(f"  plan versions: {summary['plan_versions']} (latest v{summary['latest_plan_version']} {summary['latest_strategy']})")
         print(f"  blockers: {len(summary['blockers'])}")
+        for b in summary["blockers"]:
+            print(f"    - {b.get('type', b.get('key'))}: {b.get('detail', b.get('reason', ''))}"
+                  + (f" (task {b.get('task_id')} step {b.get('step_index')})" if b.get("task_id") else ""))
         print(f"  progress: {summary['progress']}")
         print(f"  tasks: {summary['tasks']}")
         return 0
@@ -245,6 +274,29 @@ def _goals_command(args, engine) -> int:
         return _transition(args.goal_id, lambda g: gm.resume(g, reason="cli_resume"), "resumed")
     if args.goals_command == "cancel":
         return _transition(args.goal_id, lambda g: gm.cancel(g, reason="cli_cancel"), "cancelled")
+
+    if args.goals_command in ("approve", "deny"):
+        from arion.orchestration.authz import ApprovalOutcome
+
+        awaiting = [t for t in gm.task_history(args.goal_id)
+                    if t.status.value == "awaiting_approval"]
+        if not awaiting:
+            print(f"goal {args.goal_id} has no approval-pending task")
+            return 1
+        task = awaiting[0]
+        outcome = ApprovalOutcome.APPROVED if args.goals_command == "approve" else ApprovalOutcome.DENIED
+        try:
+            resolved = engine.resolve_approval(task.id, outcome, actor=args.actor)
+        except Exception as exc:
+            print(f"approval resolution rejected: {exc}")
+            return 1
+        if args.json:
+            _emit(resolved.to_dict())
+            return 0
+        print(f"goal {args.goal_id}: approval {outcome.value} for task {task.id} step {task.current_step}")
+        print(f"task {resolved.id}: {resolved.status.value.upper()}"
+              + (f" ({resolved.error})" if resolved.error else ""))
+        return 0
 
     print(f"unknown goals command: {args.goals_command}")
     return 1

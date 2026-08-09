@@ -80,7 +80,8 @@ Every step is decided by a permission policy over
 
 - `arion/state` — domain models + `SQLiteStorage` behind `Storage`.
 - `arion/capabilities` — `CapabilityRegistry`, permission scopes,
-  `filesystem.read` (read-only, sandboxed, symlink-safe, size-capped).
+  `filesystem.read` (read-only, sandboxed, symlink-safe, size-capped),
+  `git.log` (read-only git history inspection via `.git` metadata, no shell).
 - `arion/intelligence` — `Planner` protocol + `DeterministicPlanner`,
   `ModelRouter` protocol + `DeterministicRouter`, `PlanSchema` (versioned,
   strict), `PlanValidator`, `RealModelPlanner`, `providers/` (OpenAI-compatible
@@ -104,7 +105,7 @@ Every step is decided by a permission policy over
   digest), `build_episode_from_task` (structured summaries only).
 - `arion/bootstrap.py` — composition root wiring all layers (memory on by
   default).
-- `docs/adr/ADR-001..016` — approved architecture decisions.
+- `docs/adr/ADR-001..017` — approved architecture decisions.
 - `tests/` — deterministic, LLM-independent tests.
 
 ## Persistent cognitive memory (ADR-012)
@@ -255,6 +256,48 @@ Learn → Replan`, owned by an authoritative, restart-safe `GoalManager`.
   restart proving state/version/progress/provenance survival, no duplicate
   plan versions, and live-metadata re-authorization. Runs offline.
 
+## Approval-Gated Goals, BLOCKED Semantics, Second Capability (ADR-017)
+
+Hardening around the existing approval seam (ADR-009) and the durable goal
+loop (ADR-016):
+
+- **Approval-pending stops the loop cleanly:** a task reaching
+  `AWAITING_APPROVAL` makes `run_goal` return immediately (evaluator
+  `next_action "await_approval"`); the goal becomes durably BLOCKED with an
+  `approval_pending` blocker. No spin, no re-execution of the awaiting task,
+  no re-request; distinct from an ordinary task failure. The goal is never
+  completed while an approval-gated step is unresolved.
+- **Resolution seam:** `engine.resolve_approval(task_id, APPROVED|DENIED,
+  actor)`. APPROVED → task resumable (RUNNING), goal unblocked, next run
+  resumes the EXACT pending step (no replan). DENIED → durable `approval
+  denied` task failure (goal unblocked; replan later). Fail-closed on wrong
+  states. Approval records persist on the task (bounded metadata, restart-safe
+  via snapshots/checkpoints).
+- **Live re-authorization:** resuming an approved step re-runs the policy
+  against CURRENT ActionSpec/policy metadata; the approval is honored only if
+  the request fingerprints identically (capability/action/scope/risk/
+  side-effects/resource kind/resource). Changed `required_scope`, risk, or
+  removed boundary forces fresh authorization; stale approvals never
+  authorize. Approval cannot modify actor identity or ActionSpec metadata, and
+  model-produced approval/grant fields are ignored.
+- **`blocked_missing_capability` end-to-end:** before planning, `run_goal`
+  gates on `planner.required_capabilities()` against the LIVE registry —
+  missing capability → durable BLOCKED (`missing_capability` blocker), never a
+  replan loop. When the capability appears (world state), the evaluator
+  reports `replan` (`capability_available`), blockers are re-checked and the
+  goal replans and completes. Old decisions never reused.
+- **Second capability — `git.log`:** read-only git history inspection
+  (`.git` metadata parsing; NO shell). Full ActionSpec metadata, same
+  `filesystem:path` resource boundary + sandbox containment, discoverable via
+  `arion capabilities`, flows through registry → planning → authorization →
+  execution → verification.
+- **GoalManager:** `goal.blocked`/`goal.unblocked` events, `clear_blocker`
+  (single), `recheck_blockers` (world-state-aware; emits
+  `capability.available`).
+- **CLI:** `arion run` drives the durable goal loop (goal_id, status,
+  blockers, task); `arion goals approve|deny <goal_id>` resolve approval.
+- **Demo:** `scripts/demo_goal_approval.py` (both scenarios, offline).
+
 ## Structured intelligence boundary (ADR-011)
 
 ```
@@ -309,8 +352,11 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/arion resume <task_id>     # survives process restarts
 .venv/bin/arion events --task <task_id>
 .venv/bin/arion goals list           # durable goals (ADR-016)
+.venv/bin/arion goals approve <goal_id>   # approve a pending approval (ADR-017)
+.venv/bin/arion goals deny <goal_id>      # deny a pending approval (ADR-017)
 .venv/bin/arion goals show <goal_id> --json
 .venv/bin/python scripts/demo_goal_replan.py   # 3-cycle DoD demo (offline)
+.venv/bin/python scripts/demo_goal_approval.py  # approval + blocked-capability demo (offline)
 .venv/bin/python -m pytest
 ```
 

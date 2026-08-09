@@ -66,12 +66,14 @@ class StrategySelector:
         if previous_strategies:
             provenance["previous_strategies"] = previous_strategies[-10:]
 
-        # Rule 1: environment missing a capability mentioned in the goal
+        # Rule 1: environment missing a capability mentioned in the goal.
+        # Dotted tokens containing '/' are file paths, not capability names
+        # (e.g. "docs/design.md") - never treated as capabilities (ADR-017).
         env = environment if isinstance(environment, dict) else {}
         reg = env.get("registered_capabilities", {})
         caps = reg.get("value", []) if isinstance(reg, dict) else []
         if caps:
-            needed = {w for w in goal_description.lower().split() if "." in w}
+            needed = {w for w in goal_description.lower().split() if "." in w and "/" not in w}
             missing = [c for c in needed if c not in caps]
             if missing:
                 return Strategy(

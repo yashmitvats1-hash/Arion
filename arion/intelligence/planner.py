@@ -52,51 +52,75 @@ class DeterministicPlanner:
         registry: CapabilityRegistry,
         context: Any | None = None,
     ) -> list[PlanStep]:
-        if not registry.has("filesystem.read"):
-            raise ValueError("capability 'filesystem.read' not registered - cannot plan")
-
         text = goal_description.lower().strip()
-        if "summarize" in text or "explore" in text or "inspect" in text:
-            # Explore the repository tree, then read the most relevant files.
+
+        # Git-history goals (ADR-017): the git.log capability is used when it
+        # is registered and the goal asks about history/commits/branches.
+        if self._is_git_goal(text) and registry.has("git.log"):
             steps = [
                 PlanStep(
                     index=0,
-                    intent="list root",
-                    capability="filesystem.read",
-                    action="list",
-                    scope="filesystem:read",
-                    params={"path": "."},
-                    verification=VerificationPolicy("non_empty"),
+                    intent="read git history",
+                    capability="git.log",
+                    action="log",
+                    scope="git:read",
+                    params={"repo": ".", "limit": 10},
+                    verification=VerificationPolicy("schema_keys", {"keys": ["commits"]}),
                 ),
                 PlanStep(
                     index=1,
-                    intent="read key files",
-                    capability="filesystem.read",
-                    action="read",
-                    scope="filesystem:read",
-                    params=self._key_files(text),
-                    verification=VerificationPolicy("schema_keys", {"keys": ["content"]}),
+                    intent="list branches",
+                    capability="git.log",
+                    action="branches",
+                    scope="git:read",
+                    params={"repo": "."},
+                    verification=VerificationPolicy("schema_keys", {"keys": ["branches"]}),
                 ),
             ]
         else:
-            # Fallback: attempt a direct read of a path mentioned in the goal (e.g. a file name).
-            m = re.search(r"(\S+\.\w+)", goal_description)
-            if not m:
-                raise ValueError(
-                    f"goal not decomposable by DeterministicPlanner: {goal_description!r} "
-                    "(extend planner templates or use a model-backed planner)"
-                )
-            steps = [
-                PlanStep(
-                    index=0,
-                    intent="read file",
-                    capability="filesystem.read",
-                    action="read",
-                    scope="filesystem:read",
-                    params={"path": m.group(1)},
-                    verification=VerificationPolicy("schema_keys", {"keys": ["content"]}),
-                )
-            ]
+            if not registry.has("filesystem.read"):
+                raise ValueError("capability 'filesystem.read' not registered - cannot plan")
+            if "summarize" in text or "explore" in text or "inspect" in text:
+                # Explore the repository tree, then read the most relevant files.
+                steps = [
+                    PlanStep(
+                        index=0,
+                        intent="list root",
+                        capability="filesystem.read",
+                        action="list",
+                        scope="filesystem:read",
+                        params={"path": "."},
+                        verification=VerificationPolicy("non_empty"),
+                    ),
+                    PlanStep(
+                        index=1,
+                        intent="read key files",
+                        capability="filesystem.read",
+                        action="read",
+                        scope="filesystem:read",
+                        params=self._key_files(text),
+                        verification=VerificationPolicy("schema_keys", {"keys": ["content"]}),
+                    ),
+                ]
+            else:
+                # Fallback: attempt a direct read of a path mentioned in the goal (e.g. a file name).
+                m = re.search(r"(\S+\.\w+)", goal_description)
+                if not m:
+                    raise ValueError(
+                        f"goal not decomposable by DeterministicPlanner: {goal_description!r} "
+                        "(extend planner templates or use a model-backed planner)"
+                    )
+                steps = [
+                    PlanStep(
+                        index=0,
+                        intent="read file",
+                        capability="filesystem.read",
+                        action="read",
+                        scope="filesystem:read",
+                        params={"path": m.group(1)},
+                        verification=VerificationPolicy("schema_keys", {"keys": ["content"]}),
+                    )
+                ]
 
         # Memory-driven planning: if the context carries structured guidance
         # (from prior experience), re-target steps away from known-failing
@@ -117,6 +141,20 @@ class DeterministicPlanner:
             self.last_transformation = transformation
             steps = transformation.transformed
         return steps
+
+    @staticmethod
+    def _is_git_goal(text: str) -> bool:
+        """Deterministic heuristic: the goal asks about repository history."""
+        return any(k in text for k in ("git", "history", "commit", "branch", "reflog"))
+
+    def required_capabilities(self, goal_description: str) -> set[str]:
+        """Which capabilities THIS planner needs for a goal (ADR-017). The
+        engine gates on this so a goal whose required capability is missing is
+        durably BLOCKED instead of failing/replanning in a loop."""
+        text = goal_description.lower().strip()
+        if self._is_git_goal(text):
+            return {"git.log"}
+        return {"filesystem.read"}
 
     @staticmethod
     def _key_files(text: str) -> dict[str, Any]:
