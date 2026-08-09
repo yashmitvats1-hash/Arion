@@ -157,9 +157,14 @@ def test_mutation_failure_durable_and_restart_no_duplicate(tmp_path):
     engine_a.storage.close()
 
     # fresh process: the failed task is terminal and is NEVER re-run; the goal
-    # can only advance through a NEW planning/authorization decision (which
-    # queues a FRESH approval request - it does not silently re-execute)
+    # is durably gated on the recovery (ADR-020) - no new plan/approval until
+    # an EXPLICIT recovery transition, then a FRESH approval is required
     engine_b, gm_b, storage_b, _ = _engine(db, sb)
+    final = engine_b.run_goal(gid)
+    assert final.status == GoalStatus.BLOCKED  # recovery_required gate
+    assert any(b.get("type") == "recovery_required" for b in final.blockers)
+    rec = engine_b.recovery_store.list_recoveries()[0]
+    engine_b.acknowledge_recovery(rec.recovery_id, actor="user:alice")
     final = engine_b.run_goal(gid)
     assert final.status == GoalStatus.BLOCKED  # fresh approval requested
     new_task = gm_b.task_history(gid)[-1]
@@ -178,7 +183,8 @@ def test_mutation_failure_durable_and_restart_no_duplicate(tmp_path):
 
 def test_recovery_requires_new_plan_decision(tmp_path):
     """After a failed mutation, recovery happens ONLY through an explicit
-    replan: a NEW plan version + NEW task with FRESH authorization."""
+    recovery transition followed by a NEW plan version + NEW task with FRESH
+    authorization (ADR-020: recovery is a gate, never an authorization)."""
     sb = _sandbox(tmp_path)
     fail_cap = FailingWriteCapability(sb, mode="raise")
     engine, gm, storage, registry = _engine(tmp_path / "rd.db", sb, write_cap=fail_cap)
@@ -188,8 +194,14 @@ def test_recovery_requires_new_plan_decision(tmp_path):
     assert gm.task_history(gid)[-1].status == TaskStatus.FAILED
     versions_before = len(gm.plan_history(gid))
 
-    # next run_goal replans (task_failed) -> new plan version, new task
-    engine.run_goal(gid)
+    # recovery open: run_goal does NOT replan (durable gate)
+    assert engine.run_goal(gid).status == GoalStatus.BLOCKED
+    assert len(gm.plan_history(gid)) == versions_before
+    rec = engine.recovery_store.list_recoveries()[0]
+
+    # explicit recovery transition -> replan -> new plan version + new task
+    engine.acknowledge_recovery(rec.recovery_id, actor="user:alice")
+    assert engine.run_goal(gid).status == GoalStatus.BLOCKED  # fresh approval queued
     assert len(gm.plan_history(gid)) == versions_before + 1
     task = gm.task_history(gid)[-1]
     assert task.status == TaskStatus.AWAITING_APPROVAL  # fresh authz required

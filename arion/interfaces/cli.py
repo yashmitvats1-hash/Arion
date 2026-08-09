@@ -153,6 +153,20 @@ def build_parser() -> argparse.ArgumentParser:
     approvals_deny.add_argument("approval_id")
     approvals_deny.add_argument("--actor", default="cli-approver", help="who denied (audit only)")
 
+    recovery = sub.add_parser("recovery", help="mutation recovery registry (ADR-020)")
+    recovery.add_argument("--db", default=None, dest="db_recovery", help=argparse.SUPPRESS)
+    recovery_sub = recovery.add_subparsers(dest="recovery_command", required=True)
+
+    recovery_list = recovery_sub.add_parser("list", help="list mutation recovery records", parents=[common, common_memory])
+    recovery_list.add_argument("--status", default=None, choices=["required", "acknowledged"])
+
+    recovery_show = recovery_sub.add_parser("show", help="show a mutation recovery record", parents=[common, common_memory])
+    recovery_show.add_argument("recovery_id")
+
+    recovery_ack = recovery_sub.add_parser("acknowledge", help="acknowledge a REQUIRED mutation recovery (ADR-020)", parents=[common, common_memory])
+    recovery_ack.add_argument("recovery_id")
+    recovery_ack.add_argument("--actor", default="cli-operator", help="who acknowledged (audit only; never authorizes)")
+
     return parser
 
 
@@ -161,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(__file__).resolve().parent.parent.parent
     db_path = (args.db or args.db_global or getattr(args, "db_mem", None)
                or getattr(args, "db_cog", None) or getattr(args, "db_goals", None)
-               or getattr(args, "db_approvals", None)
+               or getattr(args, "db_approvals", None) or getattr(args, "db_recovery", None)
                or str(root / "arion_data" / "arion.db"))
 
     engine = build_engine(
@@ -218,9 +232,78 @@ def main(argv: list[str] | None = None) -> int:
         return _goals_command(args, engine)
     elif args.command == "approvals":
         return _approvals_command(args, engine)
+    elif args.command == "recovery":
+        return _recovery_command(args, engine)
 
     storage.close()
     return 0
+
+
+def _recovery_command(args, engine) -> int:
+    """arion recovery list|show|acknowledge (durable registry, ADR-020).
+
+    Talks to the recovery store / engine domain interfaces only - never raw
+    SQLite. Output is bounded and secret-free (identifiers + reasons only).
+    """
+    import json
+
+    store = getattr(engine, "recovery_store", None)
+    if store is None:
+        print("mutation recovery registry is not available on this engine")
+        return 1
+
+    def _emit(obj):
+        if getattr(args, "json", False):
+            print(json.dumps(obj, indent=2, default=str))
+        else:
+            print(obj)
+
+    if args.recovery_command == "list":
+        recs = store.list_recoveries(status=args.status)
+        if args.json:
+            _emit([r.to_dict() for r in recs])
+            return 0
+        for r in recs:
+            line = (f"{r.recovery_id}  {r.status.value:<12} {r.capability}/{r.action}  "
+                    f"{('on ' + str(r.resource)) if r.resource else ''}  task={r.task_id}"
+                    + (f"  goal={r.goal_id}" if r.goal_id else ""))
+            if r.acknowledged_by:
+                line += f"  acknowledged_by={r.acknowledged_by}"
+            print(line)
+        return 0
+
+    if args.recovery_command == "show":
+        rec = store.get_recovery(args.recovery_id)
+        if rec is None:
+            print(f"recovery {args.recovery_id} not found")
+            return 1
+        if args.json:
+            _emit(rec.to_dict())
+            return 0
+        print(f"recovery {rec.recovery_id}: {rec.status.value}")
+        print(f"  {rec.capability}/{rec.action} {('on ' + str(rec.resource)) if rec.resource else ''}")
+        print(f"  task={rec.task_id} step={rec.step_index} goal={rec.goal_id or '-'}")
+        print(f"  reason: {rec.reason}")
+        print(f"  created_at={rec.created_at}")
+        if rec.acknowledged_by:
+            print(f"  acknowledged_by={rec.acknowledged_by} at={rec.acknowledged_at}")
+        return 0
+
+    if args.recovery_command == "acknowledge":
+        try:
+            rec = engine.acknowledge_recovery(args.recovery_id, actor=args.actor)
+        except Exception as exc:
+            print(f"recovery acknowledgement rejected: {exc}")
+            return 1
+        if args.json:
+            _emit(rec.to_dict())
+            return 0
+        print(f"recovery {rec.recovery_id}: {rec.status.value} "
+              f"({rec.capability}/{rec.action}) acknowledged by {rec.acknowledged_by}")
+        return 0
+
+    print(f"unknown recovery command: {args.recovery_command}")
+    return 1
 
 
 def _approvals_command(args, engine) -> int:

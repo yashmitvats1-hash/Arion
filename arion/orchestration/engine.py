@@ -28,6 +28,7 @@ from typing import Any
 
 from arion.capabilities.registry import CapabilityError, CapabilityRegistry
 from arion.state.approvals import ApprovalError, ApprovalRequest, ApprovalStatus, ApprovalStore
+from arion.state.recovery import MutationRecovery, RecoveryError, RecoveryStatus
 from arion.intelligence.plan_schema import PlanValidationError
 from arion.intelligence.plan_validator import topo_sort_steps
 from arion.intelligence.planner import Planner
@@ -80,6 +81,7 @@ class ArionEngine:
         goal_manager: Any | None = None,
         approval_store: ApprovalStore | None = None,
         approval_ttl_seconds: float | None = None,
+        recovery_store: Any | None = None,
     ):
         self.storage = storage
         self.registry = registry
@@ -104,6 +106,126 @@ class ArionEngine:
         # Stale-PENDING retention (ADR-019): None = never expire; a positive
         # value expires PENDING requests older than now-ttl on demand.
         self.approval_ttl_seconds = approval_ttl_seconds
+        # Durable mutation recovery registry (ADR-020): the storage backend is
+        # the default implementation; an explicit store can be injected.
+        self.recovery_store = recovery_store
+        if self.recovery_store is None and hasattr(storage, "create_recovery"):
+            self.recovery_store = storage  # type: ignore[assignment]
+
+    # ---------- mutation recovery (ADR-020) ----------
+
+    def _has_open_recovery(self, goal_id: str | None) -> bool:
+        """True when the goal has any unacknowledged mutation-recovery record.
+
+        Recovery is a durable gate, NOT an authorization decision: it only
+        means 'a previous non-retry-safe mutation failed and needs explicit
+        handling'. It never authorizes anything.
+        """
+        if self.recovery_store is None or not goal_id:
+            return False
+        return any(
+            r.status == RecoveryStatus.REQUIRED
+            for r in self.recovery_store.list_recoveries(goal_id=goal_id)
+        )
+
+    def _record_recovery_required(self, task: Task, step: PlanStep, spec,
+                                  reason: str) -> MutationRecovery | None:
+        """Durably record that a non-retry-safe mutation failed (ADR-020).
+
+        Idempotent per (task_id, step_index): a REQUIRED record is never
+        duplicated. Also gates the goal durably with a `recovery_required`
+        blocker so no fresh plan can proceed until the operator explicitly
+        acknowledges the recovery. The record carries bounded metadata only.
+        """
+        if self.recovery_store is None:
+            return None
+        existing = [
+            r for r in self.recovery_store.list_recoveries(task_id=task.id)
+            if r.step_index == step.index and r.status == RecoveryStatus.REQUIRED
+        ]
+        rec = existing[0] if existing else None
+        if rec is None:
+            resource = step.params.get(spec.resource_param) if getattr(spec, "resource_param", None) else None
+            rec = MutationRecovery(
+                recovery_id=new_id("recovery"),
+                task_id=task.id,
+                goal_id=task.goal_id,
+                step_index=step.index,
+                capability=step.capability,
+                action=step.action,
+                resource=resource if isinstance(resource, str) else None,
+                reason=(reason or "mutation failed; recovery required")[:500],
+            )
+            self.recovery_store.create_recovery(rec)
+            self._emit("recovery.required", task_id=task.id, step_id=_step_id(step),
+                       success=False, detail={
+                           "recovery_id": rec.recovery_id,
+                           "task_id": rec.task_id,
+                           "step_index": rec.step_index,
+                           "goal_id": rec.goal_id,
+                           "capability": rec.capability,
+                           "action": rec.action,
+                           "resource": rec.resource,
+                           "reason": rec.reason[:200],
+                       })
+        # Durable goal gate: no fresh plan/task until this recovery is
+        # explicitly acknowledged. Idempotent by blocker key.
+        if self.goal_manager is not None and task.goal_id:
+            try:
+                self.goal_manager.set_blocked(task.goal_id, {
+                    "type": "recovery_required",
+                    "task_id": task.id,
+                    "step_index": step.index,
+                    "capability": step.capability,
+                    "action": step.action,
+                    "resource": step.params.get(spec.resource_param) if getattr(spec, "resource_param", None) else None,
+                    "recovery_id": rec.recovery_id,
+                    "reason": "mutation failed; recovery required (non-retry-safe)",
+                }, reason="recovery_required")
+            except Exception:
+                pass
+        return rec
+
+    def acknowledge_recovery(self, recovery_id: str, actor: str = "operator") -> MutationRecovery:
+        """Explicit, durable recovery transition (ADR-020).
+
+        `RECOVERY_REQUIRED -> RECOVERY_ACKNOWLEDGED` recorded by an explicit
+        caller. It ONLY records 'the previous failed mutation has been handled
+        and the goal may plan again' - it cannot execute a capability, cannot
+        grant authorization, cannot reuse or resurrect approvals, and cannot
+        erase the mutation-failure history (the record + audit trail persist).
+        """
+        if self.recovery_store is None:
+            raise RecoveryError("recovery registry is not available on this engine")
+        rec = self.recovery_store.get_recovery(recovery_id)
+        if rec is None:
+            raise RecoveryError(f"unknown recovery id: {recovery_id}")
+        if rec.status != RecoveryStatus.REQUIRED:
+            raise RecoveryError(f"recovery {recovery_id} is already {rec.status.value}")
+        rec.status = RecoveryStatus.ACKNOWLEDGED
+        rec.acknowledged_at = utcnow()
+        rec.acknowledged_by = actor
+        self.recovery_store.update_recovery(rec)
+        self._emit("recovery.acknowledged", task_id=rec.task_id,
+                   step_id=f"{rec.task_id}:{rec.step_index}", detail={
+                       "recovery_id": rec.recovery_id,
+                       "goal_id": rec.goal_id,
+                       "task_id": rec.task_id,
+                       "step_index": rec.step_index,
+                       "capability": rec.capability,
+                       "action": rec.action,
+                       "resource": rec.resource,
+                       "acknowledged_by": actor,
+                   })
+        # Clear the goal's recovery gate once NO open recoveries remain.
+        if self.goal_manager is not None and rec.goal_id:
+            try:
+                if not self._has_open_recovery(rec.goal_id):
+                    self.goal_manager.clear_blocker(rec.goal_id, "recovery_required",
+                                                    reason="recovery_acknowledged")
+            except Exception:
+                pass
+        return self.recovery_store.get_recovery(recovery_id)
 
     # ---------- approval expiry (ADR-019) ----------
 
@@ -309,6 +431,8 @@ class ArionEngine:
                     return gm.get_goal(goal_id)
                 if self._block_on_missing_capability(goal_id, gm):
                     return gm.get_goal(goal_id)
+                if self._block_on_open_recovery(goal_id, gm):
+                    return gm.get_goal(goal_id)
                 task = self._plan_for_goal(goal_id, replan_reason=result.evidence.get("reason"))
                 if task is not None:
                     task = self.run_task(task.id)
@@ -326,11 +450,36 @@ class ArionEngine:
                 continue
             if self._block_on_missing_capability(goal_id, gm):
                 return gm.get_goal(goal_id)
+            if self._block_on_open_recovery(goal_id, gm):
+                return gm.get_goal(goal_id)
             task = self._plan_for_goal(goal_id, replan_reason=None)
             if task is not None:
                 task = self.run_task(task.id)
                 if task.status in (TaskStatus.FAILED, TaskStatus.AWAITING_APPROVAL):
                     return gm.get_goal(goal_id)
+
+    def _block_on_open_recovery(self, goal_id: str, gm) -> bool:
+        """Gate the goal before planning while a mutation recovery is open (ADR-020).
+
+        A failed non-retry-safe mutation leaves a durable REQUIRED recovery
+        record; while ANY such record exists for the goal, fresh planning is
+        durably blocked (recovery_required blocker) until an operator
+        explicitly acknowledges the recovery. Recovery is a GATE, never an
+        authorization - a fresh plan still needs its own approval.
+        """
+        if not self._has_open_recovery(goal_id):
+            return False
+        goal = gm.get_goal(goal_id)
+        if goal is None:
+            return False
+        try:
+            gm.set_blocked(goal_id, {
+                "type": "recovery_required",
+                "reason": "mutation recovery required (non-retry-safe failure)",
+            }, reason="recovery_required")
+        except Exception:
+            pass
+        return True
 
     def _block_on_missing_capability(self, goal_id: str, gm) -> bool:
         """Gate the goal before planning (ADR-017/018).
@@ -1199,6 +1348,8 @@ class ArionEngine:
                     self._emit("mutation.requires_recovery", task_id=task.id,
                                step_id=_step_id(step), success=False,
                                detail={"error": step.error})
+                    if not spec.retry_safe:
+                        self._record_recovery_required(task, step, spec, step.error)
                 self._emit("error", task_id=task.id, step_id=_step_id(step), success=False, detail={"error": step.error})
                 return
 
@@ -1262,6 +1413,11 @@ class ArionEngine:
             self._emit("mutation.requires_recovery", task_id=task.id,
                        step_id=_step_id(step), success=False,
                        detail={"error": step.error, "attempt": step.attempts})
+            # Durable recovery-required condition (ADR-020): the mutation may
+            # have partially applied; a persistent record gates the goal until
+            # an explicit recovery transition. This is a gate, NOT an
+            # authorization - every new mutation still needs its own approval.
+            self._record_recovery_required(task, step, spec, step.error)
 
     def _verify(self, task: Task, step: PlanStep) -> bool:
         policy = step.verification.policy
@@ -1286,6 +1442,28 @@ class ArionEngine:
             ok = bool(result.get("written")) and isinstance(result.get("size"), int) and \
                 result["size"] == expected
             detail = {"policy": policy, "expected_size": expected,
+                      "reported_size": result.get("size")}
+        elif policy == "append_verified":
+            # ADR-020: confirm the intended postcondition WITHOUT another
+            # mutation - prior_size + exactly the appended bytes must equal the
+            # reported new size, and the appended bytes must match the planned
+            # content length. Deterministic, no filesystem re-check needed.
+            expected = None
+            content = step.params.get("content")
+            if isinstance(content, str):
+                expected = len(content.encode("utf-8"))
+            prior = result.get("prior_size")
+            appended = result.get("appended_bytes")
+            ok = (
+                bool(result.get("appended"))
+                and isinstance(prior, int)
+                and isinstance(appended, int)
+                and isinstance(result.get("size"), int)
+                and appended == expected
+                and result["size"] == prior + appended
+            )
+            detail = {"policy": policy, "expected_appended": expected,
+                      "reported_appended": appended, "prior_size": prior,
                       "reported_size": result.get("size")}
         else:
             ok = False
@@ -1377,6 +1555,29 @@ class ArionEngine:
             if self.goal_manager is not None and task.goal_id:
                 try:
                     ctx.plan_history = self.goal_manager.plan_history(task.goal_id)[-5:]
+                except Exception:
+                    pass
+
+            # Mutation-recovery advisory (ADR-020): bounded, informational
+            # records telling the planner that a previous mutation failed /
+            # recovery was required / the action is not retry-safe / fresh
+            # authorization is needed. ADVISORY ONLY - it can never authorize,
+            # clear, or bypass recovery enforcement (the engine re-checks the
+            # durable recovery registry and policy independently).
+            if self.recovery_store is not None and task.goal_id:
+                try:
+                    recs = [
+                        r for r in self.recovery_store.list_recoveries(goal_id=task.goal_id)
+                    ][-10:]
+                    ctx.recovery = [r.to_dict() for r in recs]
+                    if recs:
+                        self._emit("planning.recovery.advisory", task_id=task.id, detail={
+                            "goal_id": task.goal_id,
+                            "recovery_ids": [r.recovery_id for r in recs],
+                            "statuses": sorted({r.status.value for r in recs}),
+                            "count": len(recs),
+                            "advisory_only": True,
+                        })
                 except Exception:
                     pass
 

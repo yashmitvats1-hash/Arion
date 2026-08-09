@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from arion.capabilities.append import FilesystemAppendCapability
 from arion.capabilities.filesystem import FilesystemReadCapability
 from arion.capabilities.write import FilesystemWriteCapability
 from arion.capabilities.git import GitLogCapability
@@ -52,10 +53,12 @@ def build_engine(
 
     registry = CapabilityRegistry()
     registry.register(FilesystemReadCapability(sandbox_root))
-    # filesystem.write (ADR-019) is REGISTRY-DISCOVERABLE but DENIED by the
-    # default policy below (allowed_scopes has no filesystem:write): no
-    # mutation without explicit operator authorization. Fail closed.
+    # filesystem.write (ADR-019) and filesystem.append (ADR-020) are
+    # REGISTRY-DISCOVERABLE but DENIED by the default policy below
+    # (allowed_scopes has no filesystem:write): no mutation without explicit
+    # operator authorization. Fail closed.
     registry.register(FilesystemWriteCapability(sandbox_root))
+    registry.register(FilesystemAppendCapability(sandbox_root))
     registry.register(GitLogCapability(sandbox_root))
     # http.get is DISCOVERABLE by default but DENIED until an operator configures
     # a 'url' resource boundary (fail closed): no allowlist = no network access.

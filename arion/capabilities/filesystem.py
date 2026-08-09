@@ -1,10 +1,13 @@
 """Constrained, read-only filesystem capability.
 
-Security boundary (per architecture decision): NO writes, NO shell execution.
-All paths are resolved against the configured sandbox root and must stay
-inside it (symlink-safe). Access is allowed only for the requested mode.
+Security boundary (per architecture decision): this capability is read-only
+and uses NO shell execution. All paths are resolved against the configured
+sandbox root and must stay inside it (symlink-safe). Access is allowed only
+for the requested mode.
 
-Planned future actions (explicitly NOT built yet): write, list, stat, glob.
+Mutating filesystem actions live in their OWN capabilities behind the same
+boundary model (filesystem.write - ADR-019, filesystem.append - ADR-020).
+Delete/move/glob/stat are explicitly NOT built yet.
 """
 
 from __future__ import annotations

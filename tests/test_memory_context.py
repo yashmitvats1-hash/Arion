@@ -150,9 +150,9 @@ def test_context_digest_shape_is_stable(tmp_path, sandbox):
     mem = router.seen_contexts[-1]["memory"]
     # structured, separated context: historical_facts + reflections +
     # recommendations (guidance) + strategy + environment + plan_history +
-    # provenance + counts
+    # recovery advisory + provenance + counts
     assert set(mem.keys()) == {"episodes", "reflections", "guidance", "strategy",
-                               "environment", "plan_history", "provenance", "counts"}
+                               "environment", "plan_history", "recovery", "provenance", "counts"}
     assert isinstance(mem["plan_history"], list)  # bounded, immutable plan versions
     assert set(mem["counts"].keys()) == {"episodes", "reflections", "guidance"}
     # provenance answers "which memory influenced this plan?"

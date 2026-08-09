@@ -196,6 +196,8 @@ class PlanningContext:
     strategy: Any | None = None                                    # Strategy (ADR-015), informational
     environment: list = field(default_factory=list)                # current world-state facts (bounded)
     plan_history: list = field(default_factory=list)               # previous goal plan versions (bounded, immutable)
+    recovery: list = field(default_factory=list)                   # ADVISORY mutation-recovery records (ADR-020);
+                                                                   # bounded, informational - never authorization
     budget: ContextBudget = field(default_factory=ContextBudget)
 
     def __post_init__(self) -> None:
@@ -277,6 +279,22 @@ class PlanningContext:
             }
             for p in self.plan_history[-3:]
         ]
+        # ADVISORY mutation-recovery records (ADR-020): bounded metadata with
+        # provenance. Informs planning; NEVER authorizes anything.
+        recovery_block = [
+            {
+                "recovery_id": r.get("recovery_id"),
+                "task_id": r.get("task_id"),
+                "step_index": r.get("step_index"),
+                "capability": r.get("capability"),
+                "action": r.get("action"),
+                "resource": r.get("resource"),
+                "status": r.get("status"),
+                "reason": (r.get("reason") or "")[:200],
+                "created_at": r.get("created_at"),
+            }
+            for r in self.recovery[:10]
+        ]
         # Provenance: which memories influenced this context (IDs only).
         prov = {
             "episode_ids": [e.episode_id for e in episodes],
@@ -292,6 +310,7 @@ class PlanningContext:
             "strategy": strategy_block,
             "environment": env_block,
             "plan_history": plan_history_block,
+            "recovery": recovery_block,
             "provenance": prov,
             "counts": {"episodes": len(ep), "reflections": len(ref), "guidance": len(guide)},
         }

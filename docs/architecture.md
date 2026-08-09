@@ -365,6 +365,38 @@ loop (ADR-016):
   (not fingerprinted) — both directions proven by tests.
 - **Demo:** `scripts/demo_adr019_write_approval.py` (scenarios A–E, offline).
 
+## filesystem.append + Mutation Recovery Fencing (ADR-020)
+
+- **`filesystem.append`** (`arion/capabilities/append.py`) — second mutating
+  capability, same `filesystem:write` scope: bounded plain-text append, pure
+  `Path` I/O (no shell/subprocess), NEVER clobbers existing content; creation
+  of a missing file requires explicit `create: true`
+  (`security_relevant_params=["create"]`, fingerprinted). `risk=high`,
+  `side_effects=mutating`, `retry_safe=False`, `append_verified`
+  deterministic postcondition verification (prior_size + appended bytes ==
+  size, no second mutation). Containment via `_resolve_inside` (traversal /
+  absolute / symlink escapes fail closed). Registry-discoverable via
+  bootstrap, DENIED by the default policy (fail closed).
+- **Durable mutation recovery registry** (`arion/state/recovery.py`) —
+  `MutationRecovery` records (`REQUIRED | ACKNOWLEDGED`) + `RecoveryStore`
+  (SQLite `mutation_recoveries` table). A failed non-retry-safe mutation
+  durably records `REQUIRED` and attaches a `recovery_required` goal blocker;
+  `run_goal` blocks fresh planning until an explicit, durable, audited,
+  restart-safe `acknowledge_recovery(recovery_id, actor)` transition.
+  Recovery is a GATE, never an authorization: after acknowledging, a fresh
+  task still needs its own approval; expired/denied approvals stay
+  expired/denied; failure history is never erased; memory/reflection/
+  guidance/model output can neither clear nor trigger recovery.
+- **Advisory fencing** — the planning context carries bounded
+  `recovery` advisory records with provenance (`planning.recovery.advisory`):
+  "mutation previously failed / recovery required / not retry-safe / fresh
+  authorization needed". Planning information only; the engine enforces the
+  durable recovery state and policy independently (adversarial tests prove
+  poisoned guidance cannot execute a mutation).
+- **CLI:** `arion recovery list|show|acknowledge <id>` with `--json`
+  (domain/store interfaces only; bounded, secret-free, fail-closed).
+- **Demo:** `scripts/demo_adr020_append_recovery.py` (scenarios A–E, offline).
+
 ## Structured intelligence boundary (ADR-011)
 
 ```
@@ -430,6 +462,9 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/python scripts/demo_approval_queue.py  # durable approval queue + http.get demo (offline)
 .venv/bin/python scripts/demo_adr016_goal_replan.py     # 3-cycle + restart + live-authz demo (offline)
 .venv/bin/python scripts/demo_adr019_write_approval.py  # write approval A-E demo (offline)
+.venv/bin/python scripts/demo_adr020_append_recovery.py # append + recovery A-E demo (offline)
+.venv/bin/arion recovery list        # mutation recovery registry (ADR-020)
+.venv/bin/arion recovery acknowledge <recovery_id>
 .venv/bin/python -m pytest
 ```
 

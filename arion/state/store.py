@@ -13,6 +13,7 @@ from typing import Any, Protocol
 
 from arion.state.models import Checkpoint, Goal, Task, utcnow
 from arion.observability.events import AuditEvent
+from arion.state.recovery import MutationRecovery
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS goals (
@@ -83,6 +84,22 @@ CREATE TABLE IF NOT EXISTS approval_requests (
     updated_at     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_task ON approval_requests(task_id, step_index);
+CREATE TABLE IF NOT EXISTS mutation_recoveries (
+    recovery_id     TEXT PRIMARY KEY,
+    task_id         TEXT NOT NULL,
+    goal_id         TEXT,
+    step_index      INTEGER NOT NULL,
+    capability      TEXT NOT NULL,
+    action          TEXT NOT NULL,
+    resource        TEXT,
+    reason          TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    acknowledged_at TEXT,
+    acknowledged_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_recoveries_goal ON mutation_recoveries(goal_id, status);
+CREATE INDEX IF NOT EXISTS idx_recoveries_task ON mutation_recoveries(task_id, step_index);
 """
 
 
@@ -323,6 +340,58 @@ class SQLiteStorage:
         ).fetchone()
         return _approval_from_row(row) if row else None
 
+    # ---- mutation recovery registry (ADR-020) ----
+
+    _RECOVERY_COLS = (
+        "recovery_id", "task_id", "goal_id", "step_index", "capability", "action",
+        "resource", "reason", "status", "created_at", "acknowledged_at", "acknowledged_by",
+    )
+
+    def create_recovery(self, recovery: "MutationRecovery") -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO mutation_recoveries "
+            f"({', '.join(self._RECOVERY_COLS)}) VALUES ({', '.join('?' * len(self._RECOVERY_COLS))})",
+            _recovery_row(recovery),
+        )
+        self._conn.commit()
+
+    def get_recovery(self, recovery_id: str) -> "MutationRecovery | None":
+        row = self._conn.execute(
+            f"SELECT {', '.join(self._RECOVERY_COLS)} FROM mutation_recoveries WHERE recovery_id=?",
+            (recovery_id,),
+        ).fetchone()
+        return _recovery_from_row(row) if row else None
+
+    def list_recoveries(self, status: str | None = None,
+                        goal_id: str | None = None,
+                        task_id: str | None = None) -> list["MutationRecovery"]:
+        cols = ", ".join(self._RECOVERY_COLS)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if goal_id:
+            clauses.append("goal_id = ?")
+            params.append(goal_id)
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT {cols} FROM mutation_recoveries {where} ORDER BY created_at", params
+        ).fetchall()
+        return [_recovery_from_row(r) for r in rows]
+
+    def update_recovery(self, recovery: "MutationRecovery") -> None:
+        self._conn.execute(
+            "UPDATE mutation_recoveries SET status=?, acknowledged_at=?, acknowledged_by=?, "
+            "reason=? WHERE recovery_id=?",
+            (recovery.status.value, recovery.acknowledged_at, recovery.acknowledged_by,
+             recovery.reason, recovery.recovery_id),
+        )
+        self._conn.commit()
+
     def close(self) -> None:
         self._conn.close()
 
@@ -364,6 +433,22 @@ def _approval_from_row(row: tuple[Any, ...]) -> "ApprovalRequest":
     except (TypeError, json.JSONDecodeError):
         d["fingerprint"] = {}
     return ApprovalRequest.from_dict(d)
+
+
+def _recovery_row(recovery: "MutationRecovery") -> tuple[Any, ...]:
+    return (
+        recovery.recovery_id, recovery.task_id, recovery.goal_id, recovery.step_index,
+        recovery.capability, recovery.action, recovery.resource, recovery.reason,
+        recovery.status.value, recovery.created_at, recovery.acknowledged_at,
+        recovery.acknowledged_by,
+    )
+
+
+def _recovery_from_row(row: tuple[Any, ...]) -> "MutationRecovery":
+    from arion.state.recovery import MutationRecovery
+
+    d = {c: v for c, v in zip(SQLiteStorage._RECOVERY_COLS, row)}
+    return MutationRecovery.from_dict(d)
 
 
 def _goal_from_row(row: tuple[Any, ...]) -> Goal:
