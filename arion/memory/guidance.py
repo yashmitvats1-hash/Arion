@@ -329,9 +329,18 @@ def apply_guidance_to_steps(
 
         s = copy.deepcopy(step)
 
-        # Strategy 1: resource substitution (same capability+action, safe resource)
+        # Strategy 1: resource substitution (same capability+action, safe resource).
+        # The preferred resource must NOT itself be a known-failing target
+        # (race hardening, ADR-016): a 'prefer' from an old episode is not a
+        # license to re-target work onto a resource that has since failed.
         alt = prefer_by_action.get((step.capability, step.action))
-        if alt is not None and alt.resource:
+        alt_avoided = (
+            alt is not None and any(
+                g.capability == alt.capability and g.action == alt.action and g.resource == alt.resource
+                for g in avoid
+            )
+        )
+        if alt is not None and alt.resource and not alt_avoided:
             s.params[param_key] = alt.resource
             provenance = {
                 "category": "resource_substitution",
@@ -348,10 +357,14 @@ def apply_guidance_to_steps(
             transformed.append(s)
             continue
 
-        # Strategy 2: action substitution (different action, same capability)
+        # Strategy 2: action substitution (different action, same capability).
+        # Same race guard: never substitute onto an avoided resource.
         alt_action = None
         for g in prefer_by_capability.get(step.capability, []):
-            if g.action != step.action and g.resource:
+            if g.action != step.action and g.resource and not any(
+                a.capability == g.capability and a.action == g.action and a.resource == g.resource
+                for a in avoid
+            ):
                 alt_action = g
                 break
         if alt_action is not None:

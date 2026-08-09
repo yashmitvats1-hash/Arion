@@ -291,16 +291,17 @@ def test_goal_manager_tracks_plan_versions(tmp_path, sandbox):
     db = tmp_path / "gm.db"
     store = SQLiteCognitiveStore(db)
     storage = SQLiteStorage(db)
-    gm = GoalManager(store, storage=storage)
+    gm = GoalManager(storage, cognitive_store=store)
 
     assert gm.next_plan_version("goal_1") == 1
-    p1 = gm.record_plan("goal_1", "direct", [{"index": 0}])
+    p1 = gm.record_plan_version("goal_1", "direct", [{"index": 0}], reason="initial_plan")
     assert p1["plan_version"] == 1
-    p2 = gm.record_plan("goal_1", "avoid_known_failures", [{"index": 0}, {"index": 1}])
+    p2 = gm.record_plan_version("goal_1", "avoid_known_failures", [{"index": 0}, {"index": 1}], reason="replan_task_failed")
     assert p2["plan_version"] == 2
     history = gm.plan_history("goal_1")
     assert [h["plan_version"] for h in history] == [1, 2]
     assert gm.latest_plan("goal_1")["strategy"] == "avoid_known_failures"
+    assert gm.latest_plan("goal_1")["reason"] == "replan_task_failed"
     # progress across sessions from tasks
     g = __import__("arion.state.models", fromlist=["Goal"]).Goal(id="goal_1", description="long goal")
     storage.save_goal(g)

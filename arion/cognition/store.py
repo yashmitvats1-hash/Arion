@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS goal_plans (
     plan_version INTEGER NOT NULL,
     strategy     TEXT NOT NULL,
     plan_summary TEXT NOT NULL,
+    reason       TEXT NOT NULL DEFAULT '',
     created_at   TEXT NOT NULL,
     PRIMARY KEY (goal_id, plan_version)
 );
@@ -71,7 +72,7 @@ _BELIEF_COLS = ["belief_id", "category", "statement", "confidence", "importance"
                 "provenance", "source", "version", "superseded_at", "created_at", "updated_at"]
 _PREF_COLS = ["preference_id", "key", "value", "user", "source", "provenance", "created_at", "updated_at"]
 _FACT_COLS = ["fact_id", "key", "value", "source", "version", "observed_at", "created_at", "updated_at"]
-_GOAL_PLAN_COLS = ["goal_id", "plan_version", "strategy", "plan_summary", "created_at"]
+_GOAL_PLAN_COLS = ["goal_id", "plan_version", "strategy", "plan_summary", "reason", "created_at"]
 
 
 class SQLiteCognitiveStore:
@@ -101,6 +102,9 @@ class SQLiteCognitiveStore:
             self._conn.execute("ALTER TABLE environment_facts ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
         if "observed_at" not in fcols:
             self._conn.execute("ALTER TABLE environment_facts ADD COLUMN observed_at TEXT")
+        gcols = {r[1] for r in self._conn.execute("PRAGMA table_info(goal_plans)").fetchall()}
+        if "reason" not in gcols:
+            self._conn.execute("ALTER TABLE goal_plans ADD COLUMN reason TEXT NOT NULL DEFAULT ''")
 
     # ---- beliefs (append-only + versioned) ----
 
@@ -259,11 +263,12 @@ class SQLiteCognitiveStore:
 
     # ---- long-horizon goal plans ----
 
-    def record_goal_plan(self, goal_id: str, plan_version: int, strategy: str, plan_summary: list[dict]) -> None:
+    def record_goal_plan(self, goal_id: str, plan_version: int, strategy: str,
+                         plan_summary: list[dict], reason: str = "") -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO goal_plans "
             f"({', '.join(_GOAL_PLAN_COLS)}) VALUES ({', '.join('?' * len(_GOAL_PLAN_COLS))})",
-            (goal_id, plan_version, strategy, json.dumps(plan_summary), utcnow()),
+            (goal_id, plan_version, strategy, json.dumps(plan_summary), reason, utcnow()),
         )
         self._conn.commit()
 
@@ -272,7 +277,7 @@ class SQLiteCognitiveStore:
             "SELECT " + ", ".join(_GOAL_PLAN_COLS) + " FROM goal_plans WHERE goal_id=? ORDER BY plan_version",
             (goal_id,),
         ).fetchall()
-        return [{c: v for c, v in zip(_GOAL_PLAN_COLS, r)} for r in rows]
+        return [_goal_plan_from_row(r) for r in rows]
 
     def latest_goal_plan(self, goal_id: str) -> dict[str, Any] | None:
         rows = self._conn.execute(
@@ -280,7 +285,7 @@ class SQLiteCognitiveStore:
             "ORDER BY plan_version DESC LIMIT 1",
             (goal_id,),
         ).fetchall()
-        return {c: v for c, v in zip(_GOAL_PLAN_COLS, rows[0])} if rows else None
+        return _goal_plan_from_row(rows[0]) if rows else None
 
     # ---- aggregate ----
 
@@ -301,6 +306,15 @@ class SQLiteCognitiveStore:
 
     def close(self) -> None:
         self._conn.close()
+
+
+def _goal_plan_from_row(row: tuple[Any, ...]) -> dict[str, Any]:
+    d = {c: v for c, v in zip(_GOAL_PLAN_COLS, row)}
+    try:
+        d["plan_summary"] = json.loads(d["plan_summary"])
+    except (TypeError, json.JSONDecodeError):
+        d["plan_summary"] = []
+    return d
 
 
 def _belief_from_row(row: tuple[Any, ...]) -> Belief:

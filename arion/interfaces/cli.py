@@ -101,6 +101,28 @@ def build_parser() -> argparse.ArgumentParser:
     cog_goals = cog_sub.add_parser("goals", help="long-horizon goal plan history", parents=[common, common_memory])
     cog_goals.add_argument("goal_id", help="goal id to inspect")
 
+    goals = sub.add_parser("goals", help="durable goal management (ADR-016)")
+    goals.add_argument("--db", default=None, dest="db_goals", help=argparse.SUPPRESS)
+    goals_sub = goals.add_subparsers(dest="goals_command", required=True)
+
+    goals_list = goals_sub.add_parser("list", help="list goals", parents=[common, common_memory])
+    goals_list.add_argument("--status", default=None)
+
+    goals_show = goals_sub.add_parser("show", help="show a goal", parents=[common, common_memory])
+    goals_show.add_argument("goal_id")
+
+    goals_prog = goals_sub.add_parser("progress", help="goal progress", parents=[common, common_memory])
+    goals_prog.add_argument("goal_id")
+
+    goals_pause = goals_sub.add_parser("pause", help="pause a goal", parents=[common, common_memory])
+    goals_pause.add_argument("goal_id")
+
+    goals_resume = goals_sub.add_parser("resume", help="resume a goal", parents=[common, common_memory])
+    goals_resume.add_argument("goal_id")
+
+    goals_cancel = goals_sub.add_parser("cancel", help="cancel a goal", parents=[common, common_memory])
+    goals_cancel.add_argument("goal_id")
+
     return parser
 
 
@@ -108,7 +130,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     root = Path(__file__).resolve().parent.parent.parent
     db_path = (args.db or args.db_global or getattr(args, "db_mem", None)
-               or getattr(args, "db_cog", None) or str(root / "arion_data" / "arion.db"))
+               or getattr(args, "db_cog", None) or getattr(args, "db_goals", None)
+               or str(root / "arion_data" / "arion.db"))
 
     engine = build_engine(
         db_path=db_path,
@@ -146,9 +169,85 @@ def main(argv: list[str] | None = None) -> int:
         return _memory_command(args, engine)
     elif args.command == "cognition":
         return _cognition_command(args, engine)
+    elif args.command == "goals":
+        return _goals_command(args, engine)
 
     storage.close()
     return 0
+
+
+def _goals_command(args, engine) -> int:
+    """arion goals list|show|progress|pause|resume|cancel"""
+    import json
+
+    gm = getattr(engine, "goal_manager", None)
+    if gm is None:
+        print("goal manager is disabled for this engine")
+        return 1
+
+    def _emit(obj):
+        if getattr(args, "json", False):
+            print(json.dumps(obj, indent=2, default=str))
+        else:
+            print(obj)
+
+    if args.goals_command == "list":
+        goals = gm.list_goals(status=args.status)
+        if args.json:
+            _emit([g.to_dict() for g in goals])
+            return 0
+        for g in goals:
+            print(f"{g.id}  {g.status_value:<10} v{g.version} strategy={g.strategy or '-'}  {g.description[:50]!r}")
+        return 0
+
+    if args.goals_command == "show":
+        summary = gm.summarize(args.goal_id)
+        if not summary.get("exists"):
+            print(f"goal {args.goal_id} not found")
+            return 1
+        if args.json:
+            _emit(summary)
+            return 0
+        print(f"goal {args.goal_id}: status={summary['status']} v{summary['goal_version']}")
+        print(f"  description: {summary.get('description', '')}")
+        print(f"  strategy: {summary['strategy'] or '-'}")
+        print(f"  plan versions: {summary['plan_versions']} (latest v{summary['latest_plan_version']} {summary['latest_strategy']})")
+        print(f"  blockers: {len(summary['blockers'])}")
+        print(f"  progress: {summary['progress']}")
+        print(f"  tasks: {summary['tasks']}")
+        return 0
+
+    if args.goals_command == "progress":
+        result, goal = gm.evaluate(args.goal_id)
+        if args.json:
+            _emit({"evaluation": result.to_dict(), "goal": goal.to_dict()})
+            return 0
+        print(f"goal {args.goal_id}: progress={result.progress:.2f} status={result.status} next_action={result.next_action}")
+        print(f"  evidence: {result.evidence}")
+        if result.blockers:
+            print(f"  blockers: {result.blockers}")
+        return 0
+
+    from arion.state.models import GoalStateError
+
+    def _transition(goal_id, fn, verb):
+        try:
+            goal = fn(goal_id)
+        except GoalStateError as exc:
+            print(f"goal {goal_id} transition rejected (fail closed): {exc}")
+            return 1
+        _emit(f"goal {goal_id} {verb} (v{goal.version})" if not args.json else goal.to_dict())
+        return 0
+
+    if args.goals_command == "pause":
+        return _transition(args.goal_id, lambda g: gm.pause(g, reason="cli_pause"), "paused")
+    if args.goals_command == "resume":
+        return _transition(args.goal_id, lambda g: gm.resume(g, reason="cli_resume"), "resumed")
+    if args.goals_command == "cancel":
+        return _transition(args.goal_id, lambda g: gm.cancel(g, reason="cli_cancel"), "cancelled")
+
+    print(f"unknown goals command: {args.goals_command}")
+    return 1
 
 
 def _cognition_command(args, engine) -> int:

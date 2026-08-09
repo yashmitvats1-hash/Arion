@@ -117,6 +117,60 @@ def test_authorization_denial_creates_denied_episode(tmp_path, sandbox):
     assert "authorization:denied" in ep.tags
 
 
+def test_completed_task_is_not_labeled_recovered(tmp_path, sandbox):
+    """A task that runs to completion in one process (resuming from its
+    plan-only checkpoint is the normal start-of-run boundary, NOT an
+    interruption) yields a 'completed' episode - so successful outcomes
+    produce prefer guidance instead of being discarded as 'recovered'."""
+    engine, memory = _engine(tmp_path / "e.db", sandbox)
+    task = engine.execute_goal("summarize this repository")
+    assert task.status == TaskStatus.COMPLETED
+    episodes = memory.list_recent(limit=5)
+    completed = [e for e in episodes if e.task_id == task.id]
+    assert completed and completed[0].outcome == "completed"
+    assert "recovery:resumed" not in completed[0].tags
+    # prefer guidance is derivable from the completed episode (learned success)
+    from arion.memory.guidance import DeterministicMemoryGuidance
+    from arion.memory.reflector import DeterministicReflector
+    guidance = DeterministicMemoryGuidance().build(
+        completed,
+        [DeterministicReflector().reflect(completed[0])],
+    )
+    assert any(g.category == "prefer" for g in guidance)
+    engine.storage.close()
+    memory.close()
+
+
+def test_mid_execution_resume_is_labeled_recovered(tmp_path, sandbox):
+    """A task interrupted mid-execution and resumed across a restart is
+    genuinely 'recovered' (interruption happened during step execution)."""
+    db = tmp_path / "rec.db"
+    engine_a, memory_a = _engine(db, sandbox)
+    task_a = engine_a.create_task(engine_a.submit_goal("summarize this repository"))
+    # plan + run in process A; then simulate a crash mid-execution by
+    # checkpointing after the FIRST step completed, and resume in process B.
+    task_a = engine_a._plan(task_a)
+    task_a_id = task_a.id
+    # mimic a mid-execution checkpoint (status RUNNING, as the engine saves it
+    # after a step completes) - the interruption happened DURING execution
+    task_a.status = TaskStatus.RUNNING
+    task_a.current_step = 1
+    engine_a._checkpoint(task_a, reason="step completed")
+    engine_a.storage.save_task(task_a)
+    engine_a.storage.close()
+    memory_a.close()
+
+    engine_b, memory_b = _engine(db, sandbox)
+    resumed = engine_b.run_task(task_a_id)
+    assert resumed.status == TaskStatus.COMPLETED
+    episodes = memory_b.list_recent(limit=5)
+    ep = next(e for e in episodes if e.task_id == task_a_id)
+    assert ep.outcome == "recovered"
+    assert "recovery:resumed" in ep.tags
+    engine_b.storage.close()
+    memory_b.close()
+
+
 def test_restart_preserves_episodes_and_reflections(tmp_path, sandbox):
     """Task A executes in process 1; process 2 sees the episode + reflection."""
     db = tmp_path / "r.db"

@@ -16,11 +16,18 @@ from arion.observability.events import AuditEvent
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS goals (
-    id          TEXT PRIMARY KEY,
-    description TEXT NOT NULL,
-    source      TEXT NOT NULL,
-    status      TEXT NOT NULL,
-    created_at  TEXT NOT NULL
+    id                 TEXT PRIMARY KEY,
+    description        TEXT NOT NULL,
+    source             TEXT NOT NULL,
+    status             TEXT NOT NULL,
+    version            INTEGER NOT NULL DEFAULT 1,
+    strategy           TEXT,
+    blockers           TEXT NOT NULL DEFAULT '[]',
+    progress_metadata  TEXT NOT NULL DEFAULT '{}',
+    last_evaluated_at  TEXT,
+    last_replan_reason TEXT,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS tasks (
     id          TEXT PRIMARY KEY,
@@ -59,7 +66,7 @@ class Storage(Protocol):
 
     def save_goal(self, goal: Goal) -> None: ...
     def load_goal(self, goal_id: str) -> Goal | None: ...
-    def list_goals(self) -> list[Goal]: ...
+    def list_goals(self, status: str | None = None) -> list[Goal]: ...
 
     def save_task(self, task: Task) -> None: ...
     def load_task(self, task_id: str) -> Task | None: ...
@@ -84,24 +91,68 @@ class SQLiteStorage:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._conn.executescript(SCHEMA)
+        self._migrate_goals()
         self._conn.commit()
+
+    def _migrate_goals(self) -> None:
+        """Lightweight additive migration: extend legacy goals rows with the
+        goal-lifecycle columns (ADR-016)."""
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(goals)").fetchall()}
+        additions = {
+            "version": "ALTER TABLE goals ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
+            "strategy": "ALTER TABLE goals ADD COLUMN strategy TEXT",
+            "blockers": "ALTER TABLE goals ADD COLUMN blockers TEXT NOT NULL DEFAULT '[]'",
+            "progress_metadata": "ALTER TABLE goals ADD COLUMN progress_metadata TEXT NOT NULL DEFAULT '{}'",
+            "last_evaluated_at": "ALTER TABLE goals ADD COLUMN last_evaluated_at TEXT",
+            "last_replan_reason": "ALTER TABLE goals ADD COLUMN last_replan_reason TEXT",
+            "updated_at": "ALTER TABLE goals ADD COLUMN updated_at TEXT",
+        }
+        for col, ddl in additions.items():
+            if col not in cols:
+                self._conn.execute(ddl)
 
     # ---- goals ----
 
     def save_goal(self, goal: Goal) -> None:
+        import json as _json
+
+        goal.updated_at = utcnow()
         self._conn.execute(
-            "INSERT OR REPLACE INTO goals (id, description, source, status, created_at) VALUES (?,?,?,?,?)",
-            (goal.id, goal.description, goal.source, goal.status, goal.created_at),
+            "INSERT OR REPLACE INTO goals "
+            "(id, description, source, status, version, strategy, blockers, progress_metadata,"
+            " last_evaluated_at, last_replan_reason, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                goal.id,
+                goal.description,
+                goal.source,
+                goal.status_value,
+                goal.version,
+                goal.strategy,
+                _json.dumps(goal.blockers),
+                _json.dumps(goal.progress_metadata),
+                goal.last_evaluated_at,
+                goal.last_replan_reason,
+                goal.created_at,
+                goal.updated_at,
+            ),
         )
         self._conn.commit()
 
     def load_goal(self, goal_id: str) -> Goal | None:
-        row = self._conn.execute("SELECT * FROM goals WHERE id=?", (goal_id,)).fetchone()
-        return Goal.from_dict(_row_to_dict(row, _GOAL_COLS)) if row else None
+        row = self._conn.execute(
+            "SELECT " + ", ".join(_GOAL_COLS) + " FROM goals WHERE id=?", (goal_id,)
+        ).fetchone()
+        return _goal_from_row(row) if row else None
 
-    def list_goals(self) -> list[Goal]:
-        rows = self._conn.execute("SELECT * FROM goals ORDER BY created_at").fetchall()
-        return [Goal.from_dict(_row_to_dict(r, _GOAL_COLS)) for r in rows]
+    def list_goals(self, status: str | None = None) -> list[Goal]:
+        cols = ", ".join(_GOAL_COLS)
+        if status:
+            rows = self._conn.execute(
+                f"SELECT {cols} FROM goals WHERE status=? ORDER BY created_at", (status,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute(f"SELECT {cols} FROM goals ORDER BY created_at").fetchall()
+        return [_goal_from_row(r) for r in rows]
 
     # ---- tasks ----
 
@@ -190,7 +241,8 @@ class SQLiteStorage:
         self._conn.close()
 
 
-_GOAL_COLS = ["id", "description", "source", "status", "created_at"]
+_GOAL_COLS = ["id", "description", "source", "status", "version", "strategy", "blockers",
+              "progress_metadata", "last_evaluated_at", "last_replan_reason", "created_at", "updated_at"]
 _CKPT_COLS = ["id", "task_id", "status", "step_index", "snapshot", "reason", "created_at"]
 
 
@@ -198,3 +250,25 @@ def _row_to_dict(row: tuple[Any, ...], cols: list[str]) -> dict[str, Any]:
     if row is None:
         return {}
     return {c: v for c, v in zip(cols, row)}
+
+
+def _goal_from_row(row: tuple[Any, ...]) -> Goal:
+    d = {c: v for c, v in zip(_GOAL_COLS, row)}
+    # legacy rows may lack the new columns (migration adds them with defaults,
+    # but a row read before migration or with NULLs needs safe defaults)
+    d.setdefault("version", 1)
+    d.setdefault("strategy", None)
+    d.setdefault("blockers", "[]")
+    d.setdefault("progress_metadata", "{}")
+    d.setdefault("last_evaluated_at", None)
+    d.setdefault("last_replan_reason", None)
+    d.setdefault("updated_at", d.get("created_at") or utcnow())
+    try:
+        d["blockers"] = json.loads(d["blockers"])
+    except (TypeError, json.JSONDecodeError):
+        d["blockers"] = []
+    try:
+        d["progress_metadata"] = json.loads(d["progress_metadata"])
+    except (TypeError, json.JSONDecodeError):
+        d["progress_metadata"] = {}
+    return Goal.from_dict(d)

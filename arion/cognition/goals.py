@@ -1,73 +1,367 @@
-"""Long-horizon goal management (ADR-015).
+"""Durable goal management and long-horizon execution (ADR-016).
 
-Long-horizon goals span multiple planning sessions: a goal can accumulate
-PLAN VERSIONS over time (each with its strategy + plan summary), and progress
-can be tracked per goal from its tasks.
+GoalManager is the AUTHORITATIVE state machine for long-lived goals:
 
-  Goal -> Long-Horizon Planning (plan versions) -> Strategy Selection ->
-  Authorization -> Execution -> Observation -> Verification -> Learning
+  Goal -> Goal State -> Strategy -> Plan -> Execute -> Observe -> Learn
+  -> Replan
 
-GoalManager wraps the SQLiteCognitiveStore's goal_plans table plus the
-task storage to report per-goal progress. It is deterministic and
-informational - goals never authorize anything.
+It owns:
+  - goal lifecycle state transitions (validated; invalid transitions FAIL
+    CLOSED via GoalStateError), persisted and restart-safe;
+  - goal versioning (goal.version increments on every state change);
+  - plan versioning (monotonic, immutable previous plans, replay-safe);
+  - progress evaluation (via the ProgressEvaluator seam);
+  - strategy selection (via StrategySelector, explainable + provenance).
+
+It NEVER infers goal completion from a single successful task: completion
+requires a plan whose steps are covered and no blockers/outstanding work.
+
+INFORMATIONAL ONLY: goals, strategies, and progress can influence planning;
+only the live authorization layer authorizes execution.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from arion.state.models import new_id, utcnow
+from arion.cognition.progress import DeterministicProgressEvaluator, ProgressEvaluator, ProgressResult
+from arion.cognition.strategy import StrategySelector
+from arion.state.models import (
+    GOAL_TRANSITIONS,
+    Goal,
+    GoalStateError,
+    GoalStatus,
+    Task,
+    TaskStatus,
+    new_id,
+    utcnow,
+)
 
 
 class GoalManager:
-    """Tracks plan versions and progress for long-horizon goals."""
+    """Authoritative, persistent goal state machine (ADR-016)."""
 
-    def __init__(self, store, storage: Any | None = None):
-        self.store = store       # SQLiteCognitiveStore (goal_plans table)
-        self.storage = storage   # optional SQLiteStorage (tasks per goal)
+    def __init__(
+        self,
+        storage: Any,                       # SQLiteStorage (goals + tasks authoritative)
+        cognitive_store: Any | None = None,  # SQLiteCognitiveStore (goal_plans + beliefs)
+        events: Any | None = None,          # EventLogger (audit events)
+        strategy_selector: Any | None = None,
+        progress_evaluator: ProgressEvaluator | None = None,
+        world_monitor: Any | None = None,
+    ):
+        self.storage = storage
+        self.cognitive_store = cognitive_store
+        self.events = events
+        self.strategy_selector = strategy_selector or StrategySelector()
+        self.progress_evaluator = progress_evaluator or DeterministicProgressEvaluator()
+        self.world_monitor = world_monitor
+
+    # ------------------------------------------------------------------ #
+    # Goal lifecycle
+    # ------------------------------------------------------------------ #
+
+    def create_goal(self, description: str, source: str = "cli") -> Goal:
+        goal = Goal(id=new_id("goal"), description=description, source=source)
+        self.storage.save_goal(goal)
+        self._emit("goal.created", goal_id=goal.id, detail={
+            "goal_id": goal.id, "description": description[:200], "source": source,
+        })
+        return goal
+
+    def get_goal(self, goal_id: str) -> Goal | None:
+        return self.storage.load_goal(goal_id)
+
+    def list_goals(self, status: str | None = None) -> list[Goal]:
+        return self.storage.list_goals(status=status)
+
+    def transition(self, goal_id: str, to_state: str, reason: str, actor: str = "system") -> Goal:
+        """Validate + persist a goal state transition (fail closed)."""
+        goal = self.get_goal(goal_id)
+        if goal is None:
+            raise KeyError(f"goal not found: {goal_id}")
+        to_state = to_state.value if isinstance(to_state, GoalStatus) else to_state
+        if to_state not in GOAL_TRANSITIONS:
+            raise GoalStateError(f"unknown goal state {to_state!r}")
+        allowed = GOAL_TRANSITIONS[goal.status.value]
+        if to_state not in allowed:
+            raise GoalStateError(
+                f"invalid goal transition {goal.status.value!r} -> {to_state!r} for goal {goal_id}"
+            )
+        old_state = goal.status.value
+        goal.status = GoalStatus(to_state)
+        goal.version += 1
+        goal.updated_at = utcnow()
+        if to_state == GoalStatus.ACTIVE.value and goal.blockers:
+            # resuming/unblocking clears resolved blockers
+            goal.blockers = []
+        self.storage.save_goal(goal)
+        self._emit("goal.state.changed", goal_id=goal_id, detail={
+            "goal_id": goal_id,
+            "from": old_state,
+            "to": to_state,
+            "reason": reason[:200],
+            "goal_version": goal.version,
+            "actor": actor,
+        })
+        return goal
+
+    def pause(self, goal_id: str, reason: str = "explicit_pause") -> Goal:
+        return self.transition(goal_id, GoalStatus.PAUSED.value, reason)
+
+    def resume(self, goal_id: str, reason: str = "explicit_resume") -> Goal:
+        return self.transition(goal_id, GoalStatus.ACTIVE.value, reason)
+
+    def cancel(self, goal_id: str, reason: str = "explicit_cancel") -> Goal:
+        return self.transition(goal_id, GoalStatus.CANCELLED.value, reason)
+
+    def fail_goal(self, goal_id: str, reason: str = "goal_failed") -> Goal:
+        goal = self.transition(goal_id, GoalStatus.FAILED.value, reason)
+        goal.last_replan_reason = reason
+        goal.updated_at = utcnow()
+        self.storage.save_goal(goal)
+        return goal
+
+    def complete_goal(self, goal_id: str, reason: str = "all_work_complete") -> Goal:
+        return self.transition(goal_id, GoalStatus.COMPLETED.value, reason)
+
+    def set_blocked(self, goal_id: str, blocker: dict[str, Any], reason: str = "blocker") -> Goal:
+        """Attach a blocker (idempotent by key) and move to BLOCKED."""
+        goal = self.get_goal(goal_id)
+        if goal is None:
+            raise KeyError(f"goal not found: {goal_id}")
+        key = blocker.get("key") or blocker.get("type") or blocker.get("reason") or "blocker"
+        existing = [b for b in (goal.blockers or []) if (b.get("key") or b.get("type")) == key]
+        if not existing:
+            goal.blockers = list(goal.blockers or []) + [{**blocker, "key": key, "added_at": utcnow()}]
+            goal.updated_at = utcnow()
+            self.storage.save_goal(goal)
+        if goal.status == GoalStatus.ACTIVE:
+            return self.transition(goal_id, GoalStatus.BLOCKED.value, reason)
+        return self.get_goal(goal_id)
+
+    def clear_blockers(self, goal_id: str, reason: str = "blocker_resolved") -> Goal:
+        goal = self.get_goal(goal_id)
+        if goal is None:
+            raise KeyError(f"goal not found: {goal_id}")
+        goal.blockers = []
+        goal.updated_at = utcnow()
+        self.storage.save_goal(goal)
+        if goal.status == GoalStatus.BLOCKED:
+            return self.transition(goal_id, GoalStatus.ACTIVE.value, reason)
+        return self.get_goal(goal_id)
+
+    # ------------------------------------------------------------------ #
+    # Plan versioning (immutable, monotonic, replay-safe)
+    # ------------------------------------------------------------------ #
 
     def next_plan_version(self, goal_id: str) -> int:
-        latest = self.store.latest_goal_plan(goal_id)
+        latest = self.cognitive_store.latest_goal_plan(goal_id) if self.cognitive_store else None
         return (latest["plan_version"] + 1) if latest else 1
 
-    def record_plan(self, goal_id: str, strategy: str, plan_summary: list[dict]) -> dict[str, Any]:
-        """Record a new plan version for a goal; returns the record."""
+    def plan_history(self, goal_id: str) -> list[dict[str, Any]]:
+        if self.cognitive_store is None:
+            return []
+        return self.cognitive_store.list_goal_plans(goal_id)
+
+    def latest_plan(self, goal_id: str) -> dict[str, Any] | None:
+        if self.cognitive_store is None:
+            return None
+        return self.cognitive_store.latest_goal_plan(goal_id)
+
+    def record_plan_version(
+        self,
+        goal_id: str,
+        strategy: str,
+        plan_summary: list[dict],
+        reason: str,
+    ) -> dict[str, Any]:
+        """Record a NEW (immutable) plan version for a goal.
+
+        Replay-safe: if the LATEST plan version already matches
+        (strategy, plan_summary, reason) AND no task implements it yet, the
+        existing version is returned instead of creating a duplicate. A task
+        that failed against the latest version triggers a genuinely NEW
+        version (same or different steps) - previous plans are never mutated.
+
+        Returns the plan record {goal_id, plan_version, strategy, plan_summary,
+        reason, created_at}.
+        """
+        latest = self.latest_plan(goal_id)
+        if latest is not None:
+            same = (
+                latest.get("strategy") == strategy
+                and latest.get("plan_summary") == plan_summary
+                and latest.get("reason") == reason
+            )
+            if same and not self._any_task_for_plan(goal_id, latest["plan_version"]):
+                return latest  # replay of the record step: no duplicate version
         version = self.next_plan_version(goal_id)
-        self.store.record_goal_plan(goal_id, version, strategy, plan_summary)
-        return {
+        self.cognitive_store.record_goal_plan(goal_id, version, strategy, plan_summary, reason)
+        record = {
             "goal_id": goal_id,
             "plan_version": version,
             "strategy": strategy,
             "plan_summary": plan_summary,
+            "reason": reason,
             "created_at": utcnow(),
         }
+        # The goal's CURRENT strategy follows the latest plan version
+        # (persisted, restart-safe, still purely informational).
+        goal = self.get_goal(goal_id)
+        if goal is not None and goal.strategy != strategy:
+            goal.strategy = strategy
+            goal.updated_at = utcnow()
+            self.storage.save_goal(goal)
+        self._emit("plan.versioned", goal_id=goal_id, detail={
+            "goal_id": goal_id,
+            "plan_version": version,
+            "strategy": strategy,
+            "reason": reason[:200],
+            "steps": len(plan_summary),
+        })
+        return record
 
-    def plan_history(self, goal_id: str) -> list[dict[str, Any]]:
-        return self.store.list_goal_plans(goal_id)
+    def _any_task_for_plan(self, goal_id: str, plan_version: int) -> bool:
+        for task in self.storage.list_tasks():
+            if task.goal_id == goal_id and task.plan_version == plan_version:
+                return True
+        return False
 
-    def latest_plan(self, goal_id: str) -> dict[str, Any] | None:
-        return self.store.latest_goal_plan(goal_id)
+    def task_history(self, goal_id: str) -> list[Task]:
+        return [t for t in self.storage.list_tasks() if t.goal_id == goal_id]
 
     def progress(self, goal_id: str) -> dict[str, Any]:
-        """Per-goal progress from its tasks (total/completed/failed/pending)."""
-        if self.storage is None:
-            return {"goal_id": goal_id, "tasks": 0, "completed": 0, "failed": 0, "pending": 0}
-        tasks = self.storage.list_tasks()
-        goal_tasks = [t for t in tasks if t.goal_id == goal_id]
+        """Per-goal task progress counts (completion is NOT inferred here -
+        see ProgressEvaluator for the authoritative evaluation)."""
+        tasks = self.task_history(goal_id)
         return {
             "goal_id": goal_id,
-            "tasks": len(goal_tasks),
-            "completed": sum(1 for t in goal_tasks if t.status.value == "completed"),
-            "failed": sum(1 for t in goal_tasks if t.status.value == "failed"),
-            "pending": sum(1 for t in goal_tasks if t.status.value not in ("completed", "failed")),
+            "tasks": len(tasks),
+            "completed": sum(1 for t in tasks if t.status == TaskStatus.COMPLETED),
+            "failed": sum(1 for t in tasks if t.status == TaskStatus.FAILED),
+            "pending": sum(1 for t in tasks if t.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)),
         }
 
+    def pending_task(self, goal_id: str) -> Task | None:
+        """The non-terminal task implementing the LATEST plan version, if any.
+
+        Resume it on restart (replay safety) instead of duplicating work. A
+        stale pending task for an older plan version is NOT resumed - after a
+        replan, a fresh task for the new version is created."""
+        latest = self.latest_plan(goal_id)
+        latest_version = latest["plan_version"] if latest else None
+        for t in self.task_history(goal_id):
+            if t.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                if latest_version is None or t.plan_version == latest_version:
+                    return t
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Progress evaluation
+    # ------------------------------------------------------------------ #
+
+    def evaluate(self, goal_id: str) -> tuple[ProgressResult, Goal]:
+        """Deterministic progress evaluation; updates goal.last_evaluated_at.
+
+        Emits progress.evaluated + goal.evaluated with bounded metadata.
+        """
+        goal = self.get_goal(goal_id)
+        if goal is None:
+            raise KeyError(f"goal not found: {goal_id}")
+        tasks = self.task_history(goal_id)
+        latest_plan = self.latest_plan(goal_id)
+        world_changes = self._relevant_world_changes(goal)
+        result = self.progress_evaluator.evaluate(goal, tasks, latest_plan, world_changes)
+
+        goal.progress_metadata = result.to_dict()
+        goal.last_evaluated_at = utcnow()
+        goal.updated_at = utcnow()
+        self.storage.save_goal(goal)
+
+        self._emit("progress.evaluated", goal_id=goal_id, detail=result.to_dict())
+        self._emit("goal.evaluated", goal_id=goal_id, detail={
+            "goal_id": goal_id,
+            "next_action": result.next_action,
+            "status": result.status,
+            "progress": round(result.progress, 3),
+            "evidence_reason": result.evidence.get("reason"),
+        })
+        return result, self.get_goal(goal_id)
+
+    def _relevant_world_changes(self, goal: Goal) -> list:
+        """Deterministic relevance filter: only changes to facts the goal's
+        plan depends on (capabilities, or keys mentioned in the plan summary)
+        are treated as material. Unrelated changes do NOT trigger replan."""
+        if self.world_monitor is None:
+            return []
+        changes = self.world_monitor.changed_since(goal.last_evaluated_at or goal.created_at)
+        if not changes:
+            return []
+        latest = self.latest_plan(goal.id)
+        plan_text = ""
+        if latest is not None:
+            try:
+                plan_text = str(latest.get("plan_summary", [])).lower()
+            except Exception:
+                plan_text = ""
+        relevant = []
+        for change in changes:
+            key = change.key
+            if key == "registered_capabilities":
+                relevant.append(change)
+            elif key.lower() in plan_text or key in goal.description.lower():
+                relevant.append(change)
+        return relevant
+
+    def strategy_for(self, goal_id: str, goal_description: str, beliefs: list,
+                     environment: dict, guidance: list) -> Any:
+        """Select (and persist) the goal's current strategy with provenance."""
+        previous = [p.get("strategy", "") for p in self.plan_history(goal_id)]
+        strategy = self.strategy_selector.select(
+            goal_description, beliefs, environment, guidance,
+            previous_strategies=[s for s in previous if s],
+        )
+        goal = self.get_goal(goal_id)
+        if goal is not None and goal.strategy != strategy.name:
+            goal.strategy = strategy.name
+            goal.updated_at = utcnow()
+            self.storage.save_goal(goal)
+        return strategy
+
     def summarize(self, goal_id: str) -> dict[str, Any]:
+        goal = self.get_goal(goal_id)
+        if goal is None:
+            return {"goal_id": goal_id, "exists": False}
         latest = self.latest_plan(goal_id)
         return {
             "goal_id": goal_id,
+            "exists": True,
+            "description": goal.description[:300],
+            "status": goal.status_value,
+            "goal_version": goal.version,
+            "strategy": goal.strategy,
+            "blockers": goal.blockers,
             "plan_versions": len(self.plan_history(goal_id)),
-            "latest_strategy": latest["strategy"] if latest else None,
             "latest_plan_version": latest["plan_version"] if latest else None,
-            "progress": self.progress(goal_id),
+            "latest_strategy": latest["strategy"] if latest else None,
+            "latest_reason": latest["reason"] if latest else None,
+            "progress": goal.progress_metadata,
+            "tasks": len(self.task_history(goal_id)),
+            "created_at": goal.created_at,
+            "updated_at": goal.updated_at,
         }
+
+    # ------------------------------------------------------------------ #
+    # Events
+    # ------------------------------------------------------------------ #
+
+    def _emit(self, kind: str, goal_id: str | None, detail: dict[str, Any]) -> None:
+        if self.events is None:
+            return
+        try:
+            from arion.observability.events import AuditEvent
+
+            self.events.emit(AuditEvent(kind=kind, task_id=None, success=True, detail=detail))
+        except Exception:
+            pass

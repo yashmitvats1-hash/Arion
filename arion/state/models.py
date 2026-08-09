@@ -120,6 +120,7 @@ class Task:
     steps: list[PlanStep] = field(default_factory=list)
     current_step: int = 0
     error: str | None = None
+    plan_version: int | None = None  # goal plan version this task implements (ADR-016)
     created_at: str = field(default_factory=utcnow)
     updated_at: str = field(default_factory=utcnow)
     completed_at: str | None = None
@@ -131,7 +132,7 @@ class Task:
         return None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "id": self.id,
             "goal_id": self.goal_id,
             "description": self.description,
@@ -143,6 +144,9 @@ class Task:
             "updated_at": self.updated_at,
             "completed_at": self.completed_at,
         }
+        if self.plan_version is not None:
+            d["plan_version"] = self.plan_version
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Task":
@@ -154,27 +158,89 @@ class Task:
             steps=[PlanStep.from_dict(s) for s in d.get("steps", [])],
             current_step=d.get("current_step", 0),
             error=d.get("error"),
+            plan_version=d.get("plan_version"),
             created_at=d.get("created_at", utcnow()),
             updated_at=d.get("updated_at", utcnow()),
             completed_at=d.get("completed_at"),
         )
 
 
+class GoalStatus(str, Enum):
+    """Explicit goal lifecycle states (ADR-016).
+
+    Transitions are validated by GoalManager; invalid transitions fail closed.
+    Terminal states: COMPLETED, FAILED, CANCELLED.
+    """
+
+    ACTIVE = "active"
+    PAUSED = "paused"
+    BLOCKED = "blocked"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+# Allowed goal state transitions (src -> set of allowed destinations).
+GOAL_TRANSITIONS: dict[str, set[str]] = {
+    GoalStatus.ACTIVE.value: {GoalStatus.PAUSED.value, GoalStatus.BLOCKED.value,
+                              GoalStatus.COMPLETED.value, GoalStatus.FAILED.value,
+                              GoalStatus.CANCELLED.value},
+    GoalStatus.PAUSED.value: {GoalStatus.ACTIVE.value, GoalStatus.CANCELLED.value},
+    GoalStatus.BLOCKED.value: {GoalStatus.ACTIVE.value, GoalStatus.FAILED.value,
+                               GoalStatus.CANCELLED.value},
+    GoalStatus.COMPLETED.value: set(),
+    GoalStatus.FAILED.value: {GoalStatus.ACTIVE.value, GoalStatus.CANCELLED.value},
+    GoalStatus.CANCELLED.value: set(),
+}
+
+
+class GoalStateError(ValueError):
+    """Raised on invalid goal state transitions (fail closed)."""
+
+
 @dataclass
 class Goal:
+    """A persistent, versioned, long-horizon goal (ADR-016).
+
+    Backward compatible: `status` accepts a plain string ("active") and old
+    persisted rows parse into GoalStatus.
+    """
+
     id: str
     description: str
     source: str = "cli"
-    status: str = "active"
+    status: GoalStatus | str = GoalStatus.ACTIVE
+    version: int = 1                      # goal revision counter (increments on state change)
+    strategy: str | None = None           # current strategy name
+    blockers: list[dict[str, Any]] = field(default_factory=list)  # structured blocker records
+    progress_metadata: dict[str, Any] = field(default_factory=dict)  # last evaluation summary
+    last_evaluated_at: str | None = None
+    last_replan_reason: str | None = None
     created_at: str = field(default_factory=utcnow)
+    updated_at: str = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.status, str):
+            self.status = GoalStatus(self.status)
+
+    @property
+    def status_value(self) -> str:
+        return self.status.value
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "description": self.description,
             "source": self.source,
-            "status": self.status,
+            "status": self.status.value,
+            "version": self.version,
+            "strategy": self.strategy,
+            "blockers": self.blockers,
+            "progress_metadata": self.progress_metadata,
+            "last_evaluated_at": self.last_evaluated_at,
+            "last_replan_reason": self.last_replan_reason,
             "created_at": self.created_at,
+            "updated_at": self.updated_at,
         }
 
     @classmethod
@@ -184,7 +250,14 @@ class Goal:
             description=d["description"],
             source=d.get("source", "cli"),
             status=d.get("status", "active"),
+            version=int(d.get("version", 1)),
+            strategy=d.get("strategy"),
+            blockers=list(d.get("blockers", []) or []),
+            progress_metadata=dict(d.get("progress_metadata", {}) or {}),
+            last_evaluated_at=d.get("last_evaluated_at"),
+            last_replan_reason=d.get("last_replan_reason"),
             created_at=d.get("created_at", utcnow()),
+            updated_at=d.get("updated_at", utcnow()),
         )
 
 

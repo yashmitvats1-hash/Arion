@@ -18,6 +18,12 @@ from arion.state.models import new_id, utcnow
 # Canonical event kinds - the vocabulary of the audit trail.
 EVENT_KINDS = (
     "goal.submitted",
+    "goal.created",
+    "goal.state.changed",
+    "goal.evaluated",
+    "goal.replanned",
+    "progress.evaluated",
+    "plan.versioned",
     "task.created",
     "task.planning",
     "plan.produced",

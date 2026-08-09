@@ -14,6 +14,7 @@ from arion.capabilities.filesystem import FilesystemReadCapability
 from arion.capabilities.registry import CapabilityRegistry
 from arion.cognition.deriver import DeterministicBeliefDeriver
 from arion.cognition.goals import GoalManager
+from arion.cognition.progress import DeterministicProgressEvaluator
 from arion.cognition.state import CognitiveState
 from arion.cognition.store import SQLiteCognitiveStore
 from arion.cognition.strategy import StrategySelector
@@ -88,7 +89,17 @@ def build_engine(
         world_monitor = WorldStateMonitor(cognitive_store, sink=events)
         world_monitor.observe("registered_capabilities", sorted(registry.list()), source="system")
         strategy_selector = StrategySelector()
-        goal_manager = GoalManager(cognitive_store, storage=storage)
+        # GoalManager is the authoritative goal state machine (ADR-016):
+        # lifecycle transitions, plan versioning, progress evaluation,
+        # strategy selection, world-state awareness.
+        goal_manager = GoalManager(
+            storage=storage,
+            cognitive_store=cognitive_store,
+            events=events,
+            strategy_selector=strategy_selector,
+            progress_evaluator=DeterministicProgressEvaluator(),
+            world_monitor=world_monitor,
+        )
 
     return ArionEngine(
         storage=storage,

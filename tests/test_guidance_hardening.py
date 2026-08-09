@@ -137,6 +137,50 @@ def test_action_substitution_strategy(sandbox):
     assert tr.transformed[0].guidance[0]["new_action"] == "list"
 
 
+def test_prefer_never_substitutes_onto_an_avoided_resource(sandbox):
+    """Race hardening (ADR-016): a 'prefer' from an old episode must not
+    re-target work onto a resource that has SINCE failed. Substitution falls
+    through to an explicit SKIPPED step (never silently executed)."""
+    reg = _registry(sandbox)
+    steps = [_step(0)]  # read README.md
+    guidance = [
+        _guidance(category="avoid", resource="README.md", gid="g_avoid1", episode="ep_fail1"),
+        _guidance(category="avoid", resource="docs/design.md", gid="g_avoid2", episode="ep_fail2"),
+        _guidance(category="prefer", resource="docs/design.md", gid="g_pref", episode="ep_ok"),
+    ]
+    tr = apply_guidance_to_steps(
+        steps, guidance,
+        resource_param_resolver=lambda cap, act: registry_resource_param(reg, cap, act),
+    )
+    out = tr.transformed[0]
+    assert out.params == {"path": "README.md"}  # NOT redirected to docs/design.md
+    assert out.status.value == "skipped"        # explicitly skipped instead
+    assert tr.decisions[0]["category"] == "step_skipped"
+    # provenance names the avoided resource that blocked substitution
+    assert any(d.get("category") == "step_skipped" and d.get("resource") == "README.md"
+               for d in tr.decisions)
+
+
+def test_action_substitution_refuses_avoided_preferred_resource(sandbox):
+    """Same race guard for action substitution: an alternative action whose
+    resource is also known-failing must not be chosen."""
+    reg = _registry(sandbox)
+    steps = [_step(0)]  # read README.md
+    guidance = [
+        _guidance(category="avoid", resource="README.md", gid="g_avoid1"),
+        _guidance(category="avoid", action="list", resource="docs/design.md", gid="g_avoid2"),
+        _guidance(category="prefer", action="list", resource="docs/design.md", gid="g_pref"),
+    ]
+    tr = apply_guidance_to_steps(
+        steps, guidance,
+        resource_param_resolver=lambda cap, act: registry_resource_param(reg, cap, act),
+    )
+    out = tr.transformed[0]
+    assert out.action == "read"             # NOT switched to list
+    assert out.status.value == "skipped"    # explicitly skipped
+    assert tr.decisions[0]["category"] == "step_skipped"
+
+
 def test_apply_guidance_skips_step_when_no_safe_alternative(sandbox):
     """EXPLICIT skip: the avoided step is RETAINED with status SKIPPED and its
     provenance - never silently deleted (the engine always has a terminal

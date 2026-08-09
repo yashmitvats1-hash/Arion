@@ -96,13 +96,19 @@ class ArionEngine:
     # ---------- public API ----------
 
     def submit_goal(self, description: str, source: str = "cli") -> Goal:
-        goal = Goal(id=new_id("goal"), description=description, source=source)
-        self.storage.save_goal(goal)
+        """Create a lifecycle goal (ADR-016) via the GoalManager when wired;
+        falls back to a plain Goal for backward compatibility."""
+        if self.goal_manager is not None:
+            goal = self.goal_manager.create_goal(description, source)
+        else:
+            goal = Goal(id=new_id("goal"), description=description, source=source)
+            self.storage.save_goal(goal)
         self._emit("goal.submitted", task_id=None, detail={"goal_id": goal.id, "description": description})
         return goal
 
-    def create_task(self, goal: Goal) -> Task:
-        task = Task(id=new_id("task"), goal_id=goal.id, description=goal.description)
+    def create_task(self, goal: Goal, plan_version: int | None = None) -> Task:
+        task = Task(id=new_id("task"), goal_id=goal.id, description=goal.description,
+                    plan_version=plan_version)
         self.storage.save_task(task)
         self._emit("task.created", task_id=task.id, detail={"goal_id": goal.id})
         return task
@@ -114,6 +120,77 @@ class ArionEngine:
         self.run_task(task.id)
         task = self.storage.load_task(task.id)
         assert task is not None
+        return task
+
+    def run_goal(self, goal_id: str, max_replans: int = 5) -> Goal:
+        """Long-horizon goal loop (ADR-016):
+
+          Goal -> Goal State -> Strategy -> Plan -> Execute -> Observe ->
+          Learn -> Replan
+
+        Semantics per call:
+        - evaluates the goal; completes it when all plan steps are handled;
+        - continues through SUCCESSFUL planning+execution cycles;
+        - returns as soon as a task FAILS (goal stays ACTIVE with the failure
+          persisted) so the caller can seed/decide before the next advance -
+          each call is one long-horizon cycle;
+        - replanning produces a NEW (immutable) plan version (never mutates
+          the previous plan), bounded across calls by max_replans;
+        - replay-safe: pending tasks for the latest plan version are resumed,
+          never duplicated.
+
+        Returns the Goal state after this cycle.
+        """
+        gm = self.goal_manager
+        if gm is None:
+            raise ValueError("goal manager not wired; use execute_goal instead")
+        while True:
+            result, _goal = gm.evaluate(goal_id)
+            action = result.next_action
+            if action in ("none", "paused", "resolve_blocker"):
+                return gm.get_goal(goal_id)
+            if action == "complete":
+                gm.complete_goal(goal_id, reason="all_work_complete")
+                return gm.get_goal(goal_id)
+
+            if action == "replan":
+                # bounded across calls (prevents runaway caller loops)
+                replan_count = sum(
+                    1 for p in gm.plan_history(goal_id)
+                    if str(p.get("reason", "")).startswith("replan")
+                )
+                if replan_count >= max_replans:
+                    gm.fail_goal(goal_id, reason="max_replans_exceeded")
+                    return gm.get_goal(goal_id)
+                task = self._plan_for_goal(goal_id, replan_reason=result.evidence.get("reason"))
+                if task is not None:
+                    task = self.run_task(task.id)
+                    if task.status == TaskStatus.FAILED:
+                        return gm.get_goal(goal_id)  # caller decides next step
+                continue
+
+            # continue / initial_plan: resume a pending task for the latest
+            # plan version if one exists (replay safety), else plan + execute.
+            pending = gm.pending_task(goal_id)
+            if pending is not None:
+                pending = self.run_task(pending.id)
+                if pending.status == TaskStatus.FAILED:
+                    return gm.get_goal(goal_id)
+                continue
+            task = self._plan_for_goal(goal_id, replan_reason=None)
+            if task is not None:
+                task = self.run_task(task.id)
+                if task.status == TaskStatus.FAILED:
+                    return gm.get_goal(goal_id)
+
+    def _plan_for_goal(self, goal_id: str, replan_reason: str | None = None) -> Task | None:
+        """Create + plan a task for a goal (records an immutable plan version)."""
+        gm = self.goal_manager
+        goal = gm.get_goal(goal_id)
+        if goal is None:
+            return None
+        task = self.create_task(goal)
+        self._plan(task, replan_reason=replan_reason)
         return task
 
     def run_task(self, task_id: str) -> Task:
@@ -133,7 +210,15 @@ class ArionEngine:
         checkpoint = self.storage.latest_checkpoint(task_id)
         if checkpoint is not None:
             restored = Task.from_dict(checkpoint.snapshot)
-            self._emit("task.resumed", task_id=task_id, detail={"step_index": restored.current_step})
+            # mid_execution distinguishes a genuine recovery (a task that had
+            # begun executing steps) from a plan-only checkpoint (the normal
+            # start-of-run boundary, NOT an interruption). Memory uses this to
+            # avoid labeling every completed task as 'recovered'.
+            mid_execution = checkpoint.status != TaskStatus.PLANNED.value
+            self._emit(
+                "task.resumed", task_id=task_id,
+                detail={"step_index": restored.current_step, "mid_execution": mid_execution},
+            )
             task = restored
         else:
             self._emit("task.planning", task_id=task_id)
@@ -225,7 +310,7 @@ class ArionEngine:
 
     # ---------- pipeline ----------
 
-    def _plan(self, task: Task) -> Task:
+    def _plan(self, task: Task, replan_reason: str | None = None) -> Task:
         self._emit("task.planning", task_id=task.id)
         task.status = TaskStatus.PLANNING
         context = self._build_planning_context(task)
@@ -264,22 +349,37 @@ class ArionEngine:
             detail={"steps": [s.to_dict() for s in steps]},
         )
 
-        # Long-horizon goal management (ADR-015): record this plan version +
-        # strategy against the goal so progress spans sessions.
+        # Long-horizon goal management (ADR-016): record an IMMUTABLE plan
+        # version + strategy against the goal; previous plans are never
+        # mutated. The task carries its plan_version for replay safety.
         if self.goal_manager is not None and task.goal_id:
             try:
                 strategy_name = "direct"
-                if getattr(self, "_last_strategy", None) is not None:
-                    strategy_name = self._last_strategy.name
+                if context is not None and getattr(context, "strategy", None) is not None:
+                    strategy_name = context.strategy.name
                 elif self.strategy_selector is not None:
                     beliefs = self.cognition.cognition.list_beliefs(limit=100) if self.cognition else []
                     env_state = self.world_monitor.current_state() if self.world_monitor else {}
+                    guidance = list(getattr(context, "guidance", []) or [])
                     strategy_name = self.strategy_selector.select(
-                        task.description, beliefs, env_state, []
+                        task.description, beliefs, env_state, guidance
                     ).name
-                self.goal_manager.record_plan(
-                    task.goal_id, strategy_name, [s.to_dict() for s in steps]
+                history = self.goal_manager.plan_history(task.goal_id)
+                reason = "initial_plan" if not history else (
+                    f"replan_{replan_reason}" if replan_reason else "replan"
                 )
+                record = self.goal_manager.record_plan_version(
+                    task.goal_id, strategy_name, [s.to_dict() for s in steps], reason
+                )
+                task.plan_version = record["plan_version"]
+                self.storage.save_task(task)
+                if reason.startswith("replan"):
+                    self._emit("goal.replanned", task_id=task.id, detail={
+                        "goal_id": task.goal_id,
+                        "plan_version": record["plan_version"],
+                        "strategy": strategy_name,
+                        "reason": reason[:200],
+                    })
             except Exception:
                 pass
         # Audit memory-driven plan transformation (non-mutating, provenance-
@@ -591,20 +691,35 @@ class ArionEngine:
             # so the planner relies on the CURRENT world, not stale memory.
             if self.world_monitor is not None:
                 try:
-                    from arion.cognition.models import EnvironmentFact
-
                     facts = self.world_monitor.store.list_environment_facts(limit=50)
                     ctx.environment = facts[:20]
                 except Exception:
                     pass
 
-            # Strategy selection (ADR-015): deterministic, informational.
+            # Previous goal plan history (ADR-016): bounded, immutable plan
+            # versions so replanning consumes prior goal-plan history.
+            if self.goal_manager is not None and task.goal_id:
+                try:
+                    ctx.plan_history = self.goal_manager.plan_history(task.goal_id)[-5:]
+                except Exception:
+                    pass
+
+            # Strategy selection (ADR-015/016): deterministic, informational.
+            # previous_strategies (from the goal's immutable plan history) lets
+            # the selector escalate instead of blindly repeating a strategy
+            # that already failed (ADR-016). It can never authorize anything.
             if self.strategy_selector is not None:
                 try:
                     beliefs = self.cognition.cognition.list_beliefs(limit=100) if self.cognition else []
                     env_state = self.world_monitor.current_state() if self.world_monitor else {}
+                    previous_strategies: list[str] = []
+                    if self.goal_manager is not None and task.goal_id:
+                        previous_strategies = [
+                            p.get("strategy", "") for p in self.goal_manager.plan_history(task.goal_id)
+                        ]
                     strategy = self.strategy_selector.select(
-                        task.description, beliefs, env_state, ctx.guidance
+                        task.description, beliefs, env_state, ctx.guidance,
+                        previous_strategies=[s for s in previous_strategies if s],
                     )
                     ctx.strategy = strategy
                     self._last_strategy = strategy

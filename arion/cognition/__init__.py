@@ -20,6 +20,11 @@ from arion.cognition.models import (
     Preference,
     PREFERENCE_SOURCES,
 )
+from arion.cognition.progress import (
+    DeterministicProgressEvaluator,
+    ProgressEvaluator,
+    ProgressResult,
+)
 from arion.cognition.state import CognitiveState
 from arion.cognition.store import SQLiteCognitiveStore
 from arion.cognition.strategy import Strategy, StrategySelector
@@ -33,10 +38,13 @@ __all__ = [
     "CognitiveSnapshot",
     "CognitiveState",
     "DeterministicBeliefDeriver",
+    "DeterministicProgressEvaluator",
     "EnvironmentFact",
     "GoalManager",
     "PREFERENCE_SOURCES",
     "Preference",
+    "ProgressEvaluator",
+    "ProgressResult",
     "SQLiteCognitiveStore",
     "Strategy",
     "StrategySelector",

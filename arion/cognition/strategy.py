@@ -58,9 +58,13 @@ class StrategySelector:
         beliefs: list,
         environment: dict[str, Any] | list,
         guidance: list[MemoryGuidance] | None = None,
+        previous_strategies: list[str] | None = None,
     ) -> Strategy:
         guidance = guidance or []
+        previous_strategies = previous_strategies or []
         provenance: dict[str, list[str]] = {"belief_ids": [], "episode_ids": [], "guidance_ids": []}
+        if previous_strategies:
+            provenance["previous_strategies"] = previous_strategies[-10:]
 
         # Rule 1: environment missing a capability mentioned in the goal
         env = environment if isinstance(environment, dict) else {}
@@ -99,6 +103,21 @@ class StrategySelector:
                 provenance["guidance_ids"].append(g.guidance_id)
                 if g.episode_id:
                     provenance["episode_ids"].append(g.episode_id)
+            # Strategy escalation (ADR-016): if we already attempted
+            # avoid_known_failures and the goal still has failures, escalate to
+            # defer_retry rather than blindly repeating the same strategy.
+            if "avoid_known_failures" in previous_strategies:
+                return Strategy(
+                    strategy_id=new_id("strat"),
+                    name="defer_retry",
+                    description=(
+                        "avoid_known_failures was already attempted for this goal; "
+                        "deferring to avoid repeating the same failing strategy"
+                    ),
+                    constraints={"avoid": [{"capability": g.capability, "action": g.action, "resource": g.resource}
+                                           for g in avoids[:10]]},
+                    provenance=provenance,
+                )
             return Strategy(
                 strategy_id=new_id("strat"),
                 name="avoid_known_failures",

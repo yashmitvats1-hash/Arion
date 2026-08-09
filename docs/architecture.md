@@ -88,17 +88,23 @@ Every step is decided by a permission policy over
 - `arion/orchestration` — `authz.py` (authorization layer: requests, policy
   outcomes, `ResourcePolicy`, approval seam) + `ArionEngine` (the state
   machine: authorization gate, retries, verification policies, checkpointing,
-  recovery).
+  recovery, the long-horizon `run_goal` loop).
+- `arion/cognition` — `GoalManager` (authoritative goal state machine,
+  plan versioning, progress evaluation), `DeterministicProgressEvaluator`
+  (model-independent evaluation seam), `StrategySelector` (explainable
+  strategy selection + escalation), `SQLiteCognitiveStore` (goal_plans,
+  beliefs, environment facts), `WorldStateMonitor` (versioned facts +
+  change detection).
 - `arion/observability` — `AuditEvent` vocabulary, `EventLogger`, JSONL sink.
 - `arion/interfaces` — CLI (`run`, `resume`, `status`, `tasks`, `events`,
-  `capabilities`).
+  `capabilities`, `goals list|show|progress|pause|resume|cancel`).
 - `arion/memory` — `MemoryStore` protocol + `SQLiteMemoryStore` (episodic
   memories + reflections tables), `MemoryRetriever` (deterministic scoring +
   relevance gate), `DeterministicReflector`, `PlanningContext` (bounded
   digest), `build_episode_from_task` (structured summaries only).
 - `arion/bootstrap.py` — composition root wiring all layers (memory on by
   default).
-- `docs/adr/ADR-001..012` — approved architecture decisions.
+- `docs/adr/ADR-001..016` — approved architecture decisions.
 - `tests/` — deterministic, LLM-independent tests.
 
 ## Persistent cognitive memory (ADR-012)
@@ -203,6 +209,52 @@ Learning`.
   preference manipulation, world-state facts, and memory-derived strategy
   changes never alter authorization - only `PermissionPolicy` decides.
 
+## Durable Goal Management & Replanning (ADR-016)
+
+The loop is now `Goal → Goal State → Strategy → Plan → Execute → Observe →
+Learn → Replan`, owned by an authoritative, restart-safe `GoalManager`.
+
+- **Explicit lifecycle:** ACTIVE / PAUSED / BLOCKED / COMPLETED / FAILED /
+  CANCELLED with a validated transition table; invalid transitions raise
+  `GoalStateError` (fail closed) and are surfaced cleanly by the CLI. Every
+  transition bumps `goal.version` and emits `goal.state.changed`.
+- **ProgressEvaluator (deterministic seam):** `DeterministicProgressEvaluator`
+  evaluates completed/failed/skipped work, blockers, outstanding latest-plan
+  steps, and material world-state changes → `ProgressResult` with progress,
+  status, blockers, next_action, and evidence-with-provenance. Completion is
+  never inferred from a single successful task.
+- **Plan versioning + replanning:** every replan appends a NEW immutable plan
+  version (monotonic, replay-safe; reasons like `replan_task_failed`,
+  `replan_world_changed`). `run_goal` is a per-call long-horizon cycle: it
+  returns ACTIVE when a task fails (failure persisted), replanning is bounded
+  by `max_replans` across calls. Superseded-plan failures never block
+  completion once the newer plan is fully handled.
+- **World-state → replan seam:** material environment fact changes (capability
+  registrations, keys the plan depends on) trigger reevaluation → replan;
+  unrelated facts (e.g. `system_uptime`) are filtered out. Deterministic and
+  sequential - no daemons.
+- **Strategy escalation:** `StrategySelector` now receives
+  `previous_strategies` from the immutable plan history and escalates
+  `direct → avoid_known_failures → defer_retry` instead of repeating a failing
+  strategy; `blocked_missing_capability` when the goal names missing
+  capabilities. Strategies remain informational with provenance.
+- **Race-hardened learning:** successful tasks are classified `completed`
+  (not `recovered`) unless a genuine mid-execution resume occurred, so
+  successes yield `prefer` guidance; the plan transform refuses to substitute
+  onto a resource that has since failed (explicit SKIPPED step instead).
+- **Authorization invariant (extended + tested):** goal state, strategy,
+  progress evaluation, world state, memory, model output, and replanning can
+  never grant permissions; every step is re-authorized against CURRENT live
+  `ActionSpec` metadata - old successful decisions are never reused after
+  metadata changes (adversarial tests + demo).
+- **Audit:** `goal.created`, `goal.state.changed`, `goal.evaluated`,
+  `goal.replanned`, `progress.evaluated`, `plan.versioned` (plus existing
+  `strategy.selected`, `world.state.changed`); bounded metadata only.
+- **CLI:** `arion goals list|show|progress|pause|resume|cancel [--json]`.
+- **Demo:** `scripts/demo_goal_replan.py` — 3-cycle race demo with a mid-goal
+  restart proving state/version/progress/provenance survival, no duplicate
+  plan versions, and live-metadata re-authorization. Runs offline.
+
 ## Structured intelligence boundary (ADR-011)
 
 ```
@@ -256,6 +308,9 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/arion tasks
 .venv/bin/arion resume <task_id>     # survives process restarts
 .venv/bin/arion events --task <task_id>
+.venv/bin/arion goals list           # durable goals (ADR-016)
+.venv/bin/arion goals show <goal_id> --json
+.venv/bin/python scripts/demo_goal_replan.py   # 3-cycle DoD demo (offline)
 .venv/bin/python -m pytest
 ```
 

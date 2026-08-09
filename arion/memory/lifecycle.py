@@ -23,11 +23,20 @@ _DENY_MARKERS = ("not permitted", "outside boundary", "no resource boundary", "a
 
 
 def episode_outcome_for(task: Task, events: list[AuditEvent] | None = None) -> str:
-    """completed | failed | denied | recovered"""
+    """completed | failed | denied | recovered
+
+    'recovered' requires a genuine mid-execution resume: a task.resumed event
+    whose checkpoint had begun executing steps (mid_execution=True). A
+    plan-only checkpoint (the normal start-of-run boundary) is NOT an
+    interruption - resuming from it is a plain completed run, so successful
+    tasks still yield 'completed' episodes (and prefer guidance).
+    """
     denials = [e for e in (events or []) if e.kind in ("permission.denied", "approval.denied")]
     if denials and task.status == TaskStatus.FAILED:
         return "denied"
-    if any(e.kind == "task.resumed" for e in (events or [])) and task.status == TaskStatus.COMPLETED:
+    resumed = [e for e in (events or []) if e.kind == "task.resumed"]
+    mid_execution = any(bool(e.detail.get("mid_execution")) for e in resumed)
+    if mid_execution and task.status == TaskStatus.COMPLETED:
         return "recovered"
     if task.status == TaskStatus.COMPLETED:
         return "completed"
@@ -118,7 +127,12 @@ def build_episode_from_task(
         "approvals_required": any(e.kind == "approval.requested" for e in events),
     }
 
-    recovery = {"resumed": any(e.kind == "task.resumed" for e in events)}
+    resumed_events = [e for e in events if e.kind == "task.resumed"]
+    mid_execution = any(bool(e.detail.get("mid_execution")) for e in resumed_events)
+    recovery = {
+        "resumed": mid_execution,
+        "plan_only_resume": bool(resumed_events) and not mid_execution,
+    }
 
     tags: set[str] = set()
     for s in task.steps:

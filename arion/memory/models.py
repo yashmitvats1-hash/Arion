@@ -195,6 +195,7 @@ class PlanningContext:
     provenance: dict[str, list[str]] = field(default_factory=dict)  # episode_ids, reflection_ids, guidance_ids
     strategy: Any | None = None                                    # Strategy (ADR-015), informational
     environment: list = field(default_factory=list)                # current world-state facts (bounded)
+    plan_history: list = field(default_factory=list)               # previous goal plan versions (bounded, immutable)
     budget: ContextBudget = field(default_factory=ContextBudget)
 
     def __post_init__(self) -> None:
@@ -266,6 +267,16 @@ class PlanningContext:
             {"key": f.key, "version": f.version, "observed_at": f.observed_at, "source": f.source}
             for f in self.environment[:20]
         ]
+        # Previous goal plan versions (immutable history, bounded metadata).
+        plan_history_block = [
+            {
+                "plan_version": p.get("plan_version"),
+                "strategy": p.get("strategy"),
+                "reason": (p.get("reason") or "")[:100],
+                "steps": len(p.get("plan_summary") or []),
+            }
+            for p in self.plan_history[-3:]
+        ]
         # Provenance: which memories influenced this context (IDs only).
         prov = {
             "episode_ids": [e.episode_id for e in episodes],
@@ -280,6 +291,7 @@ class PlanningContext:
             "guidance": guide,
             "strategy": strategy_block,
             "environment": env_block,
+            "plan_history": plan_history_block,
             "provenance": prov,
             "counts": {"episodes": len(ep), "reflections": len(ref), "guidance": len(guide)},
         }
@@ -302,6 +314,7 @@ class PlanningContext:
                     "guidance": guide,
                     "strategy": strategy_block,
                     "environment": env_block,
+                    "plan_history": plan_history_block,
                     "provenance": prov,
                     "counts": {"episodes": len(ep), "reflections": len(ref), "guidance": len(guide)},
                 }
@@ -311,6 +324,7 @@ class PlanningContext:
                 "guidance": guide,
                 "strategy": strategy_block,
                 "environment": env_block,
+                "plan_history": plan_history_block,
                 "provenance": prov,
                 "counts": {"episodes": len(ep), "reflections": len(ref), "guidance": len(guide)},
                 "truncated": True,
