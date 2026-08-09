@@ -54,11 +54,18 @@ Every step is decided by a permission policy over
   the task (`awaiting_approval`) with a checkpoint, and a later `run_task`
   resumes the exact same step once approved. A future human approval interface
   implements this protocol.
-- Path constraints are pure string checks; the capability still enforces its
-  own containment (sandbox boundary). The two are independent layers.
-- New event kinds: `approval.requested`, `approval.granted`, `approval.denied`;
-  `permission.checked` events now include the decision (outcome, scope,
-  resource, risk, side effects).
+- **Fail-closed resources:** resource-sensitive actions (ActionSpec declares
+  `resource_kind`) are DENIED unless an explicit boundary is configured for
+  that kind. Non-resource actions are unaffected. Boundaries are keyed by
+  resource kind (extensible — future `url`, `queue:name`, ...) and enforced as
+  pure string checks; the capability still enforces its own containment
+  (sandbox root, symlinks). The two are independent layers.
+- **Identity:** requests carry an `Actor` with a delegation chain
+  (`user → agent → delegated agent`); policies can match the direct actor or
+  any ancestor. Audit events record `actor` + `actor_chain`.
+- Event kinds: `approval.requested`, `approval.granted`, `approval.denied`;
+  `permission.checked` events include the decision (outcome, scope, resource,
+  resource kind, risk, side effects) and the actor chain.
 
 ## Execution semantics (ADR-010)
 

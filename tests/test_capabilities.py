@@ -87,6 +87,9 @@ def test_action_metadata_declared(registry):
     assert read.reversible is True
     assert read.idempotent is True
     assert read.retry_safe is True
+    # resource metadata: read/list target a filesystem path (fail-closed policy)
+    assert read.resource_kind == "filesystem:path"
+    assert read.resource_param == "path"
 
     listing = registry.action_spec("filesystem.read", "list")
     assert listing is not None

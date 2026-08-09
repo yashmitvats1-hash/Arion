@@ -34,6 +34,10 @@ class ActionSpec:
     - reversible / idempotent / retry_safe: execution-semantics metadata
       (ADR-010). retry_safe=False means a failure must NOT be automatically
       retried (the operation may have partially applied).
+    - resource_kind / resource_param: if the action targets a resource, the
+      kind ("filesystem:path", future "url", "queue:name", ...) and the params
+      key that holds the resource identifier. The policy requires an explicit
+      boundary per resource kind (fail closed, ADR-009).
     """
 
     name: str
@@ -45,6 +49,8 @@ class ActionSpec:
     reversible: bool = True
     idempotent: bool = True
     retry_safe: bool = True
+    resource_kind: str | None = None
+    resource_param: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -57,6 +63,8 @@ class ActionSpec:
             "reversible": self.reversible,
             "idempotent": self.idempotent,
             "retry_safe": self.retry_safe,
+            "resource_kind": self.resource_kind,
+            "resource_param": self.resource_param,
         }
 
 

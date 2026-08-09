@@ -31,6 +31,7 @@ from arion.intelligence.planner import Planner
 from arion.intelligence.router import ModelRouter
 from arion.observability.events import AuditEvent, EventLogger
 from arion.orchestration.authz import (
+    Actor,
     ApprovalHandler,
     ApprovalOutcome,
     AuthorizationRequest,
@@ -65,7 +66,7 @@ class ArionEngine:
         events: EventLogger,
         policy: PermissionPolicy | None = None,
         approval_handler: ApprovalHandler | None = None,
-        agent: str = "system",
+        actor: Actor | None = None,
     ):
         self.storage = storage
         self.registry = registry
@@ -74,7 +75,7 @@ class ArionEngine:
         self.events = events
         self.policy = policy or ResourcePolicy()
         self.approval_handler = approval_handler or PendingApprovalHandler()
-        self.agent = agent
+        self.actor = actor or Actor.agent("system")
 
     # ---------- public API ----------
 
@@ -207,14 +208,15 @@ class ArionEngine:
 
         # 2. Authorization (policy decides; scope comes from the ActionSpec, not the plan)
         request = AuthorizationRequest(
-            agent=self.agent,
+            actor=self.actor,
             task_id=task.id,
             step_index=step.index,
             capability=step.capability,
             action=step.action,
             scope=spec.required_scope,
             params=dict(step.params),
-            resource=self._extract_resource(spec.required_scope, step.params),
+            resource=self._extract_resource(spec, step.params),
+            resource_kind=spec.resource_kind,
             risk=spec.risk,
             side_effects=spec.side_effects,
             idempotent=spec.idempotent,
@@ -225,7 +227,13 @@ class ArionEngine:
             "permission.checked",
             task_id=task.id,
             step_id=_step_id(step),
-            detail={**decision.to_dict(), "params": request.params, "step_declared_scope": step.scope},
+            detail={
+                **decision.to_dict(),
+                "params": request.params,
+                "step_declared_scope": step.scope,
+                "actor": request.actor.id,
+                "actor_chain": list(request.actor.chain),
+            },
         )
 
         if decision.outcome == PolicyOutcome.DENY:
@@ -283,12 +291,17 @@ class ArionEngine:
         return False
 
     @staticmethod
-    def _extract_resource(scope: str, params: dict[str, Any]) -> str | None:
-        """Best-effort resource extraction for the policy (e.g. filesystem path)."""
-        if scope.startswith("filesystem:"):
-            p = params.get("path")
-            return p if isinstance(p, str) else None
-        return None
+    def _extract_resource(spec, params: dict[str, Any]) -> str | None:
+        """Generic resource extraction: read the ActionSpec-declared param.
+
+        No filesystem-specific logic here - any capability that declares
+        resource_kind + resource_param gets its resource extracted the same
+        way. A plan cannot redirect which param is read.
+        """
+        if not spec.resource_kind or not spec.resource_param:
+            return None
+        p = params.get(spec.resource_param)
+        return p if isinstance(p, str) else None
 
     # ---------- execution & verification ----------
 

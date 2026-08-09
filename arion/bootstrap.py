@@ -14,7 +14,12 @@ from arion.capabilities.registry import CapabilityRegistry
 from arion.intelligence.planner import DeterministicPlanner
 from arion.intelligence.router import DeterministicRouter
 from arion.observability.events import EventLogger, JsonlFileSink
-from arion.orchestration.authz import ApprovalHandler, PermissionPolicy, ResourcePolicy
+from arion.orchestration.authz import (
+    ApprovalHandler,
+    PermissionPolicy,
+    RelativePathBoundary,
+    ResourcePolicy,
+)
 from arion.orchestration.engine import ArionEngine
 from arion.state.store import SQLiteStorage
 
@@ -39,12 +44,18 @@ def build_engine(
     if jsonl_log:
         events.add_sink(JsonlFileSink(jsonl_log))
 
+    # Fail-closed by default: the filesystem resource kind gets an explicit
+    # boundary (relative, non-traversal paths - the capability enforces the
+    # real sandbox root). Any other resource kind is DENIED until configured.
+    if policy is None:
+        policy = ResourcePolicy(boundaries={"filesystem:path": RelativePathBoundary()})
+
     return ArionEngine(
         storage=storage,
         registry=registry,
         planner=planner,
         router=router,
         events=events,
-        policy=policy or ResourcePolicy(),
+        policy=policy,
         approval_handler=approval_handler,
     )

@@ -33,6 +33,8 @@ class FilesystemReadCapability:
             reversible=True,
             idempotent=True,
             retry_safe=True,
+            resource_kind="filesystem:path",
+            resource_param="path",
         ),
         ActionSpec(
             name="list",
@@ -43,6 +45,8 @@ class FilesystemReadCapability:
             reversible=True,
             idempotent=True,
             retry_safe=True,
+            resource_kind="filesystem:path",
+            resource_param="path",
         ),
     ]
 

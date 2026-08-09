@@ -9,6 +9,7 @@ the engine and never changes.
 from arion.capabilities.registry import CapabilityRegistry
 from arion.intelligence.router import ModelRouter
 from arion.observability.events import EventLogger
+from arion.orchestration.authz import RelativePathBoundary, ResourcePolicy
 from arion.orchestration.engine import ArionEngine
 from arion.state.models import PlanStep, StepStatus, TaskStatus, VerificationPolicy
 
@@ -66,6 +67,7 @@ def test_model_backed_planner_drives_same_loop(storage, sandbox):
         planner=planner,
         router=router,
         events=EventLogger(sinks=[storage]),
+        policy=ResourcePolicy(boundaries={"filesystem:path": RelativePathBoundary()}),
     )
 
     task = engine.execute_goal("read me the readme file")

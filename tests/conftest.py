@@ -20,8 +20,17 @@ from arion.capabilities.registry import CapabilityRegistry  # noqa: E402
 from arion.intelligence.planner import DeterministicPlanner  # noqa: E402
 from arion.intelligence.router import DeterministicRouter  # noqa: E402
 from arion.observability.events import EventLogger  # noqa: E402
+from arion.orchestration.authz import RelativePathBoundary, ResourcePolicy  # noqa: E402
 from arion.orchestration.engine import ArionEngine  # noqa: E402
 from arion.state.store import SQLiteStorage  # noqa: E402
+
+FILESYSTEM_KIND = "filesystem:path"
+
+
+def fs_policy() -> ResourcePolicy:
+    """Default policy used across tests: filesystem reads allowed inside the
+    sandbox-relative namespace (fail-closed for any other resource kind)."""
+    return ResourcePolicy(boundaries={FILESYSTEM_KIND: RelativePathBoundary()})
 
 
 class MemorySink:
@@ -89,7 +98,7 @@ def engine(storage: SQLiteStorage, registry: CapabilityRegistry, sink: MemorySin
     planner = DeterministicPlanner()
     router = DeterministicRouter(planner)
     events = EventLogger(sinks=[storage, sink])
-    return ArionEngine(storage=storage, registry=registry, planner=planner, router=router, events=events)
+    return ArionEngine(storage=storage, registry=registry, planner=planner, router=router, events=events, policy=fs_policy())
 
 
 @pytest.fixture
@@ -103,7 +112,7 @@ def factory():
         planner = DeterministicPlanner()
         router = DeterministicRouter(planner)
         events = EventLogger(sinks=[storage, sink] if sink else [storage])
-        return ArionEngine(storage=storage, registry=reg, planner=planner, router=router, events=events, policy=policy)
+        return ArionEngine(storage=storage, registry=reg, planner=planner, router=router, events=events, policy=policy or fs_policy())
 
     return _make
 
@@ -122,7 +131,7 @@ def fresh_engine():
         planner = DeterministicPlanner()
         router = DeterministicRouter(planner)
         events = EventLogger(sinks=[storage, sink] if sink else [storage])
-        return ArionEngine(storage=storage, registry=reg, planner=planner, router=router, events=events)
+        return ArionEngine(storage=storage, registry=reg, planner=planner, router=router, events=events, policy=fs_policy())
 
     return _make
 
