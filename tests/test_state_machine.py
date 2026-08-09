@@ -143,14 +143,16 @@ def test_retry_then_success(engine, storage):
 
 
 def test_no_steps_planned_when_goal_undecomposable(engine):
-    # deterministic planner raises -> engine surfaces task.planning then error
+    """A planner that cannot decompose the goal fails the task gracefully
+    (never crashes the loop, never leaves the task in 'planning')."""
     goal = engine.submit_goal("do something utterly unplannable here")
     task = engine.create_task(goal)
     task.status = TaskStatus.PLANNING
     engine.storage.save_task(task)
-    try:
-        engine.run_task(task.id)
-    except ValueError as exc:
-        assert "not decomposable" in str(exc)
-    else:
-        raise AssertionError("expected ValueError for undecomposable goal")
+    result = engine.run_task(task.id)
+    assert result.status == TaskStatus.FAILED
+    assert "planning failed" in (result.error or "")
+    assert "not decomposable" in (result.error or "")
+    kinds = [e.kind for e in engine.storage.list_events(task.id)]
+    assert "error" in kinds
+    assert "task.failed" in kinds

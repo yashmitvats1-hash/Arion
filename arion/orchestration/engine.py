@@ -171,7 +171,16 @@ class ArionEngine:
     def _plan(self, task: Task) -> Task:
         self._emit("task.planning", task_id=task.id)
         task.status = TaskStatus.PLANNING
-        steps = self.planner.plan(task.description, task.id, self.registry)
+        try:
+            steps = self.planner.plan(task.description, task.id, self.registry)
+        except Exception as exc:  # planner/validator/provider failure: degrade gracefully
+            task.status = TaskStatus.FAILED
+            task.error = f"planning failed: {exc}"
+            task.completed_at = utcnow()
+            self.storage.save_task(task)
+            self._emit("error", task_id=task.id, success=False, detail={"error": task.error})
+            self._emit("task.failed", task_id=task.id, detail={"error": task.error})
+            return task
         task.steps = steps
         task.status = TaskStatus.PLANNED
         self.storage.save_task(task)

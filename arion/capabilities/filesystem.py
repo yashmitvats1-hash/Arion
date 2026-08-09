@@ -35,6 +35,8 @@ class FilesystemReadCapability:
             retry_safe=True,
             resource_kind="filesystem:path",
             resource_param="path",
+            param_schema={"path": {"type": "string", "required": True}},
+            default_verification={"policy": "schema_keys", "args": {"keys": ["content"]}},
         ),
         ActionSpec(
             name="list",
@@ -47,6 +49,8 @@ class FilesystemReadCapability:
             retry_safe=True,
             resource_kind="filesystem:path",
             resource_param="path",
+            param_schema={"path": {"type": "string", "required": True}},
+            default_verification={"policy": "non_empty"},
         ),
     ]
 

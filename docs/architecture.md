@@ -82,7 +82,9 @@ Every step is decided by a permission policy over
 - `arion/capabilities` — `CapabilityRegistry`, permission scopes,
   `filesystem.read` (read-only, sandboxed, symlink-safe, size-capped).
 - `arion/intelligence` — `Planner` protocol + `DeterministicPlanner`,
-  `ModelRouter` protocol + `DeterministicRouter`.
+  `ModelRouter` protocol + `DeterministicRouter`, `PlanSchema` (versioned,
+  strict), `PlanValidator`, `RealModelPlanner`, `providers/` (OpenAI-compatible
+  adapter behind ModelRouter).
 - `arion/orchestration` — `authz.py` (authorization layer: requests, policy
   outcomes, `ResourcePolicy`, approval seam) + `ArionEngine` (the state
   machine: authorization gate, retries, verification policies, checkpointing,
@@ -91,8 +93,42 @@ Every step is decided by a permission policy over
 - `arion/interfaces` — CLI (`run`, `resume`, `status`, `tasks`, `events`,
   `capabilities`).
 - `arion/bootstrap.py` — composition root wiring all layers.
-- `docs/adr/ADR-001..010` — approved architecture decisions.
+- `docs/adr/ADR-001..011` — approved architecture decisions.
 - `tests/` — deterministic, LLM-independent tests.
+
+## Structured intelligence boundary (ADR-011)
+
+```
+Goal → ModelRouter → Structured Plan → Schema Validation
+     → Capability/Authorization Validation → Orchestrator
+```
+
+- **Plan schema (`v1.0`):** versioned, strict, serializable. Contains intent,
+  ordered steps (capability, action, params, verification, `depends_on`).
+  Authorization fields (`scope`, `resource_kind`, `resource_param`, `risk`,
+  `permissions`, `actor`, `approve`, ...) are **forbidden in the schema** —
+  the model cannot set them.
+- **PlanValidator:** validates capability/action existence, `param_schema`
+  conformance (required keys, types, no injected arguments), and resource
+  parameters against the live registry. Never grants permissions.
+- **ModelRouter:** provider-neutral (`generate`, `plan_structured`).
+  OpenAI-compatible adapter (stdlib HTTP; OpenAI/Azure/Ollama/LiteLLM/vLLM)
+  requests structured JSON, then parses + strictly validates into PlanSchema —
+  invalid responses are rejected. Credentials via `ARION_LLM_*` env vars.
+  `DeterministicRouter.plan_structured` runs the same structured path offline.
+- **Capability discovery:** the model sees a catalog built live from
+  `registry.capabilities_summary()` (actions, scopes, risk, side effects,
+  resource kind/param, param_schema, verification expectations) — never a
+  hardcoded tool list.
+- **Planners:** `DeterministicPlanner`, `RealModelPlanner`, and future
+  planners share one `Planner` protocol.
+- **Invariant:** the model proposes; the system authorizes. Model `scope`
+  values never override the registry; the model cannot change `resource_kind`,
+  bypass a boundary, approve itself, change actor, grant permissions, or
+  create capabilities.
+- **Observability:** `planning.requested`, `model.response.received`,
+  `plan.validation.passed/failed` — provider/model/latency/token metadata
+  only; raw prompts/responses are never persisted.
 
 ## Security boundary (first slice)
 

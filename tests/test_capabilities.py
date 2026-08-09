@@ -90,6 +90,9 @@ def test_action_metadata_declared(registry):
     # resource metadata: read/list target a filesystem path (fail-closed policy)
     assert read.resource_kind == "filesystem:path"
     assert read.resource_param == "path"
+    # parameter contract + verification expectation (used by PlanValidator/capability discovery)
+    assert read.param_schema == {"path": {"type": "string", "required": True}}
+    assert read.default_verification == {"policy": "schema_keys", "args": {"keys": ["content"]}}
 
     listing = registry.action_spec("filesystem.read", "list")
     assert listing is not None

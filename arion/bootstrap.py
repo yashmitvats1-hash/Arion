@@ -8,6 +8,7 @@ are wired here without touching layer internals.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from arion.capabilities.filesystem import FilesystemReadCapability
 from arion.capabilities.registry import CapabilityRegistry
@@ -30,19 +31,25 @@ def build_engine(
     jsonl_log: str | Path | None = None,
     policy: PermissionPolicy | None = None,
     approval_handler: ApprovalHandler | None = None,
+    planner: Any | None = None,
+    router: Any | None = None,
 ) -> ArionEngine:
     storage = SQLiteStorage(db_path)
 
     registry = CapabilityRegistry()
     registry.register(FilesystemReadCapability(sandbox_root))
 
-    planner = DeterministicPlanner()
-    router = DeterministicRouter(planner)
-
     events = EventLogger()
     events.add_sink(storage)  # Storage implements EventSink.append_event
     if jsonl_log:
         events.add_sink(JsonlFileSink(jsonl_log))
+
+    # Planners (DeterministicPlanner, RealModelPlanner, future planners) are
+    # interchangeable; the router follows the same ModelRouter abstraction.
+    if planner is None:
+        planner = DeterministicPlanner()
+    if router is None:
+        router = DeterministicRouter(planner)
 
     # Fail-closed by default: the filesystem resource kind gets an explicit
     # boundary (relative, non-traversal paths - the capability enforces the
