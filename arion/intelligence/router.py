@@ -15,12 +15,9 @@ from __future__ import annotations
 import re
 from typing import Any, Protocol
 
+from arion.intelligence.errors import ModelPlanError  # noqa: F401  (re-exported for compatibility)
 from arion.intelligence.plan_schema import PLAN_SCHEMA_VERSION, PlanSchema, StructuredStep
 from arion.state.models import VerificationPolicy
-
-
-class ModelPlanError(Exception):
-    """Raised when a model provider fails or returns an unusable response."""
 
 
 class ModelRouter(Protocol):

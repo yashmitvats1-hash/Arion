@@ -61,9 +61,10 @@ class PlanStep:
     max_attempts: int = 2
     result: dict[str, Any] | None = None
     error: str | None = None
+    depends_on: list[int] = field(default_factory=list)  # indices of prerequisite steps
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "index": self.index,
             "intent": self.intent,
             "capability": self.capability,
@@ -77,6 +78,9 @@ class PlanStep:
             "result": self.result,
             "error": self.error,
         }
+        if self.depends_on:
+            d["depends_on"] = self.depends_on
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "PlanStep":
@@ -94,6 +98,7 @@ class PlanStep:
             max_attempts=d.get("max_attempts", 2),
             result=d.get("result"),
             error=d.get("error"),
+            depends_on=list(d.get("depends_on", []) or []),
         )
 
 

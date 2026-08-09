@@ -27,6 +27,8 @@ from __future__ import annotations
 from typing import Any
 
 from arion.capabilities.registry import CapabilityError, CapabilityRegistry
+from arion.intelligence.plan_schema import PlanValidationError
+from arion.intelligence.plan_validator import topo_sort_steps
 from arion.intelligence.planner import Planner
 from arion.intelligence.router import ModelRouter
 from arion.observability.events import AuditEvent, EventLogger
@@ -128,6 +130,25 @@ class ArionEngine:
 
         if not task.steps:
             task = self._plan(task)
+            if task.status == TaskStatus.FAILED:
+                return task
+        elif checkpoint is None:
+            # Dependency-aware execution: for hand-built plans, validate and
+            # order steps so every step runs only after its dependencies.
+            try:
+                task.steps = topo_sort_steps(task.steps)
+            except PlanValidationError as exc:
+                task.status = TaskStatus.FAILED
+                task.error = f"planning failed: {exc}"
+                task.completed_at = utcnow()
+                self.storage.save_task(task)
+                self._emit("error", task_id=task.id, success=False, detail={
+                    "error": task.error,
+                    "error_type": type(exc).__name__,
+                    "category": getattr(exc, "category", "unknown"),
+                })
+                self._emit("task.failed", task_id=task.id, detail={"error": task.error})
+                return task
 
         while True:
             step = task.active_step
@@ -178,7 +199,11 @@ class ArionEngine:
             task.error = f"planning failed: {exc}"
             task.completed_at = utcnow()
             self.storage.save_task(task)
-            self._emit("error", task_id=task.id, success=False, detail={"error": task.error})
+            self._emit("error", task_id=task.id, success=False, detail={
+                "error": task.error,
+                "error_type": type(exc).__name__,
+                "category": getattr(exc, "category", "unknown"),
+            })
             self._emit("task.failed", task_id=task.id, detail={"error": task.error})
             return task
         task.steps = steps
@@ -193,7 +218,12 @@ class ArionEngine:
         return task
 
     def _execute_step(self, task: Task, step: PlanStep) -> None:
-        self._emit("step.started", task_id=task.id, step_id=_step_id(step), detail={"intent": step.intent})
+        self._emit(
+            "step.started",
+            task_id=task.id,
+            step_id=_step_id(step),
+            detail={"intent": step.intent, "depends_on": step.depends_on},
+        )
 
         # 1. Capability discovery + action spec (source of truth for metadata)
         capability = self.registry.get(step.capability)

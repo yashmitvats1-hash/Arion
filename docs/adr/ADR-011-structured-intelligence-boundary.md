@@ -116,3 +116,26 @@ complete" is not claimed.
 ADR-001 (layers), ADR-004 (orchestration), ADR-005 (ModelRouter),
 ADR-006/009 (capability + authorization), ADR-008 (LLM-independent tests),
 ADR-010 (execution semantics).
+
+---
+
+## Amendments (review of commit `e7cbfe6` — approved with required fixes)
+
+1. **Dependency-aware execution.** The orchestrator now enforces `depends_on`:
+   `PlanValidator` topologically orders steps (stable; array order for
+   dependency-free plans), rejects out-of-range/self/cyclic dependencies, and
+   the engine validates ordering defensively for hand-built plans. A
+   dependency failure fails the task before any dependent step executes.
+   `PlanStep` persists `depends_on` through checkpoints. Parallel execution is
+   explicitly deferred; deterministic sequential behavior is preserved.
+2. **Typed planning errors.** `arion/intelligence/errors.py` defines
+   `PlanningError` with distinguishable subcategories (provider unavailable /
+   auth / config, malformed response, schema validation, capability/param/
+   resource validation). The orchestrator still fails tasks gracefully, but
+   audit `error` events record `error_type` and `category`.
+3. **Live-provider smoke test.** `tests/smoke/test_live_provider.py`
+   (marked `smoke`) validates the complete response path
+   (provider → JSON → PlanSchema → PlanValidator → PlanSteps) against a real
+   OpenAI-compatible endpoint when `ARION_LLM_BASE_URL`/`ARION_LLM_API_KEY`
+   are set; it skips cleanly otherwise and never requires credentials in
+   normal runs.

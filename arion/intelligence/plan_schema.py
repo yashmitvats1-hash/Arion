@@ -24,6 +24,10 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from arion.intelligence.errors import (
+    PlanSchemaValidationError,
+    PlanValidationError,  # re-exported for compatibility (base class)
+)
 from arion.state.models import VerificationPolicy
 
 PLAN_SCHEMA_VERSION = "1.0"
@@ -62,21 +66,16 @@ FORBIDDEN_STEP_FIELDS = frozenset(
 RESERVED_PARAM_KEYS = FORBIDDEN_STEP_FIELDS
 
 
-class PlanValidationError(ValueError):
-    """Raised when a plan is structurally invalid or incompatible with the
-    capability registry. Never grants permissions."""
-
-
 def validate_verification_spec(policy: Any, args: Any, where: str = "verification") -> VerificationPolicy:
     """Validate a verification specification, returning a VerificationPolicy."""
     if not isinstance(policy, str) or policy not in VERIFICATION_POLICIES:
-        raise PlanValidationError(f"{where}: invalid verification policy {policy!r} (allowed: {VERIFICATION_POLICIES})")
+        raise PlanSchemaValidationError(f"{where}: invalid verification policy {policy!r} (allowed: {VERIFICATION_POLICIES})")
     if not isinstance(args, dict):
-        raise PlanValidationError(f"{where}: verification args must be an object")
+        raise PlanSchemaValidationError(f"{where}: verification args must be an object")
     if policy == "schema_keys":
         keys = args.get("keys")
         if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
-            raise PlanValidationError(f"{where}: policy 'schema_keys' requires args.keys as a list of strings")
+            raise PlanSchemaValidationError(f"{where}: policy 'schema_keys' requires args.keys as a list of strings")
     return VerificationPolicy(policy=policy, args=dict(args))
 
 
@@ -106,39 +105,39 @@ class StructuredStep:
     @classmethod
     def from_dict(cls, d: Any, index: int) -> "StructuredStep":
         if not isinstance(d, dict):
-            raise PlanValidationError(f"step {index}: must be a JSON object")
+            raise PlanSchemaValidationError(f"step {index}: must be a JSON object")
         unknown = set(d) - STEP_KEYS
         if unknown:
             forbidden = sorted(unknown & FORBIDDEN_STEP_FIELDS)
             if forbidden:
-                raise PlanValidationError(
+                raise PlanSchemaValidationError(
                     f"step {index}: model cannot set field(s) {forbidden} - "
                     "resolved by the system from the capability registry"
                 )
-            raise PlanValidationError(f"step {index}: unknown field(s) {sorted(unknown)}")
+            raise PlanSchemaValidationError(f"step {index}: unknown field(s) {sorted(unknown)}")
 
         intent = d.get("intent")
         if not isinstance(intent, str) or not intent.strip():
-            raise PlanValidationError(f"step {index}: 'intent' must be a non-empty string")
+            raise PlanSchemaValidationError(f"step {index}: 'intent' must be a non-empty string")
         capability = d.get("capability")
         if not isinstance(capability, str) or not capability.strip():
-            raise PlanValidationError(f"step {index}: 'capability' must be a non-empty string")
+            raise PlanSchemaValidationError(f"step {index}: 'capability' must be a non-empty string")
         action = d.get("action")
         if not isinstance(action, str) or not action.strip():
-            raise PlanValidationError(f"step {index}: 'action' must be a non-empty string")
+            raise PlanSchemaValidationError(f"step {index}: 'action' must be a non-empty string")
 
         params = d.get("params", {})
         if not isinstance(params, dict):
-            raise PlanValidationError(f"step {index}: 'params' must be a JSON object")
+            raise PlanSchemaValidationError(f"step {index}: 'params' must be a JSON object")
         reserved = sorted(set(params) & RESERVED_PARAM_KEYS)
         if reserved:
-            raise PlanValidationError(
+            raise PlanSchemaValidationError(
                 f"step {index}: params cannot contain reserved key(s) {reserved} - resolved by the system"
             )
 
         verification_raw = d.get("verification")
         if not isinstance(verification_raw, dict):
-            raise PlanValidationError(f"step {index}: 'verification' is required and must be an object")
+            raise PlanSchemaValidationError(f"step {index}: 'verification' is required and must be an object")
         verification = validate_verification_spec(
             verification_raw.get("policy"), verification_raw.get("args", {}), where=f"step {index} verification"
         )
@@ -147,12 +146,12 @@ class StructuredStep:
         if not isinstance(depends_on, list) or not all(
             isinstance(x, int) and not isinstance(x, bool) for x in depends_on
         ):
-            raise PlanValidationError(f"step {index}: 'depends_on' must be a list of integers")
+            raise PlanSchemaValidationError(f"step {index}: 'depends_on' must be a list of integers")
         if len(set(depends_on)) != len(depends_on):
-            raise PlanValidationError(f"step {index}: 'depends_on' contains duplicates")
+            raise PlanSchemaValidationError(f"step {index}: 'depends_on' contains duplicates")
         for ref in depends_on:
             if ref < 0 or ref >= index:
-                raise PlanValidationError(f"step {index}: 'depends_on' may only reference earlier steps (got {ref})")
+                raise PlanSchemaValidationError(f"step {index}: 'depends_on' may only reference earlier steps (got {ref})")
 
         return cls(
             intent=intent,
@@ -185,23 +184,23 @@ class PlanSchema:
     @classmethod
     def from_dict(cls, d: Any) -> "PlanSchema":
         if not isinstance(d, dict):
-            raise PlanValidationError("plan must be a JSON object")
+            raise PlanSchemaValidationError("plan must be a JSON object")
         unknown = set(d) - TOP_LEVEL_KEYS
         if unknown:
-            raise PlanValidationError(f"plan: unknown top-level field(s) {sorted(unknown)}")
+            raise PlanSchemaValidationError(f"plan: unknown top-level field(s) {sorted(unknown)}")
 
         version = d.get("version")
         if version != PLAN_SCHEMA_VERSION:
-            raise PlanValidationError(
+            raise PlanSchemaValidationError(
                 f"plan: unsupported schema version {version!r} (expected {PLAN_SCHEMA_VERSION!r})"
             )
         intent = d.get("intent")
         if not isinstance(intent, str) or not intent.strip():
-            raise PlanValidationError("plan: 'intent' must be a non-empty string")
+            raise PlanSchemaValidationError("plan: 'intent' must be a non-empty string")
 
         steps_raw = d.get("steps")
         if not isinstance(steps_raw, list) or not steps_raw:
-            raise PlanValidationError("plan: 'steps' must be a non-empty array")
+            raise PlanSchemaValidationError("plan: 'steps' must be a non-empty array")
 
         steps = [StructuredStep.from_dict(s, i) for i, s in enumerate(steps_raw)]
         return cls(version=version, intent=intent, steps=steps)
@@ -211,5 +210,5 @@ class PlanSchema:
         try:
             obj = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise PlanValidationError(f"plan: malformed JSON: {exc}") from exc
+            raise PlanSchemaValidationError(f"plan: malformed JSON: {exc}") from exc
         return cls.from_dict(obj)

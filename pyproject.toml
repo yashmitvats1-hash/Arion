@@ -23,3 +23,6 @@ include = ["arion*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "smoke: live-provider smoke test (requires ARION_LLM_BASE_URL or ARION_LLM_API_KEY)",
+]

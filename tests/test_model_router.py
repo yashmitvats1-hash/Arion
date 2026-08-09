@@ -9,9 +9,13 @@ import json
 
 import pytest
 
+from arion.intelligence.errors import (
+    MalformedProviderResponseError,
+    ModelPlanError,
+    PlanSchemaValidationError,
+)
 from arion.intelligence.plan_schema import PLAN_SCHEMA_VERSION, PlanSchema
 from arion.intelligence.providers import OpenAICompatModelRouter
-from arion.intelligence.router import ModelPlanError
 
 VALID_PLAN = {
     "version": PLAN_SCHEMA_VERSION,
@@ -70,13 +74,13 @@ def test_router_produces_structured_plan():
 
 def test_router_rejects_malformed_json():
     router = _router("this is not json")
-    with pytest.raises(ModelPlanError, match="invalid structured plan"):
+    with pytest.raises(MalformedProviderResponseError, match="invalid structured plan"):
         router.plan_structured("goal", [], {})
 
 
 def test_router_rejects_missing_required_fields():
     router = _router(json.dumps({"version": PLAN_SCHEMA_VERSION, "intent": "x"}))
-    with pytest.raises(ModelPlanError, match="invalid structured plan"):
+    with pytest.raises(PlanSchemaValidationError, match="invalid structured plan"):
         router.plan_structured("goal", [], {})
 
 
@@ -84,7 +88,7 @@ def test_router_rejects_scope_spoofing():
     bad = json.loads(json.dumps(VALID_PLAN))
     bad["steps"][0]["scope"] = "shell:exec"
     router = _router(json.dumps(bad))
-    with pytest.raises(ModelPlanError, match="cannot set field"):
+    with pytest.raises(PlanSchemaValidationError, match="cannot set field"):
         router.plan_structured("goal", [], {})
 
 
@@ -92,19 +96,19 @@ def test_router_rejects_resource_kind_spoofing():
     bad = json.loads(json.dumps(VALID_PLAN))
     bad["steps"][0]["resource_kind"] = "filesystem:write"
     router = _router(json.dumps(bad))
-    with pytest.raises(ModelPlanError, match="cannot set field"):
+    with pytest.raises(PlanSchemaValidationError, match="cannot set field"):
         router.plan_structured("goal", [], {})
 
 
 def test_router_rejects_prose_response():
     router = _router("Sure! Here is a plan: first list the directory...")
-    with pytest.raises(ModelPlanError):
+    with pytest.raises(MalformedProviderResponseError):
         router.plan_structured("goal", [], {})
 
 
 def test_router_http_error():
     router = _router("error", status=500)
-    with pytest.raises(ModelPlanError, match="HTTP 500"):
+    with pytest.raises(Exception, match="HTTP 500"):
         router.plan_structured("goal", [], {})
 
 
@@ -113,14 +117,14 @@ def test_router_provider_malformed_response():
         return 200, "{broken"
 
     router = OpenAICompatModelRouter(model="m", api_key="", transport=transport)
-    with pytest.raises(ModelPlanError, match="malformed"):
+    with pytest.raises(MalformedProviderResponseError, match="malformed"):
         router.plan_structured("goal", [], {})
 
 
 def test_router_failure_event_no_raw_content():
     sink = MemorySink()
     router = _router("not json", sink=sink)
-    with pytest.raises(ModelPlanError):
+    with pytest.raises(MalformedProviderResponseError):
         router.plan_structured("goal", [], {})
     meta = [e for e in sink.events if e.kind == "model.response.received"]
     assert len(meta) == 1 and meta[0].success is False

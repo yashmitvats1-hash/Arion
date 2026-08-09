@@ -8,13 +8,20 @@ any step is executed:
   no unknown/injected arguments);
 - resource-bearing actions declare their resource parameter and the resource
   is present and well-formed; the plan cannot redefine the resource kind;
-- verification specifications are valid.
+- verification specifications are valid;
+- dependencies are valid (in range, no self-reference, no cycles) and steps
+  are ordered for execution (topological order; stable = array order for
+  dependency-free plans).
 
 Security: the validator NEVER grants permissions. It resolves each step's
 scope/risk/side effects from the ActionSpec (the registry is authoritative),
 and it performs no boundary checks - boundary enforcement belongs exclusively
 to PermissionPolicy during authorization. Malformed or impossible plans are
 rejected before execution.
+
+Typed errors: capability/parameter/resource/ordering failures raise
+PlanCapabilityValidationError so callers and audit events can distinguish them
+from schema failures (PlanSchemaValidationError).
 """
 
 from __future__ import annotations
@@ -22,6 +29,7 @@ from __future__ import annotations
 from typing import Any
 
 from arion.capabilities.registry import ActionSpec, CapabilityRegistry
+from arion.intelligence.errors import PlanCapabilityValidationError
 from arion.intelligence.plan_schema import PlanSchema, PlanValidationError, StructuredStep
 from arion.state.models import PlanStep
 
@@ -42,6 +50,48 @@ def _type_ok(expected: str, value: Any) -> bool:
     return True  # unknown declared type: do not reject on type grounds
 
 
+def topo_sort_steps(steps: list[PlanStep]) -> list[PlanStep]:
+    """Order steps so every step comes after all its dependencies.
+
+    - Rejects out-of-range / non-integer / self-references (PlanValidationError).
+    - Detects and rejects cycles (PlanValidationError).
+    - Stable: for dependency-free plans (and any plan whose dependencies only
+      reference earlier indices) the order is exactly the array order, so
+      deterministic sequential behavior is preserved.
+    """
+    import heapq
+
+    n = len(steps)
+    indegree = [0] * n
+    dependents: dict[int, list[int]] = {i: [] for i in range(n)}
+    for i, step in enumerate(steps):
+        for ref in step.depends_on:
+            if not isinstance(ref, int) or isinstance(ref, bool):
+                raise PlanValidationError(f"step {i}: depends_on entries must be integers")
+            if ref < 0 or ref >= n:
+                raise PlanValidationError(f"step {i}: depends_on references out-of-range step {ref}")
+            if ref == i:
+                raise PlanValidationError(f"step {i}: cannot depend on itself")
+            indegree[i] += 1
+            dependents[ref].append(i)
+
+    ready = [i for i in range(n) if indegree[i] == 0]
+    heapq.heapify(ready)  # index tie-break -> stable, deterministic order
+    order: list[int] = []
+    while ready:
+        i = heapq.heappop(ready)
+        order.append(i)
+        for j in sorted(dependents[i]):
+            indegree[j] -= 1
+            if indegree[j] == 0:
+                heapq.heappush(ready, j)
+
+    if len(order) < n:
+        cyclic = sorted(set(range(n)) - set(order))
+        raise PlanValidationError(f"dependency cycle detected involving step(s) {cyclic}")
+    return [steps[i] for i in order]
+
+
 class PlanValidator:
     """Validates a structured plan against the capability registry."""
 
@@ -51,20 +101,20 @@ class PlanValidator:
     def validate(self, schema: PlanSchema) -> list[PlanStep]:
         """Validate the schema and convert it to executable PlanSteps.
 
-        Raises PlanValidationError on the first invalid step. Scope and
-        resource metadata come from the registry's ActionSpec - never from the
-        model.
+        Raises PlanValidationError (typed subclass) on the first invalid step.
+        Scope and resource metadata come from the registry's ActionSpec - never
+        from the model. Returns steps in dependency-safe execution order.
         """
         steps: list[PlanStep] = []
         for i, s in enumerate(schema.steps):
             spec = self.registry.action_spec(s.capability, s.action)
             if spec is None:
                 if self.registry.get(s.capability) is None:
-                    raise PlanValidationError(
+                    raise PlanCapabilityValidationError(
                         f"step {i}: capability {s.capability!r} is not registered "
                         f"(registered: {self.registry.list()})"
                     )
-                raise PlanValidationError(
+                raise PlanCapabilityValidationError(
                     f"step {i}: action {s.action!r} is not provided by capability {s.capability!r}"
                 )
             self._validate_params(i, spec, s.params)
@@ -78,9 +128,10 @@ class PlanValidator:
                     scope=spec.required_scope,  # registry authority, not the model
                     params=dict(s.params),
                     verification=s.verification,
+                    depends_on=list(s.depends_on),
                 )
             )
-        return steps
+        return topo_sort_steps(steps)
 
     # ---------- internals ----------
 
@@ -92,19 +143,19 @@ class PlanValidator:
         for key, rule in schema.items():
             rule = rule or {}
             if rule.get("required") and key not in params:
-                raise PlanValidationError(
+                raise PlanCapabilityValidationError(
                     f"step {step_index}: action {spec.name!r} requires parameter {key!r} (missing from params)"
                 )
         for key, value in params.items():
             if key not in schema:
-                raise PlanValidationError(
+                raise PlanCapabilityValidationError(
                     f"step {step_index}: action {spec.name!r} has no parameter {key!r} - "
                     "arbitrary tool arguments are rejected"
                 )
             rule = schema[key] or {}
             expected = rule.get("type")
             if expected and not _type_ok(expected, value):
-                raise PlanValidationError(
+                raise PlanCapabilityValidationError(
                     f"step {step_index}: parameter {key!r} must be of type {expected!r} (got {type(value).__name__})"
                 )
 
@@ -118,12 +169,12 @@ class PlanValidator:
         if not spec.resource_kind:
             return
         if not spec.resource_param:
-            raise PlanValidationError(
+            raise PlanCapabilityValidationError(
                 f"capability {spec.name!r} misconfigured: resource_kind without resource_param"
             )
         value = params.get(spec.resource_param)
         if not isinstance(value, str) or not value:
-            raise PlanValidationError(
+            raise PlanCapabilityValidationError(
                 f"step {step_index}: action {spec.name!r} requires resource parameter "
                 f"{spec.resource_param!r} (a non-empty string)"
             )

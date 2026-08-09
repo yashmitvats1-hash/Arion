@@ -23,8 +23,14 @@ import time
 import urllib.request
 from typing import Any, Callable
 
+from arion.intelligence.errors import (
+    MalformedProviderResponseError,
+    PlanSchemaValidationError,
+    ProviderAuthenticationError,
+    ProviderConfigurationError,
+    ProviderUnavailableError,
+)
 from arion.intelligence.plan_schema import PLAN_SCHEMA_VERSION, PlanSchema, PlanValidationError
-from arion.intelligence.router import ModelPlanError
 from arion.observability.events import AuditEvent
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -98,7 +104,7 @@ class OpenAICompatModelRouter:
         try:
             return data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise ModelPlanError(f"provider response missing message content: {exc}") from exc
+            raise MalformedProviderResponseError(f"provider response missing message content: {exc}") from exc
 
     def plan_structured(self, goal: str, capabilities: list[dict[str, Any]], context: dict[str, Any]) -> PlanSchema:
         """Request a structured plan; parse + strictly validate; reject anything invalid."""
@@ -119,7 +125,7 @@ class OpenAICompatModelRouter:
 
         try:
             data = self._chat(body)
-        except ModelPlanError as exc:
+        except Exception as exc:  # any provider-side failure -> emit failure metadata, re-raise typed
             self._emit_meta(False, task_id=task_id, latency_ms=_latency(t0), error=str(exc))
             raise
 
@@ -128,7 +134,7 @@ class OpenAICompatModelRouter:
             content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             self._emit_meta(False, task_id=task_id, latency_ms=latency_ms, error=f"missing content: {exc}")
-            raise ModelPlanError(f"provider response missing message content: {exc}") from exc
+            raise MalformedProviderResponseError(f"provider response missing message content: {exc}") from exc
 
         usage = data.get("usage")
         tokens = None
@@ -138,9 +144,14 @@ class OpenAICompatModelRouter:
         try:
             obj = json.loads(content)
             schema = PlanSchema.from_dict(obj)
-        except (json.JSONDecodeError, PlanValidationError) as exc:
+        except json.JSONDecodeError as exc:
+            # Provider returned content that is not JSON at all -> malformed response
+            self._emit_meta(False, task_id=task_id, latency_ms=latency_ms, error=f"malformed content: {exc}")
+            raise MalformedProviderResponseError(f"model returned an invalid structured plan: {exc}") from exc
+        except PlanValidationError as exc:
+            # Valid JSON but structurally invalid plan -> schema validation failure
             self._emit_meta(False, task_id=task_id, latency_ms=latency_ms, error=f"invalid structured plan: {exc}")
-            raise ModelPlanError(f"model returned an invalid structured plan: {exc}") from exc
+            raise PlanSchemaValidationError(f"model returned an invalid structured plan: {exc}") from exc
 
         self._emit_meta(True, task_id=task_id, latency_ms=latency_ms, tokens=tokens)
         return schema
@@ -152,13 +163,20 @@ class OpenAICompatModelRouter:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        status, text = self.transport(url, headers, json.dumps(body))
+        try:
+            status, text = self.transport(url, headers, json.dumps(body))
+        except Exception as exc:  # network/timeout/transport failure -> provider unavailable
+            raise ProviderUnavailableError(f"provider unreachable: {exc}") from exc
+        if status == 401 or status == 403:
+            raise ProviderAuthenticationError(f"provider authentication failed (HTTP {status}): {text[:300]}")
+        if status >= 500:
+            raise ProviderUnavailableError(f"provider unavailable (HTTP {status}): {text[:300]}")
         if status >= 400:
-            raise ModelPlanError(f"provider returned HTTP {status}: {text[:300]}")
+            raise ProviderConfigurationError(f"provider configuration error (HTTP {status}): {text[:300]}")
         try:
             return json.loads(text)
         except json.JSONDecodeError as exc:
-            raise ModelPlanError(f"provider returned malformed JSON: {exc}") from exc
+            raise MalformedProviderResponseError(f"provider returned malformed JSON: {exc}") from exc
 
     def _emit_meta(self, success: bool, task_id: str | None, latency_ms: int, tokens: dict[str, int] | None = None, error: str | None = None) -> None:
         """Emit provider metadata ONLY - never raw prompts or responses."""

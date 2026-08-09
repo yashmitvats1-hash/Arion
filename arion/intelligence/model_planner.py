@@ -18,7 +18,8 @@ from __future__ import annotations
 from typing import Any
 
 from arion.capabilities.registry import CapabilityRegistry
-from arion.intelligence.plan_schema import PlanSchema, PlanValidationError
+from arion.intelligence.errors import PlanValidationError, PlanningError
+from arion.intelligence.plan_schema import PlanSchema
 from arion.intelligence.plan_validator import PlanValidator
 from arion.intelligence.router import ModelRouter
 from arion.observability.events import AuditEvent
@@ -38,8 +39,23 @@ class RealModelPlanner:
         try:
             schema: PlanSchema = self.router.plan_structured(goal_description, catalog, {"task_id": task_id})
             steps = PlanValidator(registry).validate(schema)
-        except Exception as exc:  # provider error, malformed response, or validation failure
-            self._emit("plan.validation.failed", task_id=task_id, success=False, detail={"error": str(exc)})
+        except PlanningError as exc:
+            # Typed planning failure: propagate the category so audit/recovery
+            # know WHY planning failed (provider, schema, capability, ...).
+            self._emit(
+                "plan.validation.failed",
+                task_id=task_id,
+                success=False,
+                detail={"error": str(exc), "error_type": type(exc).__name__, "category": exc.category},
+            )
+            raise
+        except Exception as exc:  # unexpected planner bug: keep the task failing gracefully
+            self._emit(
+                "plan.validation.failed",
+                task_id=task_id,
+                success=False,
+                detail={"error": str(exc), "error_type": type(exc).__name__, "category": "unknown"},
+            )
             raise PlanValidationError(str(exc)) from exc
         self._emit("plan.validation.passed", task_id=task_id, detail={"steps": len(steps)})
         return steps
