@@ -37,6 +37,7 @@ class StepStatus(str, Enum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    SKIPPED = "skipped"  # deliberately not executed (e.g. memory-driven guidance)
 
 
 @dataclass
@@ -63,6 +64,7 @@ class PlanStep:
     error: str | None = None
     depends_on: list[int] = field(default_factory=list)  # indices of prerequisite steps
     guidance: list[dict[str, Any]] = field(default_factory=list)  # memory-driven transformation provenance (informational)
+    skipped_reason: str | None = None  # why this step was deliberately skipped (guidance)
 
     def to_dict(self) -> dict[str, Any]:
         d = {
@@ -83,6 +85,8 @@ class PlanStep:
             d["depends_on"] = self.depends_on
         if self.guidance:
             d["guidance"] = self.guidance
+        if self.skipped_reason:
+            d["skipped_reason"] = self.skipped_reason
         return d
 
     @classmethod
@@ -103,6 +107,7 @@ class PlanStep:
             error=d.get("error"),
             depends_on=list(d.get("depends_on", []) or []),
             guidance=list(d.get("guidance", []) or []),
+            skipped_reason=d.get("skipped_reason"),
         )
 
 

@@ -175,7 +175,33 @@ beliefs can never authorize (tested).
   the registry. `PlanTransformation` retains original + transformed plans with
   per-decision provenance; audited via `planning.memory.transformation`; each
   transformed step carries its provenance.
-- CLI: `arion cognition beliefs|preferences|environment|snapshot [--json]`.
+- CLI: `arion cognition beliefs|preferences|environment|snapshot|world|goals [--json]`.
+
+## World State → Long-Horizon Goals (ADR-015)
+
+The cognitive spine: `World State → Beliefs → Goals → Long-Horizon Planning →
+Strategy Selection → Authorization → Execution → Observation → Verification →
+Learning`.
+
+- **World-state change detection:** `WorldStateMonitor` observes environment
+  facts (versioned per key with `observed_at`); value changes bump the version
+  and emit `world.state.changed`; `stale_facts()` flags facts that need
+  re-checking so stale state cannot mislead planning.
+- **Strategy selection:** `StrategySelector` (deterministic, explainable)
+  maps goal + beliefs + environment + memory guidance to a `Strategy`
+  (`blocked_missing_capability` / `defer_retry` / `avoid_known_failures` /
+  `capability_verified` / `direct`) with provenance; emitted as
+  `strategy.selected` and exposed in the planning context.
+- **Long-horizon goals:** `GoalManager` records every plan version per goal
+  (`goal_plans` table: version, strategy, summary) and reports per-goal task
+  progress — goals span sessions with traceable history.
+- **Cognitive hardening:** Belief/Preference/EnvironmentFact validation;
+  belief updates are append-only + versioned (revisions supersede prior rows,
+  history never rewritten); planning context carries `strategy` +
+  `environment` (bounded) alongside memories.
+- **Invariant (tested):** stale/poisoned beliefs, model instructions,
+  preference manipulation, world-state facts, and memory-derived strategy
+  changes never alter authorization - only `PermissionPolicy` decides.
 
 ## Structured intelligence boundary (ADR-011)
 

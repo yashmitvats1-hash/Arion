@@ -31,12 +31,40 @@ class CognitiveState:
         self.cognition = cognition
         self.deriver = deriver or DeterministicBeliefDeriver()
 
+    def derive_and_store(self, episodes: list, reflections: list, guidance: list) -> int:
+        """Derive beliefs and store them (append-only + versioned).
+
+        A revision with a higher confidence for the same (category, statement)
+        supersedes the prior belief (history preserved). Returns the number of
+        NEW beliefs stored.
+        """
+        beliefs = self.deriver.derive(episodes, reflections, guidance)
+        new_count = 0
+        for b in beliefs:
+            existing = self.cognition.list_beliefs(category=b.category, limit=1000)
+            match = [e for e in existing if e.statement == b.statement]
+            if match:
+                best = max(match, key=lambda e: e.confidence)
+                if best.confidence >= b.confidence:
+                    continue  # already known at >= confidence
+                # higher-confidence revision: store new version, supersede old
+                b.version = max(e.version for e in match) + 1
+                self.cognition.record_belief(b)
+                for e in match:
+                    if e.superseded_at is None:
+                        self.cognition.supersede_belief(e.belief_id)
+                new_count += 1
+                continue
+            self.cognition.record_belief(b)
+            new_count += 1
+        return new_count
+
     def refresh_from_memory(self, limit: int = 20) -> int:
         """Derive beliefs from recent episodes+reflections+guidance and store them.
 
-        Deterministic and deduplicated (a derived belief with the same
-        statement+category is not re-added at lower confidence). Returns the
-        number of NEW beliefs stored.
+        Deterministic, deduplicated, and versioned (a revised belief with
+        higher confidence supersedes the prior one). Returns the number of NEW
+        beliefs stored.
         """
         from arion.memory.guidance import DeterministicMemoryGuidance
 
@@ -46,15 +74,7 @@ class CognitiveState:
         # pair reflections with their episodes for guidance derivation
         paired_refs = [ref_by_ep[e.episode_id] for e in episodes if e.episode_id in ref_by_ep]
         guidance = DeterministicMemoryGuidance().build(episodes, paired_refs)
-        beliefs = self.deriver.derive(episodes, paired_refs, guidance)
-        new_count = 0
-        for b in beliefs:
-            existing = self.cognition.list_beliefs(category=b.category, limit=1000)
-            if any(e.statement == b.statement and e.confidence >= b.confidence for e in existing):
-                continue
-            self.cognition.record_belief(b)
-            new_count += 1
-        return new_count
+        return self.derive_and_store(episodes, paired_refs, guidance)
 
     def snapshot(self, limit_beliefs: int = 50) -> CognitiveSnapshot:
         beliefs = self.cognition.list_beliefs(limit=limit_beliefs)

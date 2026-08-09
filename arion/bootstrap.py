@@ -13,8 +13,11 @@ from typing import Any
 from arion.capabilities.filesystem import FilesystemReadCapability
 from arion.capabilities.registry import CapabilityRegistry
 from arion.cognition.deriver import DeterministicBeliefDeriver
+from arion.cognition.goals import GoalManager
 from arion.cognition.state import CognitiveState
 from arion.cognition.store import SQLiteCognitiveStore
+from arion.cognition.strategy import StrategySelector
+from arion.cognition.world_state import WorldStateMonitor
 from arion.intelligence.planner import DeterministicPlanner
 from arion.intelligence.router import DeterministicRouter
 from arion.observability.events import EventLogger, JsonlFileSink
@@ -73,19 +76,19 @@ def build_engine(
     # deterministically. Informational only.
     cognition_facade = None
     belief_deriver = None
+    world_monitor = None
+    strategy_selector = None
+    goal_manager = None
     if cognition and memory_store is not None:
-        from arion.cognition.models import EnvironmentFact
-
         cognitive_store = SQLiteCognitiveStore(db_path)
         belief_deriver = DeterministicBeliefDeriver()
         cognition_facade = CognitiveState(memory_store, cognitive_store, belief_deriver)
-        # environment layer: record a current system fact (idempotent by key)
-        cognitive_store.record_environment_fact(EnvironmentFact(
-            fact_id="fact_capabilities",
-            key="registered_capabilities",
-            value=sorted(registry.list()),
-            source="system",
-        ))
+        # World State (ADR-015): observe the current system state through the
+        # monitor so future changes are DETECTED (versioned + events).
+        world_monitor = WorldStateMonitor(cognitive_store, sink=events)
+        world_monitor.observe("registered_capabilities", sorted(registry.list()), source="system")
+        strategy_selector = StrategySelector()
+        goal_manager = GoalManager(cognitive_store, storage=storage)
 
     return ArionEngine(
         storage=storage,
@@ -99,4 +102,7 @@ def build_engine(
         reflector=DeterministicReflector() if memory else None,
         cognition=cognition_facade,
         belief_deriver=belief_deriver,
+        world_monitor=world_monitor,
+        strategy_selector=strategy_selector,
+        goal_manager=goal_manager,
     )

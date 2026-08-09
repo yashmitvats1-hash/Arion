@@ -45,11 +45,15 @@ def _guidance(category="avoid", capability="filesystem.read", action="read",
 
 
 def test_apply_guidance_is_non_mutating(sandbox):
+    reg = _registry(sandbox)
     steps = [_step(0), _step(1, action="list", params={"path": "."})]
     guidance = [_guidance(resource="README.md")]
     original_ids = [id(s) for s in steps]
 
-    tr = apply_guidance_to_steps(steps, guidance)
+    tr = apply_guidance_to_steps(
+        steps, guidance,
+        resource_param_resolver=lambda cap, act: registry_resource_param(reg, cap, act),
+    )
 
     assert isinstance(tr, PlanTransformation)
     # original plan retained (deep copies), inputs NOT mutated
@@ -134,14 +138,33 @@ def test_action_substitution_strategy(sandbox):
 
 
 def test_apply_guidance_skips_step_when_no_safe_alternative(sandbox):
+    """EXPLICIT skip: the avoided step is RETAINED with status SKIPPED and its
+    provenance - never silently deleted (the engine always has a terminal
+    task state)."""
+    from arion.state.models import StepStatus
+
     reg = _registry(sandbox)
     steps = [_step(0)]
     tr = apply_guidance_to_steps(
         steps, [_guidance(resource="README.md")],
         resource_param_resolver=lambda cap, act: registry_resource_param(reg, cap, act),
     )
-    assert tr.transformed == []
+    assert len(tr.transformed) == 1  # step retained, not dropped
+    skipped = tr.transformed[0]
+    assert skipped.status == StepStatus.SKIPPED
+    assert skipped.skipped_reason and "no safe alternative" in skipped.skipped_reason
+    assert skipped.guidance and skipped.guidance[0]["category"] == "step_skipped"
+    assert skipped.guidance[0]["episode_id"] == "ep_1"
     assert tr.decisions[0]["category"] == "step_skipped"
+    assert tr.decisions[0]["guidance_id"] == "g_1"
+
+
+def test_apply_guidance_fails_closed_without_resolver(sandbox):
+    """FAIL CLOSED: no registry-driven resolver -> refuse to transform (no
+    filesystem 'path' assumption in the generic guidance layer)."""
+    steps = [_step(0)]
+    with pytest.raises(ValueError, match="fail closed"):
+        apply_guidance_to_steps(steps, [_guidance(resource="README.md")])  # no resolver
 
 
 def test_plan_transformation_retains_original_and_decisions(sandbox):
@@ -151,8 +174,10 @@ def test_plan_transformation_retains_original_and_decisions(sandbox):
         steps, [_guidance(resource="README.md")],
         resource_param_resolver=lambda cap, act: registry_resource_param(reg, cap, act),
     )
-    # original has 2 steps; transformed dropped the avoided one
-    assert len(tr.original) == 2 and len(tr.transformed) == 1
+    # original has 2 steps; transformed retains both (one now SKIPPED)
+    assert len(tr.original) == 2 and len(tr.transformed) == 2
+    assert tr.transformed[0].status.value == "skipped"
+    assert tr.transformed[1].status.value == "pending"
     assert tr.decisions[0]["step_index"] == 0
     # provenance ids present in every decision
     for d in tr.decisions:

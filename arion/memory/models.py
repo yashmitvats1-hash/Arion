@@ -193,7 +193,13 @@ class PlanningContext:
     reflections: list[Reflection] = field(default_factory=list)    # reflections
     guidance: list = field(default_factory=list)                   # recommendations (MemoryGuidance)
     provenance: dict[str, list[str]] = field(default_factory=dict)  # episode_ids, reflection_ids, guidance_ids
+    strategy: Any | None = None                                    # Strategy (ADR-015), informational
+    environment: list = field(default_factory=list)                # current world-state facts (bounded)
     budget: ContextBudget = field(default_factory=ContextBudget)
+
+    def __post_init__(self) -> None:
+        if self.strategy is None and self.provenance:
+            self.provenance.setdefault("strategy_ids", [])
 
     def digest(self) -> dict[str, Any]:
         """Bounded, privacy-safe serialization for model consumption."""
@@ -241,17 +247,39 @@ class PlanningContext:
             }
             for g in guidance
         ]
+        # Strategy (ADR-015): the deterministic strategy selected for this goal.
+        strategy_block: dict[str, Any] | None = None
+        if self.strategy is not None and hasattr(self.strategy, "to_dict"):
+            try:
+                sd = self.strategy.to_dict()
+                strategy_block = {
+                    "strategy_id": sd.get("strategy_id"),
+                    "name": sd.get("name"),
+                    "description": (sd.get("description") or "")[:200],
+                    "constraints": sd.get("constraints", {}),
+                }
+            except Exception:
+                strategy_block = None
+        # Current world-state facts (bounded, metadata only - values are
+        # already structured safe metadata from the environment store).
+        env_block = [
+            {"key": f.key, "version": f.version, "observed_at": f.observed_at, "source": f.source}
+            for f in self.environment[:20]
+        ]
         # Provenance: which memories influenced this context (IDs only).
         prov = {
             "episode_ids": [e.episode_id for e in episodes],
             "reflection_ids": [r.reflection_id for r in reflections],
             "guidance_ids": [g.guidance_id for g in guidance],
+            "strategy_ids": [self.strategy.strategy_id] if self.strategy is not None else [],
         }
         # Enforce the character budget across the whole digest (truncate).
         total = {
             "episodes": ep,
             "reflections": ref,
             "guidance": guide,
+            "strategy": strategy_block,
+            "environment": env_block,
             "provenance": prov,
             "counts": {"episodes": len(ep), "reflections": len(ref), "guidance": len(guide)},
         }
@@ -259,8 +287,10 @@ class PlanningContext:
         if len(text) > budget.max_chars:
             budget_left = budget.max_chars - 80
             # drop guidance first, then reflections, then episodes, until it fits
-            while len(json.dumps(total, separators=(",", ":"))) > budget_left and (guide or ref or ep):
-                if guide:
+            while len(json.dumps(total, separators=(",", ":"))) > budget_left and (guide or ref or ep or env_block):
+                if env_block:
+                    env_block = env_block[: len(env_block) - 1]
+                elif guide:
                     guide = guide[: len(guide) - 1]
                 elif ref:
                     ref = ref[: len(ref) - 1]
@@ -270,6 +300,8 @@ class PlanningContext:
                     "episodes": ep,
                     "reflections": ref,
                     "guidance": guide,
+                    "strategy": strategy_block,
+                    "environment": env_block,
                     "provenance": prov,
                     "counts": {"episodes": len(ep), "reflections": len(ref), "guidance": len(guide)},
                 }
@@ -277,6 +309,8 @@ class PlanningContext:
                 "episodes": ep,
                 "reflections": ref,
                 "guidance": guide,
+                "strategy": strategy_block,
+                "environment": env_block,
                 "provenance": prov,
                 "counts": {"episodes": len(ep), "reflections": len(ref), "guidance": len(guide)},
                 "truncated": True,

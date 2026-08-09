@@ -149,13 +149,17 @@ def test_context_digest_shape_is_stable(tmp_path, sandbox):
     engine.execute_goal("Inspect this repository")
     mem = router.seen_contexts[-1]["memory"]
     # structured, separated context: historical_facts + reflections +
-    # recommendations (guidance) + provenance + counts
-    assert set(mem.keys()) == {"episodes", "reflections", "guidance", "provenance", "counts"}
+    # recommendations (guidance) + strategy + environment + provenance + counts
+    assert set(mem.keys()) == {"episodes", "reflections", "guidance", "strategy",
+                               "environment", "provenance", "counts"}
     assert set(mem["counts"].keys()) == {"episodes", "reflections", "guidance"}
     # provenance answers "which memory influenced this plan?"
     assert "episode_ids" in mem["provenance"]
     assert "reflection_ids" in mem["provenance"]
     assert "guidance_ids" in mem["provenance"]
+    # strategy + environment are structured, informational fields
+    assert mem["strategy"] is None or isinstance(mem["strategy"], dict)
+    assert isinstance(mem["environment"], list)
     ep0 = mem["episodes"][0]
     for key in ("episode_id", "goal", "outcome", "tags", "importance", "plan", "failures", "created_at"):
         assert key in ep0, f"missing {key} in episode digest"

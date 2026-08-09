@@ -96,6 +96,11 @@ def build_parser() -> argparse.ArgumentParser:
     cog_snap = cog_sub.add_parser("snapshot", help="full cognitive snapshot", parents=[common, common_memory])
     cog_snap.add_argument("--refresh", action="store_true", help="re-derive beliefs from memory first")
 
+    cog_world = cog_sub.add_parser("world", help="current world state + stale facts", parents=[common, common_memory])
+
+    cog_goals = cog_sub.add_parser("goals", help="long-horizon goal plan history", parents=[common, common_memory])
+    cog_goals.add_argument("goal_id", help="goal id to inspect")
+
     return parser
 
 
@@ -202,6 +207,44 @@ def _cognition_command(args, engine) -> int:
             return 0
         for b in snap.beliefs[:10]:
             print(f"  belief [{b.category}] conf={b.confidence:.2f}: {b.statement[:90]}")
+        return 0
+
+    if args.cognition_command == "world":
+        monitor = getattr(engine, "world_monitor", None)
+        if monitor is None:
+            print("world monitor is disabled for this engine")
+            return 1
+        facts = monitor.current_state()
+        stale = monitor.stale_facts(max_age_days=7.0)
+        if args.json:
+            _emit({
+                "state": facts,
+                "stale_facts": [f.to_dict() for f in stale],
+            })
+            return 0
+        for key, info in sorted(facts.items()):
+            print(f"{key} (v{info['version']}, observed {info['observed_at']}) = {json.dumps(info['value'], default=str)[:100]}")
+        if stale:
+            print(f"STALE facts ({len(stale)}):")
+            for f in stale:
+                print(f"  {f.key} last observed {f.observed_at}")
+        else:
+            print("no stale facts")
+        return 0
+
+    if args.cognition_command == "goals":
+        gm = getattr(engine, "goal_manager", None)
+        if gm is None:
+            print("goal manager is disabled for this engine")
+            return 1
+        history = gm.plan_history(args.goal_id)
+        if args.json:
+            _emit(gm.summarize(args.goal_id))
+            return 0
+        print(f"goal {args.goal_id}: {len(history)} plan version(s)")
+        for h in history:
+            print(f"  v{h['plan_version']} strategy={h['strategy']} steps={len(json.loads(h['plan_summary']))} at {h['created_at']}")
+        print(f"progress: {gm.progress(args.goal_id)}")
         return 0
 
     print(f"unknown cognition command: {args.cognition_command}")

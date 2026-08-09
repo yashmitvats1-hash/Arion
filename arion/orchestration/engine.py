@@ -73,6 +73,9 @@ class ArionEngine:
         reflector: Any | None = None,
         cognition: Any | None = None,
         belief_deriver: Any | None = None,
+        world_monitor: Any | None = None,
+        strategy_selector: Any | None = None,
+        goal_manager: Any | None = None,
     ):
         self.storage = storage
         self.registry = registry
@@ -86,6 +89,9 @@ class ArionEngine:
         self.reflector = reflector  # optional Reflector; deterministic by default
         self.cognition = cognition  # optional CognitiveState facade (ADR-014)
         self.belief_deriver = belief_deriver  # optional BeliefDeriver; deterministic by default
+        self.world_monitor = world_monitor  # optional WorldStateMonitor (ADR-015)
+        self.strategy_selector = strategy_selector  # optional StrategySelector (ADR-015)
+        self.goal_manager = goal_manager  # optional GoalManager (ADR-015)
 
     # ---------- public API ----------
 
@@ -163,34 +169,52 @@ class ArionEngine:
         while True:
             step = task.active_step
             if step is None:
-                break
-            task.status = TaskStatus.RUNNING
-            self._execute_step(task, step)
-
-            if step.status == StepStatus.PENDING and task.status == TaskStatus.AWAITING_APPROVAL:
-                self._checkpoint(task, reason="awaiting approval")
-                self.storage.save_task(task)
-                return task
-
-            self.storage.save_task(task)
-
-            if step.status == StepStatus.FAILED:
-                task.status = TaskStatus.FAILED
-                task.error = step.error or "step failed"
-                task.completed_at = utcnow()
-                self.storage.save_task(task)
-                self._emit("task.failed", task_id=task.id, detail={"step_index": step.index, "error": task.error})
-                self._record_memory(task)
-                return task
-
-            if step.index + 1 >= len(task.steps):
+                # Walked past the last step: every step was either executed or
+                # explicitly skipped, so the task reaches a terminal state.
+                skipped = sum(1 for s in task.steps if s.status == StepStatus.SKIPPED)
                 task.status = TaskStatus.COMPLETED
                 task.completed_at = utcnow()
                 self.storage.save_task(task)
                 self._checkpoint(task, reason="task completed")
-                self._emit("task.completed", task_id=task.id, detail={"steps": len(task.steps)})
+                self._emit(
+                    "task.completed",
+                    task_id=task.id,
+                    detail={"steps": len(task.steps), "skipped_steps": skipped},
+                )
                 self._record_memory(task)
                 return task
+
+            if step.status == StepStatus.SKIPPED:
+                # Explicitly skipped step (memory guidance): never executed,
+                # audited with its provenance, terminal for dependency purposes.
+                self._emit(
+                    "step.skipped",
+                    task_id=task.id,
+                    step_id=_step_id(step),
+                    detail={
+                        "reason": step.skipped_reason or "skipped",
+                        "guidance": step.guidance[:5],
+                    },
+                )
+            else:
+                task.status = TaskStatus.RUNNING
+                self._execute_step(task, step)
+
+                if step.status == StepStatus.PENDING and task.status == TaskStatus.AWAITING_APPROVAL:
+                    self._checkpoint(task, reason="awaiting approval")
+                    self.storage.save_task(task)
+                    return task
+
+                self.storage.save_task(task)
+
+                if step.status == StepStatus.FAILED:
+                    task.status = TaskStatus.FAILED
+                    task.error = step.error or "step failed"
+                    task.completed_at = utcnow()
+                    self.storage.save_task(task)
+                    self._emit("task.failed", task_id=task.id, detail={"step_index": step.index, "error": task.error})
+                    self._record_memory(task)
+                    return task
 
             task.current_step += 1
             self._checkpoint(task, reason="step completed")
@@ -219,6 +243,18 @@ class ArionEngine:
             })
             self._emit("task.failed", task_id=task.id, detail={"error": task.error})
             return task
+        if not steps:
+            # A plan with no steps can never reach a terminal state; fail the
+            # task explicitly rather than leaving it dangling in 'planned'.
+            task.status = TaskStatus.FAILED
+            task.error = "planning produced no steps"
+            task.completed_at = utcnow()
+            self.storage.save_task(task)
+            self._emit("error", task_id=task.id, success=False, detail={"error": task.error})
+            self._emit("task.failed", task_id=task.id, detail={"error": task.error})
+            self._record_memory(task)
+            return task
+
         task.steps = steps
         task.status = TaskStatus.PLANNED
         self.storage.save_task(task)
@@ -227,6 +263,25 @@ class ArionEngine:
             task_id=task.id,
             detail={"steps": [s.to_dict() for s in steps]},
         )
+
+        # Long-horizon goal management (ADR-015): record this plan version +
+        # strategy against the goal so progress spans sessions.
+        if self.goal_manager is not None and task.goal_id:
+            try:
+                strategy_name = "direct"
+                if getattr(self, "_last_strategy", None) is not None:
+                    strategy_name = self._last_strategy.name
+                elif self.strategy_selector is not None:
+                    beliefs = self.cognition.cognition.list_beliefs(limit=100) if self.cognition else []
+                    env_state = self.world_monitor.current_state() if self.world_monitor else {}
+                    strategy_name = self.strategy_selector.select(
+                        task.description, beliefs, env_state, []
+                    ).name
+                self.goal_manager.record_plan(
+                    task.goal_id, strategy_name, [s.to_dict() for s in steps]
+                )
+            except Exception:
+                pass
         # Audit memory-driven plan transformation (non-mutating, provenance-
         # carrying). The ORIGINAL plan + every decision are recorded; guidance
         # remains informational - authorization still decides at execution.
@@ -531,6 +586,40 @@ class ArionEngine:
                     "deterministic": True,
                 },
             )
+
+            # World state (ADR-015): expose current environment facts (bounded)
+            # so the planner relies on the CURRENT world, not stale memory.
+            if self.world_monitor is not None:
+                try:
+                    from arion.cognition.models import EnvironmentFact
+
+                    facts = self.world_monitor.store.list_environment_facts(limit=50)
+                    ctx.environment = facts[:20]
+                except Exception:
+                    pass
+
+            # Strategy selection (ADR-015): deterministic, informational.
+            if self.strategy_selector is not None:
+                try:
+                    beliefs = self.cognition.cognition.list_beliefs(limit=100) if self.cognition else []
+                    env_state = self.world_monitor.current_state() if self.world_monitor else {}
+                    strategy = self.strategy_selector.select(
+                        task.description, beliefs, env_state, ctx.guidance
+                    )
+                    ctx.strategy = strategy
+                    self._last_strategy = strategy
+                    self._emit(
+                        "strategy.selected",
+                        task_id=task.id,
+                        detail={
+                            "strategy_id": strategy.strategy_id,
+                            "name": strategy.name,
+                            "constraints": strategy.constraints,
+                            "provenance": strategy.provenance,
+                        },
+                    )
+                except Exception:
+                    pass
             return ctx
         except Exception:
             # Memory must never break planning.

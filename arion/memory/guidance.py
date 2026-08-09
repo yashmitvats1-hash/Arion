@@ -276,14 +276,29 @@ def apply_guidance_to_steps(
       1. resource_substitution - a 'prefer' exists for the same capability+action
       2. action_substitution   - a 'prefer' exists for a DIFFERENT action of the
                                  same capability (materially different strategy)
-      3. step_skipped          - no safe alternative: drop the doomed step
+      3. step_skipped          - no safe alternative: the step is kept in the
+                                 plan with status SKIPPED and its provenance
+                                 (NEVER silently deleted - the engine treats
+                                 SKIPPED as an explicit terminal state)
+
+    FAIL-CLOSED RESOLUTION: resource resolution must come from the capability
+    registry (ActionSpec.resource_param). If NO resolver is provided, the
+    transform refuses to guess (raises ValueError) rather than assuming a
+    filesystem 'path' param. If the resolver returns None for a specific
+    capability/action, that step is left untransformed (we cannot safely
+    target its resource).
 
     Returns PlanTransformation(original, transformed, decisions); every
     decision records provenance (guidance/episode/reflection ids), and each
     transformed step carries its provenance in step.guidance.
     """
+    if resource_param_resolver is None:
+        raise ValueError(
+            "apply_guidance_to_steps requires a registry-driven resource_param_resolver; "
+            "refusing to guess a resource param (fail closed)"
+        )
     original = [copy.deepcopy(s) for s in steps]
-    resolver = resource_param_resolver or (lambda capability, action: "path")
+    resolver = resource_param_resolver
 
     avoid = [g for g in guidance if g.category == "avoid" and g.capability and g.resource]
     prefer_by_action = {
@@ -376,7 +391,12 @@ def apply_guidance_to_steps(
             transformed.append(s)
             continue
 
-        # Strategy 3: no safe alternative -> skip the doomed step
+        # Strategy 3: no safe alternative -> SKIP the doomed step EXPLICITLY.
+        # The step is retained in the plan with status SKIPPED and its
+        # provenance, so the orchestrator always has a terminal task state and
+        # the action is never silently deleted.
+        from arion.state.models import StepStatus
+
         provenance = {
             "category": "step_skipped",
             "capability": step.capability,
@@ -385,7 +405,12 @@ def apply_guidance_to_steps(
             "guidance_id": hit.guidance_id,
             "episode_id": hit.episode_id,
             "reflection_id": hit.reflection_id,
+            "reason": hit.reason[:200],
         }
+        s.status = StepStatus.SKIPPED
+        s.skipped_reason = hit.reason[:200] or "no safe alternative per memory guidance"
+        s.guidance.append(provenance)
         decisions.append({"step_index": step.index, **provenance})
+        transformed.append(s)
 
     return PlanTransformation(original=original, transformed=transformed, decisions=decisions)
