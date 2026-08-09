@@ -140,7 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
     approvals_sub = approvals.add_subparsers(dest="approvals_command", required=True)
 
     approvals_list = approvals_sub.add_parser("list", help="list approval requests", parents=[common, common_memory])
-    approvals_list.add_argument("--status", default=None, choices=["pending", "approved", "denied"])
+    approvals_list.add_argument("--status", default=None, choices=["pending", "approved", "denied", "expired"])
 
     approvals_show = approvals_sub.add_parser("show", help="show an approval request", parents=[common, common_memory])
     approvals_show.add_argument("approval_id")
@@ -244,9 +244,12 @@ def _approvals_command(args, engine) -> int:
             _emit([r.to_dict() for r in reqs])
             return 0
         for r in reqs:
-            print(f"{r.approval_id}  {r.status.value:<9} {r.capability}/{r.action}  "
-                  f"{('on ' + str(r.resource)) if r.resource else ''}  task={r.task_id}"
-                  + (f"  goal={r.goal_id}" if r.goal_id else ""))
+            line = (f"{r.approval_id}  {r.status.value:<9} {r.capability}/{r.action}  "
+                    f"{('on ' + str(r.resource)) if r.resource else ''}  task={r.task_id}"
+                    + (f"  goal={r.goal_id}" if r.goal_id else ""))
+            if r.status.value == "expired" and r.expired_at:
+                line += f"  expired_at={r.expired_at}"
+            print(line)
         return 0
 
     if args.approvals_command == "show":

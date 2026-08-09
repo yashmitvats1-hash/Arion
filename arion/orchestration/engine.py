@@ -79,6 +79,7 @@ class ArionEngine:
         strategy_selector: Any | None = None,
         goal_manager: Any | None = None,
         approval_store: ApprovalStore | None = None,
+        approval_ttl_seconds: float | None = None,
     ):
         self.storage = storage
         self.registry = registry
@@ -100,6 +101,116 @@ class ArionEngine:
         self.approval_store = approval_store
         if self.approval_store is None and hasattr(storage, "create_request"):
             self.approval_store = storage  # type: ignore[assignment]
+        # Stale-PENDING retention (ADR-019): None = never expire; a positive
+        # value expires PENDING requests older than now-ttl on demand.
+        self.approval_ttl_seconds = approval_ttl_seconds
+
+    # ---------- approval expiry (ADR-019) ----------
+
+    def expire_stale_approvals(self, now: str | None = None) -> list[str]:
+        """Mark stale PENDING approval requests as EXPIRED (durable, idempotent).
+
+        A request expires when it has been pending longer than the engine's
+        configured TTL (approval_ttl_seconds). `now` is injectable for tests
+        (ISO-8601); defaults to the real clock. Returns the approval ids that
+        were newly expired in this call. Idempotent: already-EXPIRED requests
+        are never touched again, so no duplicate events. Expired requests
+        remain fully auditable - nothing is deleted.
+
+        An expired approval fails the awaiting task durably with an explicit
+        'approval expired; recovery requires new authorization' error and
+        clears the goal's approval_pending blocker, so a later run_goal
+        replans and requests FRESH authorization. A stale approval can never
+        cause a mutation.
+        """
+        if now is None:
+            from arion.state.models import utcnow
+
+            now = utcnow()
+        if self.approval_store is None:
+            return []
+        ttl = self.approval_ttl_seconds
+        if ttl is None:
+            return []  # expiration disabled
+
+        from datetime import datetime, timedelta, timezone
+
+        try:
+            now_dt = datetime.fromisoformat(now)
+            if now_dt.tzinfo is None:
+                now_dt = now_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return []
+        cutoff = now_dt - timedelta(seconds=max(0.0, float(ttl)))
+        cutoff_iso = cutoff.isoformat()
+
+        expired: list[str] = []
+        for req in self.approval_store.list_requests(status=ApprovalStatus.PENDING.value):
+            try:
+                created_dt = datetime.fromisoformat(req.created_at)
+                if created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+            if created_dt >= cutoff:
+                continue
+            req.status = ApprovalStatus.EXPIRED
+            req.expired_at = now
+            req.updated_at = now
+            self.approval_store.update_request(req)
+            expired.append(req.approval_id)
+            self._emit(
+                "approval.expired",
+                task_id=req.task_id,
+                step_id=f"{req.task_id}:{req.step_index}",
+                success=False,
+                detail={
+                    "approval_id": req.approval_id,
+                    "task_id": req.task_id,
+                    "step_index": req.step_index,
+                    "capability": req.capability,
+                    "action": req.action,
+                    "resource": req.resource,
+                    "reason": "pending approval exceeded TTL",
+                },
+            )
+            self._fail_awaiting_task_on_expiry(req)
+        return expired
+
+    def _fail_awaiting_task_on_expiry(self, req: "ApprovalRequest") -> None:
+        """Fail the task that was waiting on an expired approval, durably.
+
+        Mirrors the DENIED path but with an explicit expiry reason: the
+        mutation is NOT executed, the task becomes terminally FAILED with an
+        explainable error, and the goal's approval_pending blocker is cleared
+        so the next run_goal replans and requests fresh authorization.
+        """
+        task = self.storage.load_task(req.task_id)
+        if task is None or task.status != TaskStatus.AWAITING_APPROVAL:
+            return
+        step = task.active_step
+        if step is not None and step.index == req.step_index:
+            step.status = StepStatus.FAILED
+            step.error = "approval expired; recovery requires new authorization"
+        task.status = TaskStatus.FAILED
+        task.error = "approval expired; recovery requires new authorization"
+        task.completed_at = utcnow()
+        if self.goal_manager is not None and task.goal_id:
+            try:
+                self.goal_manager.clear_blocker(task.goal_id, "approval_pending",
+                                                reason="approval_expired")
+            except Exception:
+                pass
+        self._emit("task.failed", task_id=task.id, detail={
+            "step_index": req.step_index, "error": task.error,
+        })
+        self._emit("goal.approval.expired", task_id=task.id, detail={
+            "goal_id": task.goal_id, "task_id": task.id, "step_index": req.step_index,
+            "approval_id": req.approval_id,
+        })
+        self._record_memory(task)
+        task.updated_at = utcnow()
+        self.storage.save_task(task)
 
     # ---------- public API ----------
 
@@ -738,6 +849,17 @@ class ArionEngine:
                         "strategy": strategy_name,
                         "reason": reason[:200],
                     })
+                    # keep the goal row's replan provenance in sync (the plan
+                    # history is the source of truth; this mirrors the reason
+                    # on the goal for CLI/debugging, ADR-016)
+                    try:
+                        g = self.goal_manager.get_goal(task.goal_id)
+                        if g is not None:
+                            g.last_replan_reason = reason
+                            g.updated_at = utcnow()
+                            self.storage.save_goal(g)
+                    except Exception:
+                        pass
             except Exception:
                 pass
         # Audit memory-driven plan transformation (non-mutating, provenance-
@@ -1038,14 +1160,25 @@ class ArionEngine:
     def _execute_with_retries(self, task: Task, step: PlanStep, capability, spec) -> None:
         verify_failed = False
         exec_error: str | None = None
+        mutating = getattr(spec, "side_effects", "read_only") == "mutating"
         while step.attempts < step.max_attempts:
             step.attempts += 1
             step.status = StepStatus.RUNNING
+            if mutating:
+                self._emit("mutation.attempted", task_id=task.id, step_id=_step_id(step), detail={
+                    "capability": getattr(capability, "name", step.capability),
+                    "action": step.action,
+                    "resource": step.params.get(spec.resource_param) if spec.resource_param else None,
+                    "attempt": step.attempts,
+                })
             try:
                 observation = capability.execute(step.action, dict(step.params))
             except CapabilityError as exc:
                 exec_error = str(exc)
                 step.result = None
+                if mutating:
+                    self._emit("mutation.failed", task_id=task.id, step_id=_step_id(step),
+                               success=False, detail={"error": exec_error, "attempt": step.attempts})
                 # retry only if the action is metadata-marked retry-safe
                 if step.attempts >= step.max_attempts or not spec.retry_safe:
                     break
@@ -1060,6 +1193,12 @@ class ArionEngine:
             except Exception as exc:  # unexpected capability bug - fail loudly
                 step.status = StepStatus.FAILED
                 step.error = f"capability raised unexpected error: {exc!r}"
+                if mutating:
+                    self._emit("mutation.failed", task_id=task.id, step_id=_step_id(step),
+                               success=False, detail={"error": step.error, "attempt": step.attempts})
+                    self._emit("mutation.requires_recovery", task_id=task.id,
+                               step_id=_step_id(step), success=False,
+                               detail={"error": step.error})
                 self._emit("error", task_id=task.id, step_id=_step_id(step), success=False, detail={"error": step.error})
                 return
 
@@ -1075,6 +1214,11 @@ class ArionEngine:
             if self._verify(task, step):
                 step.status = StepStatus.SUCCEEDED
                 step.error = None
+                if mutating:
+                    self._emit("mutation.succeeded", task_id=task.id, step_id=_step_id(step), detail={
+                        "resource": step.params.get(spec.resource_param) if spec.resource_param else None,
+                        "size": observation.get("size"),
+                    })
                 return
             verify_failed = True
             step.error = "verification failed"
@@ -1090,7 +1234,14 @@ class ArionEngine:
             break
 
         step.status = StepStatus.FAILED
-        step.error = step.error or exec_error or "step failed"
+        if mutating and not spec.retry_safe and exec_error is not None:
+            # Non-retry-safe mutation failed: the operation may have partially
+            # applied. NEVER infer safe-to-repeat from the failure itself; the
+            # task fails durably with an explainable recovery-required error
+            # and recovery needs a NEW planning/authorization decision.
+            step.error = f"mutation failed: {exec_error}; recovery required"
+        else:
+            step.error = step.error or exec_error or "step failed"
         if exec_error is not None:
             self._emit(
                 "capability.executed",
@@ -1107,6 +1258,10 @@ class ArionEngine:
             success=False,
             detail={"attempt": step.attempts, "error": step.error},
         )
+        if mutating and not spec.retry_safe and exec_error is not None:
+            self._emit("mutation.requires_recovery", task_id=task.id,
+                       step_id=_step_id(step), success=False,
+                       detail={"error": step.error, "attempt": step.attempts})
 
     def _verify(self, task: Task, step: PlanStep) -> bool:
         policy = step.verification.policy
@@ -1119,6 +1274,19 @@ class ArionEngine:
             missing = [k for k in keys if k not in result]
             ok = not missing
             detail = {"policy": policy, "missing": missing}
+        elif policy == "write_verified":
+            # ADR-019: confirm the intended postcondition WITHOUT another
+            # mutation - the capability reported the exact byte size of the
+            # write; it must match the length of the content the plan asked
+            # to write. Deterministic, no filesystem re-check needed.
+            expected = None
+            content = step.params.get("content")
+            if isinstance(content, str):
+                expected = len(content.encode("utf-8"))
+            ok = bool(result.get("written")) and isinstance(result.get("size"), int) and \
+                result["size"] == expected
+            detail = {"policy": policy, "expected_size": expected,
+                      "reported_size": result.get("size")}
         else:
             ok = False
             detail = {"policy": policy, "error": "unknown verification policy"}

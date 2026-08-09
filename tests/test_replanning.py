@@ -315,3 +315,82 @@ def test_step_skipped_within_goal_plan(tmp_path, sandbox):
     final = engine.run_goal(gid)
     assert final.status_value == "completed"
     engine.storage.close()
+
+
+def test_completed_task_yields_prefer_guidance(tmp_path, sandbox):
+    """A normally-completed engine-run task yields a 'completed' episode and
+    prefer guidance (NOT 'recovered') - the mechanism that lets cycle-2
+    planning substitute a read onto a previously-good resource."""
+    from arion.memory.lifecycle import build_episode_from_task
+    from arion.memory.retrieval import MemoryRetriever, build_planning_context
+    from arion.memory.models import ContextBudget
+
+    db = tmp_path / "prefer.db"
+    engine, gm, storage, world_monitor = _engine(db, sandbox)
+
+    goal = engine.submit_goal("read docs/design.md")
+    final = engine.run_goal(goal.id)
+    assert final.status_value == "completed"
+
+    task = gm.task_history(goal.id)[-1]
+    episode = build_episode_from_task(task, storage.list_events(goal.id), registry=engine.registry)
+    assert episode.outcome == "completed", f"expected completed, got {episode.outcome}"
+
+    ctx = build_planning_context(MemoryRetriever(engine.memory), "inspect this repository",
+                                 ContextBudget())
+    prefers = [g for g in ctx.guidance if g.category == "prefer" and g.resource == "docs/design.md"]
+    assert prefers, "completed episode must yield prefer guidance"
+    engine.storage.close()
+
+
+def test_strategy_escalation_reaches_defer_retry(tmp_path, sandbox):
+    """Full escalation through the engine loop: direct (v1, fails on binary) ->
+    avoid_known_failures (v2, race: preferred resource turns binary mid-goal,
+    fails) -> world change -> defer_retry (v3, skips known-bad reads,
+    completes). Previous plans stay immutable; versions monotonic."""
+    _binary_sandbox(sandbox)
+    db = tmp_path / "escalate.db"
+    engine, gm, storage, world_monitor = _engine(db, sandbox)
+    goal = engine.submit_goal("inspect this repository and produce useful notes")
+    gid = goal.id
+
+    # Cycle 1: direct, fails on binary README.md
+    engine.run_goal(gid)
+    assert gm.latest_plan(gid)["strategy"] == "direct"
+
+    # prelude: docs/design.md succeeds -> prefer guidance
+    pre = engine.submit_goal("read docs/design.md")
+    engine.run_goal(pre.id)
+    assert gm.get_goal(pre.id).status_value == "completed"
+
+    # race: the preferred file turns binary mid-goal
+    (sandbox / "docs" / "design.md").write_bytes(b"\xff\xde\xad binary")
+
+    # Cycle 2: avoid_known_failures; guidance substitutes read onto the
+    # preferred docs/design.md, which now fails -> task failed
+    engine.run_goal(gid)
+    assert gm.latest_plan(gid)["strategy"] == "avoid_known_failures"
+
+    # Cycle 3: material world change -> replan; strategy ESCALATES to
+    # defer_retry instead of repeating avoid_known_failures
+    class ClockCap:
+        name = "clock.now"
+        description = "clock"
+        actions = [ActionSpec(name="now", description="now", required_scope="clock:read")]
+
+        def execute(self, action, params):
+            return {"time": "12:00"}
+
+    engine.registry.register(ClockCap())
+    world_monitor.observe("registered_capabilities", sorted(engine.registry.list()), source="system")
+    final = engine.run_goal(gid)
+    assert final.status_value == "completed"
+
+    history = gm.plan_history(gid)
+    assert [h["plan_version"] for h in history] == [1, 2, 3]
+    assert [h["reason"] for h in history] == ["initial_plan", "replan_task_failed", "replan_world_changed"]
+    assert [h["strategy"] for h in history] == ["direct", "avoid_known_failures", "defer_retry"]
+    # v1/v2 immutable
+    assert history[0]["plan_summary"] == gm.plan_history(gid)[0]["plan_summary"]
+    assert history[1]["plan_summary"] == gm.plan_history(gid)[1]["plan_summary"]
+    engine.storage.close()

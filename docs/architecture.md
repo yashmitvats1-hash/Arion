@@ -333,6 +333,38 @@ loop (ADR-016):
   rejected by PlanValidator before execution.
 - **Demo:** `scripts/demo_approval_queue.py` (both DoD paths, offline).
 
+## First Write Capability + Approval Expiry (ADR-019)
+
+- **`filesystem.write`** (`arion/capabilities/write.py`) — the ONLY mutating
+  capability. Single `write` action: bounded plain-text write to a sandboxed,
+  repo-relative path; pure `Path` I/O (no shell/subprocess); refuses to
+  overwrite unless `overwrite: true` (security-relevant, fingerprinted);
+  `risk=high`, `side_effects=mutating`, `retry_safe=False`; explicit
+  `param_schema`; `write_verified` default verification (postcondition size
+  check, no second mutation). Containment via `_resolve_inside` — `..`
+  traversal, absolute paths outside the root, and symlink escapes fail
+  closed. Registry-discoverable via bootstrap, but DENIED by the default
+  policy (no `filesystem:write` scope) — no mutation without explicit
+  authorization.
+- **Non-retry-safe execution:** failed mutations are never blindly retried;
+  the task fails durably with `mutation failed: …; recovery required` and a
+  bounded audit trail (`mutation.attempted` / `mutation.failed` /
+  `mutation.succeeded` / `mutation.requires_recovery`). The failed task is
+  terminal — restart never duplicates the mutation; recovery goes through a
+  NEW plan version + FRESH authorization.
+- **Approval expiry:** stale PENDING requests expire (`ApprovalStatus.EXPIRED`
+  + `expired_at`, engine `approval_ttl_seconds`, injectable clock, idempotent).
+  Expired approvals cannot be resolved (typed `ApprovalError`); the awaiting
+  task fails durably with `approval expired; recovery requires new
+  authorization`; nothing is pruned (EXPIRED records + `approval.expired`
+  audit events remain). CLI: `arion approvals list [--status expired]`, `show`
+  expose EXPIRED + `expired_at`; approve/deny fail closed.
+- **Fingerprint review:** the canonical fingerprint (capability/action/scope/
+  risk/side-effects/resource-kind/resource/security-relevant params) covers
+  writes once `overwrite` is declared; the content payload stays operational
+  (not fingerprinted) — both directions proven by tests.
+- **Demo:** `scripts/demo_adr019_write_approval.py` (scenarios A–E, offline).
+
 ## Structured intelligence boundary (ADR-011)
 
 ```
@@ -390,11 +422,14 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/arion goals approve <goal_id>   # approve a pending approval (ADR-017)
 .venv/bin/arion goals deny <goal_id>      # deny a pending approval (ADR-017)
 .venv/bin/arion approvals list            # durable approval queue (ADR-018)
+.venv/bin/arion approvals list --status expired   # expiry state (ADR-019)
 .venv/bin/arion approvals approve <approval_id>
 .venv/bin/arion goals show <goal_id> --json
 .venv/bin/python scripts/demo_goal_replan.py   # 3-cycle DoD demo (offline)
 .venv/bin/python scripts/demo_goal_approval.py  # approval + blocked-capability demo (offline)
 .venv/bin/python scripts/demo_approval_queue.py  # durable approval queue + http.get demo (offline)
+.venv/bin/python scripts/demo_adr016_goal_replan.py     # 3-cycle + restart + live-authz demo (offline)
+.venv/bin/python scripts/demo_adr019_write_approval.py  # write approval A-E demo (offline)
 .venv/bin/python -m pytest
 ```
 

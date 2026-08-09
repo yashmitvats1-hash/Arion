@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS approval_requests (
     fingerprint    TEXT NOT NULL,
     decision_actor TEXT,
     decided_at     TEXT,
+    expired_at     TEXT,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL
 );
@@ -116,6 +117,7 @@ class SQLiteStorage:
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._conn.executescript(SCHEMA)
         self._migrate_goals()
+        self._migrate_approvals()
         self._conn.commit()
 
     def _migrate_goals(self) -> None:
@@ -134,6 +136,14 @@ class SQLiteStorage:
         for col, ddl in additions.items():
             if col not in cols:
                 self._conn.execute(ddl)
+
+    def _migrate_approvals(self) -> None:
+        """Lightweight additive migration: add the expiry column to
+        approval_requests created before ADR-019. Never drops data (the
+        queue record + audit trail stay intact)."""
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(approval_requests)").fetchall()}
+        if "expired_at" not in cols:
+            self._conn.execute("ALTER TABLE approval_requests ADD COLUMN expired_at TEXT")
 
     # ---- goals ----
 
@@ -267,7 +277,7 @@ class SQLiteStorage:
         "approval_id", "task_id", "step_index", "goal_id", "capability", "action",
         "scope", "risk", "side_effects", "resource_kind", "resource", "summary",
         "status", "requester_actor", "actor_chain", "params_keys", "fingerprint",
-        "decision_actor", "decided_at", "created_at", "updated_at",
+        "decision_actor", "decided_at", "expired_at", "created_at", "updated_at",
     )
 
     def create_request(self, request: "ApprovalRequest") -> None:
@@ -299,9 +309,9 @@ class SQLiteStorage:
         request.updated_at = utcnow()
         self._conn.execute(
             "UPDATE approval_requests SET status=?, decision_actor=?, decided_at=?, "
-            "summary=?, updated_at=? WHERE approval_id=?",
+            "summary=?, expired_at=?, updated_at=? WHERE approval_id=?",
             (request.status.value, request.decision_actor, request.decided_at,
-             request.summary, request.updated_at, request.approval_id),
+             request.summary, request.expired_at, request.updated_at, request.approval_id),
         )
         self._conn.commit()
 
@@ -335,7 +345,8 @@ def _approval_row(request: "ApprovalRequest") -> tuple[Any, ...]:
         request.side_effects, request.resource_kind, request.resource, request.summary,
         request.status.value, request.requester_actor, json.dumps(request.actor_chain),
         json.dumps(request.params_keys), json.dumps(request.fingerprint),
-        request.decision_actor, request.decided_at, request.created_at, request.updated_at,
+        request.decision_actor, request.decided_at, request.expired_at,
+        request.created_at, request.updated_at,
     )
 
 

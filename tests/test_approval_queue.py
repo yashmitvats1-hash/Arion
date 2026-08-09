@@ -357,7 +357,13 @@ def test_approval_queue_audit_events(tmp_path, sandbox):
     engine.storage.close()
 
 
-def test_approval_expired_event_not_emitted(tmp_path, sandbox):
-    """No approval.expired event exists (expiration is NOT implemented)."""
+def test_approval_expired_event_kind_registered(tmp_path, sandbox):
+    """approval.expired is a canonical audit kind (ADR-019 expiration)."""
     from arion.observability.events import EVENT_KINDS
-    assert "approval.expired" not in EVENT_KINDS
+    assert "approval.expired" in EVENT_KINDS
+    assert "goal.approval.expired" in EVENT_KINDS
+    # mutation audit vocabulary (ADR-019 non-retry-safe writes)
+    assert "mutation.attempted" in EVENT_KINDS
+    assert "mutation.succeeded" in EVENT_KINDS
+    assert "mutation.failed" in EVENT_KINDS
+    assert "mutation.requires_recovery" in EVENT_KINDS

@@ -28,6 +28,7 @@ class ApprovalStatus(str, Enum):
     PENDING = "pending"
     APPROVED = "approved"
     DENIED = "denied"
+    EXPIRED = "expired"  # stale PENDING (ADR-019): cannot be resolved; auditable
 
 
 class ApprovalError(Exception):
@@ -57,6 +58,7 @@ class ApprovalRequest:
     fingerprint: dict[str, Any] = field(default_factory=dict)  # canonical authz fingerprint
     decision_actor: str | None = None
     decided_at: str | None = None
+    expired_at: str | None = None  # when the request was marked EXPIRED (ADR-019)
     created_at: str = field(default_factory=utcnow)
     updated_at: str = field(default_factory=utcnow)
 
@@ -87,6 +89,7 @@ class ApprovalRequest:
             fingerprint=dict(d.get("fingerprint", {}) or {}),
             decision_actor=d.get("decision_actor"),
             decided_at=d.get("decided_at"),
+            expired_at=d.get("expired_at"),
             created_at=d.get("created_at", utcnow()),
             updated_at=d.get("updated_at", utcnow()),
         )
