@@ -11,6 +11,7 @@ from arion.intelligence.planner import DeterministicPlanner
 from arion.intelligence.router import DeterministicRouter
 from arion.observability.events import EventLogger
 from arion.orchestration.authz import (
+    ApprovalOutcome,
     AutoApproveHandler,
     AutoDenyHandler,
     PendingApprovalHandler,
@@ -82,10 +83,8 @@ def test_require_approval_pauses_task(db_path):
 
 
 def test_approval_then_resume_completes(db_path):
-    """Approve the pause, then resume: same step runs to completion.
-
-    Simulates a human approval interface answering between two run_task calls
-    (the approval seam).
+    """Approve the durable queue record, then resume: same step runs to
+    completion (ADR-018 queue path).
     """
     engine = _build_engine(db_path, PendingApprovalHandler())
     goal = engine.submit_goal("do medium thing")
@@ -94,17 +93,19 @@ def test_approval_then_resume_completes(db_path):
     engine.storage.save_task(task)
     task_id = task.id
 
-    engine.run_task(task_id)  # pauses awaiting approval
+    engine.run_task(task_id)  # pauses awaiting approval + queues a request
 
-    # approval interface answers; a fresh handler grants approval on resume
-    engine2 = _build_engine(db_path, AutoApproveHandler())
-    resumed = engine2.run_task(task_id)
+    # approval interface answers through the durable queue
+    req = engine.approval_store.list_requests()[0]
+    engine.resolve_approval_request(req.approval_id, ApprovalOutcome.APPROVED, actor="user:alice")
+    resumed = engine.run_task(task_id)
 
     assert resumed.status == TaskStatus.COMPLETED
     assert resumed.steps[0].status == StepStatus.SUCCEEDED
     assert resumed.steps[0].result["content"] == "medium done"
-    kinds = [e.kind for e in engine2.storage.list_events(task_id)]
+    kinds = [e.kind for e in engine.storage.list_events(task_id)]
     assert "approval.requested" in kinds
+    assert "approval.queued" in kinds
     assert "approval.granted" in kinds
     # paused task resumed from the same step, not replanned
     assert kinds.count("plan.produced") == 0
@@ -133,13 +134,17 @@ def test_approval_events_persist_across_restart(db_path):
     task.steps = [_step()]
     engine.storage.save_task(task)
     task_id = task.id
-    engine.run_task(task_id)  # pauses
+    engine.run_task(task_id)  # pauses + queues a durable request
     engine.storage.close()
 
-    # fresh process: events preserved, task resumable to completion
-    engine2 = _build_engine(db_path, AutoApproveHandler())
+    # fresh process: events + queue record preserved; resolve then resume
+    engine2 = _build_engine(db_path)
     events = engine2.storage.list_events(task_id)
     assert "approval.requested" in [e.kind for e in events]
+    assert "approval.queued" in [e.kind for e in events]
     assert engine2.storage.load_task(task_id).status == TaskStatus.AWAITING_APPROVAL
+    req = engine2.approval_store.list_requests()[0]
+    assert req.status.value == "pending"
+    engine2.resolve_approval_request(req.approval_id, ApprovalOutcome.APPROVED, actor="user:alice")
     resumed = engine2.run_task(task_id)
     assert resumed.status == TaskStatus.COMPLETED

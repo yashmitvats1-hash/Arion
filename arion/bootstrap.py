@@ -12,6 +12,7 @@ from typing import Any
 
 from arion.capabilities.filesystem import FilesystemReadCapability
 from arion.capabilities.git import GitLogCapability
+from arion.capabilities.http import HttpGetCapability
 from arion.capabilities.registry import CapabilityRegistry
 from arion.cognition.deriver import DeterministicBeliefDeriver
 from arion.cognition.goals import GoalManager
@@ -51,6 +52,9 @@ def build_engine(
     registry = CapabilityRegistry()
     registry.register(FilesystemReadCapability(sandbox_root))
     registry.register(GitLogCapability(sandbox_root))
+    # http.get is DISCOVERABLE by default but DENIED until an operator configures
+    # a 'url' resource boundary (fail closed): no allowlist = no network access.
+    registry.register(HttpGetCapability())
 
     events = EventLogger()
     events.add_sink(storage)  # Storage implements EventSink.append_event
@@ -71,6 +75,8 @@ def build_engine(
     if policy is None:
         policy = ResourcePolicy(
             allowed_scopes={"filesystem:read", "git:read"},
+            # NOTE: no 'url' boundary by default -> http.get is DENIED (fail
+            # closed). Configure UrlBoundary to enable network access.
             boundaries={"filesystem:path": RelativePathBoundary()},
         )
 

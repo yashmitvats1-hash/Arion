@@ -100,6 +100,9 @@ def _seed_awaiting_goal(db_path, sandbox):
                          verification=VerificationPolicy("schema_keys", {"keys": ["review"]})),
             ]
 
+        def required_capabilities(self, goal_description):
+            return {"filesystem.read", "repo.review"}
+
     events = EventLogger(sinks=[storage])
     planner = TwoStepPlanner()
     cognitive = SQLiteCognitiveStore(db_path)

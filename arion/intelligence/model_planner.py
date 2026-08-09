@@ -90,6 +90,18 @@ class RealModelPlanner:
             steps = transformation.transformed
         return steps
 
+    def required_capabilities(self, goal_description: str) -> set[str]:
+        """Declare the capabilities this model-backed planner needs (ADR-018).
+
+        The heuristic mirrors the deterministic planner's templates so the
+        gate is consistent; the ACTUAL produced plan is additionally validated
+        by PlanValidator against the live registry - a model-proposed
+        unregistered capability is rejected before execution. Never returns an
+        empty set to mean 'unknown' (fail closed)."""
+        from arion.intelligence.planner import planner_requirements
+
+        return planner_requirements(goal_description)
+
     def _emit(self, kind: str, task_id: str | None, success: bool = True, detail: dict[str, Any] | None = None) -> None:
         if self.events is None:
             return

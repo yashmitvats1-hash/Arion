@@ -30,7 +30,7 @@ def _print_task(engine: ArionEngine, task_id: str) -> None:
         if step.error:
             print(f"        error: {step.error}")
         if task.status.value == "awaiting_approval" and step.status.value == "pending":
-            print("        awaiting approval: run `arion goals approve <goal_id>` or `arion goals deny <goal_id>`")
+            print("        awaiting approval: `arion approvals list` then `arion approvals approve <approval_id>`")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -135,6 +135,24 @@ def build_parser() -> argparse.ArgumentParser:
     goals_deny.add_argument("goal_id")
     goals_deny.add_argument("--actor", default="cli-approver", help="who denied (audit only)")
 
+    approvals = sub.add_parser("approvals", help="durable approval queue (ADR-018)")
+    approvals.add_argument("--db", default=None, dest="db_approvals", help=argparse.SUPPRESS)
+    approvals_sub = approvals.add_subparsers(dest="approvals_command", required=True)
+
+    approvals_list = approvals_sub.add_parser("list", help="list approval requests", parents=[common, common_memory])
+    approvals_list.add_argument("--status", default=None, choices=["pending", "approved", "denied"])
+
+    approvals_show = approvals_sub.add_parser("show", help="show an approval request", parents=[common, common_memory])
+    approvals_show.add_argument("approval_id")
+
+    approvals_approve = approvals_sub.add_parser("approve", help="approve a pending approval request", parents=[common, common_memory])
+    approvals_approve.add_argument("approval_id")
+    approvals_approve.add_argument("--actor", default="cli-approver", help="who approved (audit only; never changes authorization identity)")
+
+    approvals_deny = approvals_sub.add_parser("deny", help="deny a pending approval request", parents=[common, common_memory])
+    approvals_deny.add_argument("approval_id")
+    approvals_deny.add_argument("--actor", default="cli-approver", help="who denied (audit only)")
+
     return parser
 
 
@@ -143,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(__file__).resolve().parent.parent.parent
     db_path = (args.db or args.db_global or getattr(args, "db_mem", None)
                or getattr(args, "db_cog", None) or getattr(args, "db_goals", None)
+               or getattr(args, "db_approvals", None)
                or str(root / "arion_data" / "arion.db"))
 
     engine = build_engine(
@@ -197,9 +216,77 @@ def main(argv: list[str] | None = None) -> int:
         return _cognition_command(args, engine)
     elif args.command == "goals":
         return _goals_command(args, engine)
+    elif args.command == "approvals":
+        return _approvals_command(args, engine)
 
     storage.close()
     return 0
+
+
+def _approvals_command(args, engine) -> int:
+    """arion approvals list|show|approve|deny (durable queue, ADR-018)."""
+    import json
+
+    store = getattr(engine, "approval_store", None)
+    if store is None:
+        print("approval queue is not available on this engine")
+        return 1
+
+    def _emit(obj):
+        if getattr(args, "json", False):
+            print(json.dumps(obj, indent=2, default=str))
+        else:
+            print(obj)
+
+    if args.approvals_command == "list":
+        reqs = store.list_requests(status=args.status)
+        if args.json:
+            _emit([r.to_dict() for r in reqs])
+            return 0
+        for r in reqs:
+            print(f"{r.approval_id}  {r.status.value:<9} {r.capability}/{r.action}  "
+                  f"{('on ' + str(r.resource)) if r.resource else ''}  task={r.task_id}"
+                  + (f"  goal={r.goal_id}" if r.goal_id else ""))
+        return 0
+
+    if args.approvals_command == "show":
+        req = store.get_request(args.approval_id)
+        if req is None:
+            print(f"approval {args.approval_id} not found")
+            return 1
+        if args.json:
+            _emit(req.to_dict())
+            return 0
+        print(f"approval {req.approval_id}: {req.status.value}")
+        print(f"  {req.capability}/{req.action} {('on ' + str(req.resource)) if req.resource else ''}")
+        print(f"  scope={req.scope} risk={req.risk} side_effects={req.side_effects}")
+        print(f"  resource_kind={req.resource_kind or '-'}")
+        print(f"  task={req.task_id} step={req.step_index} goal={req.goal_id or '-'}")
+        print(f"  summary: {req.summary}")
+        print(f"  requester={req.requester_actor} chain={req.actor_chain}")
+        print(f"  created_at={req.created_at}")
+        if req.decision_actor:
+            print(f"  decided_by={req.decision_actor} at={req.decided_at}")
+        return 0
+
+    if args.approvals_command in ("approve", "deny"):
+        from arion.orchestration.authz import ApprovalOutcome
+
+        outcome = ApprovalOutcome.APPROVED if args.approvals_command == "approve" else ApprovalOutcome.DENIED
+        try:
+            resolved = engine.resolve_approval_request(args.approval_id, outcome, actor=args.actor)
+        except Exception as exc:
+            print(f"approval resolution rejected: {exc}")
+            return 1
+        if args.json:
+            _emit(resolved.to_dict())
+            return 0
+        print(f"approval {resolved.approval_id}: {resolved.status.value} "
+              f"({resolved.capability}/{resolved.action}) by {resolved.decision_actor}")
+        return 0
+
+    print(f"unknown approvals command: {args.approvals_command}")
+    return 1
 
 
 def _goals_command(args, engine) -> int:

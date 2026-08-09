@@ -58,6 +58,30 @@ CREATE TABLE IF NOT EXISTS audit_events (
     detail  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_task ON audit_events(task_id, ts);
+CREATE TABLE IF NOT EXISTS approval_requests (
+    approval_id    TEXT PRIMARY KEY,
+    task_id        TEXT NOT NULL,
+    step_index     INTEGER NOT NULL,
+    goal_id        TEXT,
+    capability     TEXT NOT NULL,
+    action         TEXT NOT NULL,
+    scope          TEXT NOT NULL,
+    risk           TEXT NOT NULL,
+    side_effects   TEXT NOT NULL,
+    resource_kind  TEXT,
+    resource       TEXT,
+    summary        TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    requester_actor TEXT NOT NULL,
+    actor_chain    TEXT NOT NULL,
+    params_keys    TEXT NOT NULL,
+    fingerprint    TEXT NOT NULL,
+    decision_actor TEXT,
+    decided_at     TEXT,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_approvals_task ON approval_requests(task_id, step_index);
 """
 
 
@@ -237,6 +261,58 @@ class SQLiteStorage:
         """Implement EventSink so the EventLogger can persist events directly."""
         self.append_event(event)
 
+    # ---- approval queue (ADR-018) ----
+
+    _APPROVAL_COLS = (
+        "approval_id", "task_id", "step_index", "goal_id", "capability", "action",
+        "scope", "risk", "side_effects", "resource_kind", "resource", "summary",
+        "status", "requester_actor", "actor_chain", "params_keys", "fingerprint",
+        "decision_actor", "decided_at", "created_at", "updated_at",
+    )
+
+    def create_request(self, request: "ApprovalRequest") -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO approval_requests "
+            f"({', '.join(self._APPROVAL_COLS)}) VALUES ({', '.join('?' * len(self._APPROVAL_COLS))})",
+            _approval_row(request),
+        )
+        self._conn.commit()
+
+    def get_request(self, approval_id: str) -> "ApprovalRequest | None":
+        row = self._conn.execute(
+            f"SELECT {', '.join(self._APPROVAL_COLS)} FROM approval_requests WHERE approval_id=?",
+            (approval_id,),
+        ).fetchone()
+        return _approval_from_row(row) if row else None
+
+    def list_requests(self, status: str | None = None) -> list["ApprovalRequest"]:
+        cols = ", ".join(self._APPROVAL_COLS)
+        if status:
+            rows = self._conn.execute(
+                f"SELECT {cols} FROM approval_requests WHERE status=? ORDER BY created_at", (status,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute(f"SELECT {cols} FROM approval_requests ORDER BY created_at").fetchall()
+        return [_approval_from_row(r) for r in rows]
+
+    def update_request(self, request: "ApprovalRequest") -> None:
+        request.updated_at = utcnow()
+        self._conn.execute(
+            "UPDATE approval_requests SET status=?, decision_actor=?, decided_at=?, "
+            "summary=?, updated_at=? WHERE approval_id=?",
+            (request.status.value, request.decision_actor, request.decided_at,
+             request.summary, request.updated_at, request.approval_id),
+        )
+        self._conn.commit()
+
+    def latest_request_for_step(self, task_id: str, step_index: int) -> "ApprovalRequest | None":
+        row = self._conn.execute(
+            f"SELECT {', '.join(self._APPROVAL_COLS)} FROM approval_requests"
+            " WHERE task_id=? AND step_index=? ORDER BY rowid DESC LIMIT 1",
+            (task_id, step_index),
+        ).fetchone()
+        return _approval_from_row(row) if row else None
+
     def close(self) -> None:
         self._conn.close()
 
@@ -250,6 +326,33 @@ def _row_to_dict(row: tuple[Any, ...], cols: list[str]) -> dict[str, Any]:
     if row is None:
         return {}
     return {c: v for c, v in zip(cols, row)}
+
+
+def _approval_row(request: "ApprovalRequest") -> tuple[Any, ...]:
+    return (
+        request.approval_id, request.task_id, request.step_index, request.goal_id,
+        request.capability, request.action, request.scope, request.risk,
+        request.side_effects, request.resource_kind, request.resource, request.summary,
+        request.status.value, request.requester_actor, json.dumps(request.actor_chain),
+        json.dumps(request.params_keys), json.dumps(request.fingerprint),
+        request.decision_actor, request.decided_at, request.created_at, request.updated_at,
+    )
+
+
+def _approval_from_row(row: tuple[Any, ...]) -> "ApprovalRequest":
+    from arion.state.approvals import ApprovalRequest
+
+    d = {c: v for c, v in zip(SQLiteStorage._APPROVAL_COLS, row)}
+    for key in ("actor_chain", "params_keys"):
+        try:
+            d[key] = json.loads(d[key])
+        except (TypeError, json.JSONDecodeError):
+            d[key] = []
+    try:
+        d["fingerprint"] = json.loads(d["fingerprint"])
+    except (TypeError, json.JSONDecodeError):
+        d["fingerprint"] = {}
+    return ApprovalRequest.from_dict(d)
 
 
 def _goal_from_row(row: tuple[Any, ...]) -> Goal:

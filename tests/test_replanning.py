@@ -254,6 +254,9 @@ def test_max_replans_fails_goal(tmp_path, sandbox):
                              scope="fail:run", params={},
                              verification=VerificationPolicy("non_empty"))]
 
+        def required_capabilities(self, goal_description):
+            return {"fail.tool"}
+
     db = tmp_path / "max.db"
     storage = SQLiteStorage(db)
     registry = CapabilityRegistry()

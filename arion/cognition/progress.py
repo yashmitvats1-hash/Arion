@@ -74,11 +74,14 @@ class DeterministicProgressEvaluator:
          - missing_capability blockers whose capabilities are ALL present in
            the current world state -> next_action "replan" (capability_available)
          - otherwise                -> next_action "resolve_blocker"
-      5. world changes since last eval -> next_action "replan" (material)
-      6. any task failed               -> next_action "replan"
+      5. a resumable (non-terminal) task implements the LATEST plan version
+         -> next_action "continue" (resume it; never abandon in-flight work
+         - e.g. an approved task - merely because the world changed)
+      6. world changes since last eval -> next_action "replan" (material)
       7. no plan / no tasks            -> next_action "continue" (first plan)
-      8. all plan steps succeeded      -> next_action "complete"
-      9. outstanding steps remain      -> next_action "continue"
+      8. any task failed               -> next_action "replan"
+      9. all plan steps succeeded      -> next_action "complete"
+      10. outstanding steps remain     -> next_action "continue"
     """
 
     @staticmethod
@@ -220,7 +223,26 @@ class DeterministicProgressEvaluator:
                 evidence={**evidence, "reason": "blocked"},
             )
 
-        # Rule 5: world changed materially -> replan
+        # Rule 5: a resumable task for the LATEST plan version takes priority
+        # over a world-change replan - never abandon in-flight work (e.g. an
+        # approved step awaiting resume) just because the world changed.
+        if latest_plan is not None:
+            latest_version = latest_plan.get("plan_version")
+            resumable = [
+                t for t in tasks
+                if t.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+                and t.status != TaskStatus.AWAITING_APPROVAL
+                and (t.plan_version == latest_version or t.plan_version is None)
+            ]
+            if resumable:
+                return ProgressResult(
+                    goal_id=goal.id, progress=progress, status=goal.status_value,
+                    blockers=[], next_action="continue",
+                    evidence={**evidence, "reason": "resume_pending",
+                              "resume_task_id": resumable[0].id},
+                )
+
+        # Rule 6: world changed materially -> replan
         if world_changes:
             return ProgressResult(
                 goal_id=goal.id, progress=progress, status=GoalStatus.ACTIVE.value,
@@ -229,7 +251,7 @@ class DeterministicProgressEvaluator:
                           "world_change_keys": [w.key for w in world_changes[:10]]},
             )
 
-        # Rule 6: no plan yet -> continue (first plan)
+        # Rule 7: no plan yet -> continue (first plan)
         if latest_plan is None:
             return ProgressResult(
                 goal_id=goal.id, progress=0.0, status=GoalStatus.ACTIVE.value,

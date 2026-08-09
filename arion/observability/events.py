@@ -40,6 +40,7 @@ EVENT_KINDS = (
     "permission.checked",
     "permission.denied",
     "approval.requested",
+    "approval.queued",
     "approval.granted",
     "approval.denied",
     "planning.requested",

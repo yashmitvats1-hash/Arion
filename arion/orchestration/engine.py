@@ -27,6 +27,7 @@ from __future__ import annotations
 from typing import Any
 
 from arion.capabilities.registry import CapabilityError, CapabilityRegistry
+from arion.state.approvals import ApprovalError, ApprovalRequest, ApprovalStatus, ApprovalStore
 from arion.intelligence.plan_schema import PlanValidationError
 from arion.intelligence.plan_validator import topo_sort_steps
 from arion.intelligence.planner import Planner
@@ -77,6 +78,7 @@ class ArionEngine:
         world_monitor: Any | None = None,
         strategy_selector: Any | None = None,
         goal_manager: Any | None = None,
+        approval_store: ApprovalStore | None = None,
     ):
         self.storage = storage
         self.registry = registry
@@ -93,6 +95,11 @@ class ArionEngine:
         self.world_monitor = world_monitor  # optional WorldStateMonitor (ADR-015)
         self.strategy_selector = strategy_selector  # optional StrategySelector (ADR-015)
         self.goal_manager = goal_manager  # optional GoalManager (ADR-015)
+        # Durable approval queue (ADR-018): the storage backend is the default
+        # implementation; an explicit store can be injected (e.g. in tests).
+        self.approval_store = approval_store
+        if self.approval_store is None and hasattr(storage, "create_request"):
+            self.approval_store = storage  # type: ignore[assignment]
 
     # ---------- public API ----------
 
@@ -215,13 +222,33 @@ class ArionEngine:
                     return gm.get_goal(goal_id)
 
     def _block_on_missing_capability(self, goal_id: str, gm) -> bool:
-        """If the planner requires a capability absent from the live registry,
-        durably BLOCK the goal (missing_capability) instead of planning/failing
-        in a loop. Returns True when the goal was blocked."""
+        """Gate the goal before planning (ADR-017/018).
+
+        - If the planner cannot declare its required capabilities (contract
+          missing), FAIL CLOSED: the goal is durably BLOCKED
+          (planner_contract) - never planned, never executed.
+        - If the planner requires a capability absent from the live registry,
+          durably BLOCK the goal (missing_capability) instead of
+          planning/failing in a loop.
+
+        Returns True when the goal was blocked."""
         goal = gm.get_goal(goal_id)
         if goal is None:
             return False
-        missing = self._missing_required_capabilities(goal.description)
+        requirements = self._planner_requirements(goal.description)
+        if requirements is None:
+            gm.set_blocked(goal_id, {
+                "type": "planner_contract",
+                "detail": "planner cannot declare required capabilities; refusing to plan (fail closed)",
+            }, reason="planner_contract_fail_closed")
+            self._emit("error", task_id=None, success=False, detail={
+                "goal_id": goal_id,
+                "error": "planner does not implement the required_capabilities contract",
+                "error_type": "PlannerContractError",
+                "category": "planning",
+            })
+            return True
+        missing = [c for c in requirements if not self.registry.has(c)]
         if not missing:
             return False
         gm.set_blocked(goal_id, {
@@ -235,22 +262,27 @@ class ArionEngine:
         })
         return True
 
-    def _missing_required_capabilities(self, goal_description: str) -> list[str]:
-        """Ask the planner which capabilities this goal requires, then report
-        which of those are NOT registered (deterministic gate). Planners that
-        do not declare requirements are never gated."""
+    def _planner_requirements(self, goal_description: str) -> list[str] | None:
+        """Required capabilities per the planner contract.
+
+        Returns a list of required capability names, or None when the planner
+        does NOT implement the contract (fail closed: do not bypass the gate).
+        """
         planner = getattr(self, "planner", None)
         required = getattr(planner, "required_capabilities", None)
         if required is None:
-            return []
+            return None
         try:
             need = required(goal_description)
         except Exception:
-            return []
-        return [c for c in need if not self.registry.has(c)]
+            return None  # a planner that errors on requirements also fails closed
+        if not isinstance(need, (set, list, tuple)):
+            return None
+        return sorted(str(c) for c in need)
 
     def resolve_approval(self, task_id: str, outcome: "ApprovalOutcome", actor: str = "approver") -> Task:
-        """Seam for an approval decision on an awaiting task (ADR-017).
+        """Backward-compatible seam: resolve the durable approval request for
+        an awaiting task's active step (ADR-017/018). Delegates to the queue.
 
         APPROVED: the task becomes resumable (RUNNING) and the goal's
         approval_pending blocker is cleared; the next run resumes the EXACT
@@ -272,30 +304,128 @@ class ArionEngine:
         step = task.active_step
         if step is None:
             raise GoalStateError(f"task {task_id} has no active step to resolve")
+        if self.approval_store is not None:
+            req = self._pending_request_for_step(task.id, step.index)
+            if req is None:
+                raise GoalStateError(f"task {task_id} has no pending approval for step {step.index}")
+            self._resolve_request(req, outcome, actor)
+            return self.storage.load_task(task_id)
+        # No durable queue (legacy wiring): fall back to the in-memory mirror.
         recs = [r for r in task.approvals
                 if r.get("step_index") == step.index and r.get("outcome") == "pending"]
         if not recs:
             raise GoalStateError(f"task {task_id} has no pending approval for step {step.index}")
-        rec = recs[-1]
+        return self._resolve_legacy(task, recs[-1], outcome, actor)
+
+    def resolve_approval_request(self, approval_id: str, outcome: "ApprovalOutcome",
+                                 actor: str = "approver") -> "ApprovalRequest":
+        """Resolve a durable approval-queue record by id (ADR-018).
+
+        APPROVED: the record is marked approved, the goal unblocks and the
+        next run resumes the EXACT pending step (no replan, no re-request).
+
+        DENIED: the record is durably denied; the step + task fail with
+        reason 'approval denied'.
+
+        Fail closed (ApprovalError): unknown id, already-resolved, or the
+        request's task/step no longer awaits this approval.
+        """
+        if outcome not in (ApprovalOutcome.APPROVED, ApprovalOutcome.DENIED):
+            raise ValueError(f"resolve_approval_request accepts APPROVED or DENIED, got {outcome!r}")
+        if self.approval_store is None:
+            raise ApprovalError("approval queue is not available on this engine")
+        req = self.approval_store.get_request(approval_id)
+        if req is None:
+            raise ApprovalError(f"unknown approval id: {approval_id}")
+        if req.status != ApprovalStatus.PENDING:
+            raise ApprovalError(f"approval {approval_id} is already resolved ({req.status.value})")
+        task = self.storage.load_task(req.task_id)
+        if task is None:
+            raise ApprovalError(f"approval {approval_id} references a missing task {req.task_id}")
+        step = task.active_step
+        if task.status != TaskStatus.AWAITING_APPROVAL or step is None or step.index != req.step_index:
+            raise ApprovalError(
+                f"approval {approval_id} no longer matches the task's pending step "
+                f"(task={req.task_id} step={req.step_index})"
+            )
+        self._resolve_request(req, outcome, actor)
+        return self.approval_store.get_request(approval_id)
+
+    def _resolve_request(self, req: "ApprovalRequest", outcome: "ApprovalOutcome",
+                         actor: str) -> None:
+        """Resolve a durable queue record + the mirrored task state."""
+        task = self.storage.load_task(req.task_id)
+        step = task.active_step
+        req.status = ApprovalStatus.APPROVED if outcome == ApprovalOutcome.APPROVED else ApprovalStatus.DENIED
+        req.decision_actor = actor
+        req.decided_at = utcnow()
+        self.approval_store.update_request(req)
+
+        mirror = [r for r in (task.approvals or []) if r.get("approval_id") == req.approval_id]
+        rec = mirror[-1] if mirror else self._mirror_from_request(task, step, req)
+        rec["outcome"] = req.status.value
         rec["resolved_by"] = actor
-        rec["resolved_at"] = utcnow()
+        rec["resolved_at"] = req.decided_at
 
         gm = self.goal_manager
         if outcome == ApprovalOutcome.APPROVED:
-            rec["outcome"] = "approved"
             task.status = TaskStatus.RUNNING  # resumable; not terminal
             if gm is not None and task.goal_id:
                 try:
                     gm.clear_blocker(task.goal_id, "approval_pending", reason="approval_granted")
                 except Exception:
                     pass
+            self._emit("approval.granted", task_id=task.id, step_id=_step_id(step), detail={
+                "scope": req.scope, "resource": req.resource, "approval_id": req.approval_id,
+            })
             self._emit("goal.approval.granted", task_id=task.id, detail={
-                "goal_id": task.goal_id,
-                "task_id": task.id,
-                "step_index": step.index,
-                "capability": rec.get("request", {}).get("capability"),
-                "action": rec.get("request", {}).get("action"),
-                "scope": rec.get("request", {}).get("scope"),
+                "goal_id": task.goal_id, "task_id": task.id, "step_index": step.index,
+                "capability": req.capability, "action": req.action, "scope": req.scope,
+                "actor": actor, "approval_id": req.approval_id,
+            })
+        else:
+            step.status = StepStatus.FAILED
+            step.error = "approval denied"
+            task.status = TaskStatus.FAILED
+            task.error = "approval denied"
+            task.completed_at = utcnow()
+            if gm is not None and task.goal_id:
+                try:
+                    gm.clear_blocker(task.goal_id, "approval_pending", reason="approval_denied")
+                except Exception:
+                    pass
+            self._emit("approval.denied", task_id=task.id, step_id=_step_id(step),
+                       success=False, detail={
+                           "scope": req.scope, "resource": req.resource,
+                           "reason": "approval denied", "approval_id": req.approval_id,
+                       })
+            self._emit("goal.approval.denied", task_id=task.id, detail={
+                "goal_id": task.goal_id, "task_id": task.id, "step_index": step.index,
+                "actor": actor, "reason": "approval denied", "approval_id": req.approval_id,
+            })
+            self._emit("task.failed", task_id=task.id, detail={
+                "step_index": step.index, "error": "approval denied",
+            })
+            self._record_memory(task)
+        task.updated_at = utcnow()
+        self.storage.save_task(task)
+
+    def _resolve_legacy(self, task: Task, rec: dict, outcome: "ApprovalOutcome", actor: str) -> Task:
+        """Legacy in-memory resolution when no durable queue is wired."""
+        rec["resolved_by"] = actor
+        rec["resolved_at"] = utcnow()
+        step = task.active_step
+        gm = self.goal_manager
+        if outcome == ApprovalOutcome.APPROVED:
+            rec["outcome"] = "approved"
+            task.status = TaskStatus.RUNNING
+            if gm is not None and task.goal_id:
+                try:
+                    gm.clear_blocker(task.goal_id, "approval_pending", reason="approval_granted")
+                except Exception:
+                    pass
+            self._emit("goal.approval.granted", task_id=task.id, detail={
+                "goal_id": task.goal_id, "task_id": task.id, "step_index": step.index,
                 "actor": actor,
             })
         else:
@@ -311,11 +441,9 @@ class ArionEngine:
                 except Exception:
                     pass
             self._emit("approval.denied", task_id=task.id, step_id=_step_id(step),
-                       success=False, detail={
-                           "scope": rec.get("request", {}).get("scope"),
-                           "resource": rec.get("request", {}).get("resource"),
-                           "reason": "approval denied",
-                       })
+                       success=False, detail={"scope": rec.get("request", {}).get("scope"),
+                                              "resource": rec.get("request", {}).get("resource"),
+                                              "reason": "approval denied"})
             self._emit("goal.approval.denied", task_id=task.id, detail={
                 "goal_id": task.goal_id, "task_id": task.id, "step_index": step.index,
                 "actor": actor, "reason": "approval denied",
@@ -327,6 +455,77 @@ class ArionEngine:
         task.updated_at = utcnow()
         self.storage.save_task(task)
         return task
+
+    # ------------------------------------------------------------------ #
+    # approval queue helpers
+    # ------------------------------------------------------------------ #
+
+    def _pending_request_for_step(self, task_id: str, step_index: int) -> "ApprovalRequest | None":
+        """The latest PENDING durable request for a task/step, if any."""
+        req = self.approval_store.latest_request_for_step(task_id, step_index)
+        if req is not None and req.status == ApprovalStatus.PENDING:
+            return req
+        return None
+
+    def _pending_queue_request(self, task_id: str, step_index: int, fingerprint: dict) -> "ApprovalRequest | None":
+        """Dedupe: an existing PENDING request for the same task/step/authz
+        fingerprint. Repeated pauses never create duplicate queue records."""
+        for req in self.approval_store.list_requests(status=ApprovalStatus.PENDING.value):
+            if req.task_id == task_id and req.step_index == step_index and req.fingerprint == fingerprint:
+                return req
+        return None
+
+    def _queue_request_from_auth(self, task: Task, step: PlanStep, request: AuthorizationRequest,
+                                 decision: PolicyDecision) -> "ApprovalRequest":
+        fp = self._authz_fingerprint(request)
+        summary = (
+            f"{request.capability}/{request.action} "
+            f"{('on ' + str(request.resource)) if request.resource else ''} "
+            f"(scope={request.scope}, risk={request.risk})"
+        ).strip()
+        return ApprovalRequest(
+            approval_id=new_id("approval"),
+            task_id=task.id,
+            step_index=step.index,
+            goal_id=task.goal_id,
+            capability=request.capability,
+            action=request.action,
+            scope=request.scope,
+            risk=request.risk,
+            side_effects=request.side_effects,
+            resource_kind=request.resource_kind,
+            resource=request.resource,
+            summary=summary[:300],
+            requester_actor=request.actor.id,
+            actor_chain=list(request.actor.chain),
+            params_keys=sorted(request.params.keys()),
+            fingerprint=fp,
+        )
+
+    def _mirror_from_request(self, task: Task, step: PlanStep, req: "ApprovalRequest") -> dict:
+        """Keep the task-level mirror record in sync with the queue record."""
+        rec = {
+            "record_id": new_id("apr"),
+            "approval_id": req.approval_id,
+            "step_index": step.index,
+            "outcome": req.status.value,
+            "actor": req.requester_actor,
+            "created_at": req.created_at,
+            "reason": req.summary[:200],
+            "request": {
+                "capability": req.capability,
+                "action": req.action,
+                "scope": req.scope,
+                "risk": req.risk,
+                "side_effects": req.side_effects,
+                "resource_kind": req.resource_kind,
+                "resource": req.resource,
+                "params_keys": req.params_keys,
+            },
+            "fingerprint": req.fingerprint,
+        }
+        task.approvals = list(task.approvals or []) + [rec]
+        return rec
 
     def _plan_for_goal(self, goal_id: str, replan_reason: str | None = None) -> Task | None:
         """Create + plan a task for a goal (records an immutable plan version)."""
@@ -377,6 +576,13 @@ class ArionEngine:
 
         # Already terminal (e.g. completed before a restart): return as-is.
         if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            return task
+
+        # Approval still pending (durable queue record exists): stop cleanly
+        # and idempotently - never re-execute, re-request or re-queue the
+        # awaiting step (ADR-018). resolve_approval(APPROVED) flips the task
+        # to RUNNING, which is how the exact-step resume proceeds.
+        if task.status == TaskStatus.AWAITING_APPROVAL:
             return task
 
         if not task.steps:
@@ -643,11 +849,13 @@ class ArionEngine:
         Returns True when the action may proceed (approved), False when it was
         denied or is still pending (the caller must not execute).
 
-        ADR-017: a previously APPROVED decision for this exact step is honored
-        on resume ONLY when the CURRENT request (rebuilt from live ActionSpec
-        + policy metadata) still fingerprints identically. Any change to
-        scope/risk/side-effects/resource kind/resource/action forces a FRESH
-        approval request - stale approvals never authorize.
+        ADR-017/018: a previously APPROVED decision for this exact step is
+        honored on resume ONLY when the CURRENT request (rebuilt from live
+        ActionSpec + policy metadata) still fingerprints identically. Any
+        change to scope/risk/side-effects/resource kind/resource/action/
+        security-relevant params forces a FRESH approval request - stale
+        approvals never authorize. When the handler returns PENDING, exactly
+        ONE durable ApprovalRequest is queued per task/step/authz-fingerprint.
         """
         record = self._approved_record_for(task, step.index)
         if record is not None:
@@ -656,6 +864,7 @@ class ArionEngine:
                 # metadata: resume without re-requesting
                 self._emit("task.approval.resumed", task_id=task.id, step_id=_step_id(step), detail={
                     "approval_record": record.get("record_id"),
+                    "approval_id": record.get("approval_id"),
                     "resolved_by": record.get("resolved_by"),
                     "scope": request.scope,
                     "resource": request.resource,
@@ -667,6 +876,16 @@ class ArionEngine:
                         pass
                 return True
             # stale approval (metadata changed): fall through to a fresh request
+
+        fp = self._authz_fingerprint(request)
+        if self.approval_store is not None:
+            existing = self._pending_queue_request(task.id, step.index, fp)
+            if existing is not None:
+                # we are already durably waiting on this exact request:
+                # idempotent - no new record, no re-request, no re-queue
+                task.status = TaskStatus.AWAITING_APPROVAL
+                step.status = StepStatus.PENDING
+                return False
 
         self._emit("approval.requested", task_id=task.id, step_id=_step_id(step), detail=decision.to_dict())
         outcome = self.approval_handler.request(request, decision)
@@ -686,11 +905,26 @@ class ArionEngine:
                 detail=decision.to_dict(),
             )
             return False
-        # PENDING: pause the task durably; a later resolve_approval + run_task
-        # resumes the exact same step
+        # PENDING: queue exactly one durable request, pause the task durably;
+        # a later resolve_approval_request + run resumes the exact same step
         task.status = TaskStatus.AWAITING_APPROVAL
         step.status = StepStatus.PENDING
-        self._append_approval_record(task, step, request, decision, "pending", actor="system")
+        req = self._queue_request_from_auth(task, step, request, decision)
+        if self.approval_store is not None:
+            try:
+                self.approval_store.create_request(req)
+            except Exception:
+                pass
+            self._emit("approval.queued", task_id=task.id, step_id=_step_id(step), detail={
+                "approval_id": req.approval_id,
+                "task_id": task.id,
+                "step_index": step.index,
+                "capability": req.capability,
+                "action": req.action,
+                "scope": req.scope,
+                "resource": req.resource,
+            })
+        self._mirror_from_request(task, step, req)
         if self.goal_manager is not None and task.goal_id:
             try:
                 self.goal_manager.set_blocked(task.goal_id, {
@@ -701,6 +935,7 @@ class ArionEngine:
                     "action": request.action,
                     "scope": request.scope,
                     "resource": request.resource,
+                    "approval_id": req.approval_id,
                     "reason": decision.reason[:200],
                 }, reason="approval_pending")
             except Exception:
@@ -714,6 +949,7 @@ class ArionEngine:
                     "action": request.action,
                     "scope": request.scope,
                     "resource": request.resource,
+                    "approval_id": req.approval_id,
                 })
             except Exception:
                 pass
@@ -724,7 +960,9 @@ class ArionEngine:
     def _append_approval_record(self, task: Task, step: PlanStep, request: AuthorizationRequest,
                                 decision: PolicyDecision, outcome: str, actor: str) -> None:
         """Append a bounded approval record to the task (persisted via the
-        task snapshot / checkpoints). Never stores params values or secrets."""
+        task snapshot / checkpoints). Never stores params values or secrets.
+        Used for immediate handler decisions (approved/denied); PENDING uses
+        the durable queue path (_mirror_from_request)."""
         task.approvals = list(task.approvals or []) + [{
             "record_id": new_id("apr"),
             "step_index": step.index,
@@ -753,9 +991,17 @@ class ArionEngine:
         return None
 
     def _authz_fingerprint(self, request: AuthorizationRequest) -> dict[str, Any]:
-        """Everything an approval covers: capability/action/scope/risk/
-        side-effects/resource kind/resource. Any change forces fresh authz."""
-        return {
+        """Canonical authorization fingerprint (ADR-017/018).
+
+        Everything an approval covers: capability, action, the resolved
+        required scope, risk, side effects, resource kind, resource, and the
+        SECURITY-RELEVANT parameters declared by the live ActionSpec
+        (ActionSpec.security_relevant_params). The resource parameter is
+        always covered via `resource`. Operational parameters (limits,
+        formatting, verification args) are NOT fingerprinted unless declared.
+        Any change forces fresh authorization.
+        """
+        fp: dict[str, Any] = {
             "capability": request.capability,
             "action": request.action,
             "scope": request.scope,
@@ -764,6 +1010,15 @@ class ArionEngine:
             "resource_kind": request.resource_kind,
             "resource": request.resource,
         }
+        srp: list[str] = []
+        try:
+            spec = self.registry.action_spec(request.capability, request.action)
+            if spec is not None:
+                srp = list(getattr(spec, "security_relevant_params", []) or [])
+        except Exception:
+            srp = []
+        fp["security_relevant_params"] = {k: request.params.get(k) for k in srp if k in request.params}
+        return fp
 
     @staticmethod
     def _extract_resource(spec, params: dict[str, Any]) -> str | None:

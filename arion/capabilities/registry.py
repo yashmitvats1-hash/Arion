@@ -43,6 +43,11 @@ class ActionSpec:
       or arbitrary injected parameters from model-produced plans (ADR-011).
     - default_verification: suggested verification spec shown to planners in
       capability discovery ({"policy": ..., "args": {...}}).
+    - security_relevant_params: param NAMES (besides resource_param) whose
+      VALUES must be part of the canonical authorization fingerprint (ADR-018,
+      Phase D). The resource parameter is always fingerprinted via `resource`.
+      Operational parameters (limits, formatting, ...) are NOT fingerprinted
+      unless declared here.
     """
 
     name: str
@@ -58,6 +63,7 @@ class ActionSpec:
     resource_param: str | None = None
     param_schema: dict[str, dict[str, Any]] | None = None
     default_verification: dict[str, Any] | None = None
+    security_relevant_params: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -74,6 +80,7 @@ class ActionSpec:
             "resource_param": self.resource_param,
             "param_schema": self.param_schema,
             "default_verification": self.default_verification,
+            "security_relevant_params": list(self.security_relevant_params),
         }
 
 

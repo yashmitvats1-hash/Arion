@@ -25,6 +25,16 @@ class Planner(Protocol):
         context: Any | None = None,  # PlanningContext (memory digest) - informational only
     ) -> list[PlanStep]: ...
 
+    def required_capabilities(self, goal_description: str) -> set[str]:
+        """Which capabilities this planner requires for a goal (ADR-018).
+
+        The engine gates on this before planning: a required capability that
+        is not registered durably BLOCKS the goal (missing_capability) instead
+        of failing/replanning in a loop. A planner that cannot declare its
+        requirements fails closed (the engine refuses to plan). Never return
+        an empty set to mean 'unknown'."""
+        ...
+
 
 # Action templates keyed by the capability.plan intent keyword.
 _ACTION_TEMPLATES: dict[str, dict[str, Any]] = {
@@ -54,9 +64,29 @@ class DeterministicPlanner:
     ) -> list[PlanStep]:
         text = goal_description.lower().strip()
 
+        # HTTP-fetch goals (ADR-018): the http.get capability is used when it
+        # is registered and the goal asks to fetch a URL.
+        if self._is_http_goal(text) and registry.has("http.get"):
+            url = _extract_url(goal_description)
+            if url is None:
+                raise ValueError(
+                    f"http goal has no URL to fetch: {goal_description!r} "
+                    "(goal must contain an http(s) URL)"
+                )
+            steps = [
+                PlanStep(
+                    index=0,
+                    intent="fetch url",
+                    capability="http.get",
+                    action="get",
+                    scope="http:get",
+                    params={"url": url},
+                    verification=VerificationPolicy("schema_keys", {"keys": ["status", "body"]}),
+                )
+            ]
         # Git-history goals (ADR-017): the git.log capability is used when it
         # is registered and the goal asks about history/commits/branches.
-        if self._is_git_goal(text) and registry.has("git.log"):
+        elif self._is_git_goal(text) and registry.has("git.log"):
             steps = [
                 PlanStep(
                     index=0,
@@ -147,14 +177,17 @@ class DeterministicPlanner:
         """Deterministic heuristic: the goal asks about repository history."""
         return any(k in text for k in ("git", "history", "commit", "branch", "reflog"))
 
+    @staticmethod
+    def _is_http_goal(text: str) -> bool:
+        """Deterministic heuristic: the goal asks to fetch a URL over HTTP(S)."""
+        return "http://" in text or "https://" in text or "fetch" in text or "download" in text
+
     def required_capabilities(self, goal_description: str) -> set[str]:
-        """Which capabilities THIS planner needs for a goal (ADR-017). The
+        """Which capabilities THIS planner needs for a goal (ADR-017/018). The
         engine gates on this so a goal whose required capability is missing is
-        durably BLOCKED instead of failing/replanning in a loop."""
-        text = goal_description.lower().strip()
-        if self._is_git_goal(text):
-            return {"git.log"}
-        return {"filesystem.read"}
+        durably BLOCKED instead of failing/replanning in a loop. Never returns
+        an empty set for an undetermined goal."""
+        return planner_requirements(goal_description)
 
     @staticmethod
     def _key_files(text: str) -> dict[str, Any]:
@@ -166,3 +199,24 @@ class DeterministicPlanner:
         if not files:
             files = ["README.md"]
         return {"path": files[0]}
+
+
+def _extract_url(goal_description: str) -> str | None:
+    """First http(s) URL in the goal text (deterministic)."""
+    m = re.search(r"https?://[^\s]+", goal_description)
+    return m.group(0).rstrip(".,;:)") if m else None
+
+
+def planner_requirements(goal_description: str) -> set[str]:
+    """Shared deterministic capability-requirement heuristic (ADR-018).
+
+    Order matters: http fetch goals -> http.get; git-history goals -> git.log;
+    everything else -> filesystem.read. Never returns an empty set for a
+    decomposable goal: an undetermined goal means the planner cannot declare
+    its requirements, which the engine treats as fail-closed."""
+    text = goal_description.lower().strip()
+    if DeterministicPlanner._is_http_goal(text):
+        return {"http.get"}
+    if DeterministicPlanner._is_git_goal(text):
+        return {"git.log"}
+    return {"filesystem.read"}

@@ -81,7 +81,11 @@ Every step is decided by a permission policy over
 - `arion/state` — domain models + `SQLiteStorage` behind `Storage`.
 - `arion/capabilities` — `CapabilityRegistry`, permission scopes,
   `filesystem.read` (read-only, sandboxed, symlink-safe, size-capped),
-  `git.log` (read-only git history inspection via `.git` metadata, no shell).
+  `git.log` (read-only git history inspection via `.git` metadata, no shell),
+  `http.get` (read-only HTTP GET, injectable transport, origin-contained
+  redirects, bounded size/timeout).
+- `arion/state/approvals.py` — `ApprovalRequest` domain model + `ApprovalStore`
+  protocol (durable approval queue, ADR-018).
 - `arion/intelligence` — `Planner` protocol + `DeterministicPlanner`,
   `ModelRouter` protocol + `DeterministicRouter`, `PlanSchema` (versioned,
   strict), `PlanValidator`, `RealModelPlanner`, `providers/` (OpenAI-compatible
@@ -98,14 +102,15 @@ Every step is decided by a permission policy over
   change detection).
 - `arion/observability` — `AuditEvent` vocabulary, `EventLogger`, JSONL sink.
 - `arion/interfaces` — CLI (`run`, `resume`, `status`, `tasks`, `events`,
-  `capabilities`, `goals list|show|progress|pause|resume|cancel`).
+  `capabilities`, `goals list|show|progress|pause|resume|cancel`,
+  `approvals list|show|approve|deny`).
 - `arion/memory` — `MemoryStore` protocol + `SQLiteMemoryStore` (episodic
   memories + reflections tables), `MemoryRetriever` (deterministic scoring +
   relevance gate), `DeterministicReflector`, `PlanningContext` (bounded
   digest), `build_episode_from_task` (structured summaries only).
 - `arion/bootstrap.py` — composition root wiring all layers (memory on by
   default).
-- `docs/adr/ADR-001..017` — approved architecture decisions.
+- `docs/adr/ADR-001..018` — approved architecture decisions.
 - `tests/` — deterministic, LLM-independent tests.
 
 ## Persistent cognitive memory (ADR-012)
@@ -298,6 +303,36 @@ loop (ADR-016):
   blockers, task); `arion goals approve|deny <goal_id>` resolve approval.
 - **Demo:** `scripts/demo_goal_approval.py` (both scenarios, offline).
 
+
+## Persistent Approval Queue + URL Resource Boundary (ADR-018)
+
+- **Durable approval queue:** `ApprovalRequest` domain model + `ApprovalStore`
+  protocol (SQLite implements it, same DB file). Exactly ONE request per
+  task/step/authorization-fingerprint; repeated `run_goal`/`run_task` calls are
+  idempotent (no duplicate requests, no re-requests, no duplicate
+  checkpoints). `resolve_approval_request(approval_id, APPROVED|DENIED, actor)`
+  resolves the durable record and reuses the exact-step resume path; typed
+  `ApprovalError` on unknown/already-resolved/mismatched/stale requests.
+- **CLI approvals:** `arion approvals list|show|approve|deny [--json]` against
+  the same persistent DB — `process A → request → exit; process B → CLI
+  approve → exit; process C → resume → completion` works across real process
+  boundaries (demo runs the CLI as a subprocess). `--actor` is audit-only.
+- **`http.get` + `UrlBoundary`:** second resource kind (`url`) with an
+  allowlist boundary (malformed/credentials/non-http(s)/off-allowlist → DENY;
+  no boundary → DENY). Read-only GET through an INJECTABLE transport (fake in
+  tests, stdlib default) with bounded size/timeout and origin-contained
+  redirects (escape → denied, target never fetched). Bootstrap registers
+  http.get discoverable but DENIED by default (fail closed).
+- **Canonical authorization fingerprint:** capability, action, required
+  scope, risk, side effects, resource kind, resource, and
+  `security_relevant_params` declared per ActionSpec. Changing any of these
+  after approval forces fresh authorization.
+- **Planner contract (fail closed):** `Planner.required_capabilities()` is
+  explicit; a planner that cannot declare requirements durably BLOCKS the goal
+  (`planner_contract`), and a model-proposed unregistered capability is
+  rejected by PlanValidator before execution.
+- **Demo:** `scripts/demo_approval_queue.py` (both DoD paths, offline).
+
 ## Structured intelligence boundary (ADR-011)
 
 ```
@@ -354,9 +389,12 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/arion goals list           # durable goals (ADR-016)
 .venv/bin/arion goals approve <goal_id>   # approve a pending approval (ADR-017)
 .venv/bin/arion goals deny <goal_id>      # deny a pending approval (ADR-017)
+.venv/bin/arion approvals list            # durable approval queue (ADR-018)
+.venv/bin/arion approvals approve <approval_id>
 .venv/bin/arion goals show <goal_id> --json
 .venv/bin/python scripts/demo_goal_replan.py   # 3-cycle DoD demo (offline)
 .venv/bin/python scripts/demo_goal_approval.py  # approval + blocked-capability demo (offline)
+.venv/bin/python scripts/demo_approval_queue.py  # durable approval queue + http.get demo (offline)
 .venv/bin/python -m pytest
 ```
 

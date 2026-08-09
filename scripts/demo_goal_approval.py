@@ -96,6 +96,9 @@ class TwoStepPlanner:
                      verification=VerificationPolicy("schema_keys", {"keys": ["review"]})),
         ]
 
+    def required_capabilities(self, goal_description):
+        return {"filesystem.read", "repo.review"}
+
 
 def _engine_a(db_path, sandbox, registry=None):
     storage = SQLiteStorage(db_path)
