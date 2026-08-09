@@ -490,7 +490,27 @@ class ArionEngine:
             self._emit(
                 "planning.context.created",
                 task_id=task.id,
-                detail={"episodes": len(ctx.episodes), "reflections": len(ctx.reflections)},
+                detail={
+                    "episodes": len(ctx.episodes),
+                    "reflections": len(ctx.reflections),
+                    "guidance": len(ctx.guidance),
+                    "provenance": ctx.provenance,
+                },
+            )
+            # planning.memory.influence: record which memories influenced this
+            # planning decision (IDs/counts/categories - never raw contents).
+            self._emit(
+                "planning.memory.influence",
+                task_id=task.id,
+                detail={
+                    "episode_ids": ctx.provenance.get("episode_ids", []),
+                    "reflection_ids": ctx.provenance.get("reflection_ids", []),
+                    "guidance_ids": ctx.provenance.get("guidance_ids", []),
+                    "memory_count": len(ctx.episodes) + len(ctx.reflections),
+                    "guidance_categories": sorted({g.category for g in ctx.guidance}),
+                    "guidance_count": len(ctx.guidance),
+                    "deterministic": True,
+                },
             )
             return ctx
         except Exception:
@@ -515,7 +535,7 @@ class ArionEngine:
                 events = self.storage.list_events(task.id)
             except Exception:
                 events = []
-            episode = build_episode_from_task(task, events)
+            episode = build_episode_from_task(task, events, registry=self.registry)
             self.memory.record_episode(episode)
             self._emit(
                 "memory.episode.recorded",
@@ -528,8 +548,22 @@ class ArionEngine:
                 },
             )
 
-            reflector = self.reflector or DeterministicReflector()
-            reflection = reflector.reflect(episode)
+            # Reflect: prefer the configured reflector (may be a ModelReflector);
+            # if it fails or produces something invalid, fall back to the
+            # deterministic reflector so the loop stays offline-capable.
+            reflection = None
+            try:
+                if self.reflector is not None:
+                    reflection = self.reflector.reflect(episode)
+            except Exception as exc:
+                self._emit(
+                    "reflection.validation.failed",
+                    task_id=task.id,
+                    success=False,
+                    detail={"error": str(exc)[:300], "fallback": "deterministic"},
+                )
+            if reflection is None:
+                reflection = DeterministicReflector().reflect(episode)
             self.memory.record_reflection(reflection)
             try:
                 self.memory.link_reflection(episode.episode_id, reflection.reflection_id)
@@ -540,8 +574,32 @@ class ArionEngine:
                 task_id=task.id,
                 detail={"reflection_id": reflection.reflection_id, "episode_id": episode.episode_id},
             )
+
+            # Consolidation: deterministic duplicate/lesson merging (never deletes).
+            self._consolidate(task.id)
         except Exception:
             # Memory is best-effort; never break the task lifecycle.
+            pass
+
+    def _consolidate(self, task_id: str) -> None:
+        """Run deterministic consolidation; emit memory.consolidated per record."""
+        try:
+            from arion.memory.consolidation import MemoryConsolidator
+
+            records = MemoryConsolidator(self.memory).consolidate(limit=100)
+            for record in records:
+                self._emit(
+                    "memory.consolidated",
+                    task_id=task_id,
+                    detail={
+                        "consolidation_id": record.consolidation_id,
+                        "source_episode_ids": record.source_episode_ids,
+                        "category": record.category,
+                        "count": record.count,
+                        "importance": record.importance,
+                    },
+                )
+        except Exception:
             pass
 
     def _emit(

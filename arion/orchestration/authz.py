@@ -266,13 +266,15 @@ class ResourcePolicy:
         boundaries: dict[str, ResourceBoundary] | None = None,
         allowed_agents: set[str] | None = None,
     ):
-        self.allowed_scopes = allowed_scopes or {"filesystem:read"}
-        self.denied_scopes = denied_scopes or set()
+        # NOTE: None means "use the default"; an EXPLICIT empty set means
+        # "allow nothing" - never conflate the two (falsy-empty bug).
+        self.allowed_scopes = set(allowed_scopes) if allowed_scopes is not None else {"filesystem:read"}
+        self.denied_scopes = set(denied_scopes) if denied_scopes is not None else set()
         # read-only slice: high risk is never allowed, medium risk needs approval
-        self.risk_deny = risk_deny or {"high"}
-        self.risk_approve = risk_approve or {"medium"}
+        self.risk_deny = set(risk_deny) if risk_deny is not None else {"high"}
+        self.risk_approve = set(risk_approve) if risk_approve is not None else {"medium"}
         self.boundaries: dict[str, ResourceBoundary] = boundaries or {}
-        self.allowed_agents = allowed_agents  # None = any identity allowed
+        self.allowed_agents = set(allowed_agents) if allowed_agents is not None else None  # None = any identity allowed
 
     def decide(self, request: AuthorizationRequest) -> PolicyDecision:
         base = dict(

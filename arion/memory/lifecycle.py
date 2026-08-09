@@ -38,8 +38,18 @@ def _importance_for(outcome: str) -> float:
     return {"completed": 0.5, "recovered": 0.6, "denied": 0.65, "failed": 0.7}.get(outcome, 0.5)
 
 
-def build_episode_from_task(task: Task, events: list[AuditEvent] | None = None) -> Episode:
-    """Construct a structured episode from a terminal task."""
+def build_episode_from_task(
+    task: Task,
+    events: list[AuditEvent] | None = None,
+    registry: Any | None = None,
+) -> Episode:
+    """Construct a structured episode from a terminal task.
+
+    When a registry is provided, each step's DECLARED resource value (from the
+    ActionSpec resource_param) is recorded in `resources` - structured safe
+    metadata that lets later planning guidance be resource-aware. Arbitrary
+    param values are still never stored.
+    """
     events = events or []
     outcome = episode_outcome_for(task, events)
 
@@ -58,6 +68,24 @@ def build_episode_from_task(task: Task, events: list[AuditEvent] | None = None) 
         {"capability": s.capability, "action": s.action, "status": s.status.value, "attempts": s.attempts}
         for s in task.steps
     ]
+    resources: list[dict[str, Any]] = []
+    if registry is not None:
+        for s in task.steps:
+            spec = None
+            try:
+                spec = registry.action_spec(s.capability, s.action)
+            except Exception:
+                spec = None
+            if spec is not None and spec.resource_kind and spec.resource_param:
+                value = s.params.get(spec.resource_param)
+                if isinstance(value, str) and value:
+                    resources.append({
+                        "step": s.index,
+                        "capability": s.capability,
+                        "action": s.action,
+                        "resource": value,
+                        "status": s.status.value,
+                    })
     verification = {
         "passed": [s.index for s in task.steps if s.status == StepStatus.SUCCEEDED],
         "failed": [s.index for s in task.steps if s.status == StepStatus.FAILED],
@@ -111,6 +139,7 @@ def build_episode_from_task(task: Task, events: list[AuditEvent] | None = None) 
         goal=task.description[:500],
         plan_summary=plan_summary,
         actions=actions,
+        resources=resources,
         outcome=outcome,
         verification=verification,
         failures=failures,

@@ -77,12 +77,15 @@ class DeterministicPlanner:
                     verification=VerificationPolicy("schema_keys", {"keys": ["content"]}),
                 ),
             ]
-            return steps
-
-        # Fallback: attempt a direct read of a path mentioned in the goal (e.g. a file name).
-        m = re.search(r"(\S+\.\w+)", goal_description)
-        if m:
-            return [
+        else:
+            # Fallback: attempt a direct read of a path mentioned in the goal (e.g. a file name).
+            m = re.search(r"(\S+\.\w+)", goal_description)
+            if not m:
+                raise ValueError(
+                    f"goal not decomposable by DeterministicPlanner: {goal_description!r} "
+                    "(extend planner templates or use a model-backed planner)"
+                )
+            steps = [
                 PlanStep(
                     index=0,
                     intent="read file",
@@ -94,10 +97,14 @@ class DeterministicPlanner:
                 )
             ]
 
-        raise ValueError(
-            f"goal not decomposable by DeterministicPlanner: {goal_description!r} "
-            "(extend planner templates or use a model-backed planner)"
-        )
+        # Memory-driven planning: if the context carries structured guidance
+        # (from prior experience), re-target steps away from known-failing
+        # resources. Informational only - authorization still decides.
+        if context is not None and getattr(context, "guidance", None):
+            from arion.memory.guidance import apply_guidance_to_steps
+
+            steps, _ = apply_guidance_to_steps(steps, context.guidance)
+        return steps
 
     @staticmethod
     def _key_files(text: str) -> dict[str, Any]:

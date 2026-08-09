@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 from typing import Protocol
 
+from arion.memory.guidance import DeterministicMemoryGuidance
 from arion.memory.interface import MemoryStore
 from arion.memory.models import ContextBudget, Episode, EpisodeFilter, PlanningContext
 
@@ -110,4 +111,17 @@ def build_planning_context(
                 break
     reflections = sorted(reflections, key=lambda r: r.created_at, reverse=True)[: budget.max_reflections]
 
-    return PlanningContext(goal=goal, episodes=episodes, reflections=reflections, budget=budget)
+    # Recommendations: deterministic guidance derived from the retrieved memory.
+    guidance = DeterministicMemoryGuidance().build(episodes, reflections)
+
+    # Provenance: which memories influenced this context (IDs only).
+    provenance = {
+        "episode_ids": [e.episode_id for e in episodes],
+        "reflection_ids": [r.reflection_id for r in reflections],
+        "guidance_ids": [g.guidance_id for g in guidance],
+    }
+
+    return PlanningContext(
+        goal=goal, episodes=episodes, reflections=reflections,
+        guidance=guidance, provenance=provenance, budget=budget,
+    )

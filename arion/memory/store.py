@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS episodic_memories (
     goal          TEXT NOT NULL,
     plan_summary  TEXT NOT NULL,
     actions       TEXT NOT NULL,
+    resources     TEXT NOT NULL,
     outcome       TEXT NOT NULL,
     verification  TEXT NOT NULL,
     failures      TEXT NOT NULL,
@@ -56,10 +57,43 @@ CREATE TABLE IF NOT EXISTS reflections (
 );
 CREATE INDEX IF NOT EXISTS idx_reflections_episode ON reflections(episode_id);
 CREATE INDEX IF NOT EXISTS idx_reflections_created ON reflections(created_at);
+CREATE TABLE IF NOT EXISTS consolidations (
+    consolidation_id TEXT PRIMARY KEY,
+    source_episode_ids TEXT NOT NULL,
+    category TEXT NOT NULL,
+    merged_lesson TEXT NOT NULL,
+    count INTEGER NOT NULL,
+    importance REAL NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
+
+class ConsolidationRecord:
+    """An explicit, explainable consolidation of similar episodes."""
+
+    def __init__(self, consolidation_id, source_episode_ids, category, merged_lesson, count, importance, created_at):
+        self.consolidation_id = consolidation_id
+        self.source_episode_ids = source_episode_ids
+        self.category = category
+        self.merged_lesson = merged_lesson
+        self.count = count
+        self.importance = importance
+        self.created_at = created_at
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "consolidation_id": self.consolidation_id,
+            "source_episode_ids": self.source_episode_ids,
+            "category": self.category,
+            "merged_lesson": self.merged_lesson,
+            "count": self.count,
+            "importance": self.importance,
+            "created_at": self.created_at,
+        }
+
 _EPISODE_COLS = [
-    "episode_id", "task_id", "goal_id", "goal", "plan_summary", "actions",
+    "episode_id", "task_id", "goal_id", "goal", "plan_summary", "actions", "resources",
     "outcome", "verification", "failures", "authorization", "recovery",
     "tags", "importance", "reflection_id", "created_at", "updated_at",
 ]
@@ -93,6 +127,7 @@ class SQLiteMemoryStore:
                 episode.goal,
                 json.dumps(episode.plan_summary),
                 json.dumps(episode.actions),
+                json.dumps(episode.resources),
                 episode.outcome,
                 json.dumps(episode.verification),
                 json.dumps(episode.failures),
@@ -190,6 +225,39 @@ class SQLiteMemoryStore:
         )
         self._conn.commit()
 
+    # ---- consolidations ----
+
+    def record_consolidation(self, record: ConsolidationRecord) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO consolidations "
+            "(consolidation_id, source_episode_ids, category, merged_lesson, count, importance, created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (
+                record.consolidation_id,
+                json.dumps(record.source_episode_ids),
+                record.category,
+                record.merged_lesson,
+                record.count,
+                float(record.importance),
+                record.created_at,
+            ),
+        )
+        self._conn.commit()
+
+    def list_consolidations(self, limit: int = 50) -> list[ConsolidationRecord]:
+        rows = self._conn.execute(
+            "SELECT consolidation_id, source_episode_ids, category, merged_lesson, count, importance, created_at "
+            "FROM consolidations ORDER BY created_at DESC LIMIT ?",
+            (max(1, limit),),
+        ).fetchall()
+        out = []
+        for r in rows:
+            out.append(ConsolidationRecord(
+                consolidation_id=r[0], source_episode_ids=json.loads(r[1]), category=r[2],
+                merged_lesson=r[3], count=r[4], importance=r[5], created_at=r[6],
+            ))
+        return out
+
     def close(self) -> None:
         self._conn.close()
 
@@ -198,6 +266,7 @@ def _episode_from_row(row: tuple[Any, ...]) -> Episode:
     d = {c: v for c, v in zip(_EPISODE_COLS, row)}
     d["plan_summary"] = json.loads(d["plan_summary"])
     d["actions"] = json.loads(d["actions"])
+    d["resources"] = json.loads(d["resources"])
     d["verification"] = json.loads(d["verification"])
     d["failures"] = json.loads(d["failures"])
     d["authorization"] = json.loads(d["authorization"])

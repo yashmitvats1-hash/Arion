@@ -59,13 +59,36 @@ def build_parser() -> argparse.ArgumentParser:
 
     caps = sub.add_parser("capabilities", help="list registered capabilities", parents=[common])
 
+    mem = sub.add_parser("memory", help="inspect the persistent cognitive memory")
+    mem.add_argument("--db", default=None, dest="db_mem", help=argparse.SUPPRESS)
+    mem_sub = mem.add_subparsers(dest="memory_command", required=True)
+
+    common_memory = argparse.ArgumentParser(add_help=False)
+    common_memory.add_argument("--json", action="store_true", help="machine-readable output")
+
+    mem_eps = mem_sub.add_parser("episodes", help="list recent episodes", parents=[common, common_memory])
+    mem_eps.add_argument("--limit", type=int, default=10)
+    mem_eps.add_argument("--outcome", default=None)
+
+    mem_refs = mem_sub.add_parser("reflections", help="list recent reflections", parents=[common, common_memory])
+    mem_refs.add_argument("--limit", type=int, default=10)
+
+    mem_search = mem_sub.add_parser("search", help="search episodes by relevance", parents=[common, common_memory])
+    mem_search.add_argument("query", help="search text / goal")
+    mem_search.add_argument("--limit", type=int, default=5)
+
+    mem_stats = mem_sub.add_parser("stats", help="memory statistics", parents=[common, common_memory])
+
+    mem_consol = mem_sub.add_parser("consolidate", help="run deterministic consolidation", parents=[common, common_memory])
+    mem_consol.add_argument("--limit", type=int, default=200)
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     root = Path(__file__).resolve().parent.parent.parent
-    db_path = args.db or args.db_global or str(root / "arion_data" / "arion.db")
+    db_path = args.db or args.db_global or getattr(args, "db_mem", None) or str(root / "arion_data" / "arion.db")
 
     engine = build_engine(
         db_path=db_path,
@@ -99,9 +122,105 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{cap['name']}: {cap['description']}")
             for action in cap["actions"]:
                 print(f"  - {action['name']} (scope: {action['required_scope']})")
+    elif args.command == "memory":
+        return _memory_command(args, engine)
 
     storage.close()
     return 0
+
+
+def _memory_command(args, engine) -> int:
+    """arion memory episodes|reflections|search|stats|consolidate"""
+    import json
+
+    memory = getattr(engine, "memory", None)
+    if memory is None:
+        print("memory is disabled for this engine")
+        return 1
+
+    def _emit(obj):
+        if getattr(args, "json", False):
+            print(json.dumps(obj, indent=2, default=str))
+        else:
+            print(obj)
+
+    if args.memory_command == "episodes":
+        from arion.memory.models import EpisodeFilter
+
+        episodes = memory.search_episodes(
+            EpisodeFilter(outcome=args.outcome, limit=args.limit)
+            if args.outcome else EpisodeFilter(limit=args.limit)
+        )
+        if args.json:
+            _emit([e.to_dict() for e in episodes])
+            return 0
+        for ep in episodes:
+            _emit(
+                f"{ep.episode_id}  {ep.outcome:<10} importance={ep.importance:.2f}  {ep.goal[:60]!r}"
+                f"  tags={ep.tags[:4]}"
+            )
+        return 0
+
+    if args.memory_command == "reflections":
+        reflections = memory.list_recent_reflections(limit=args.limit)
+        if args.json:
+            _emit([r.to_dict() for r in reflections])
+            return 0
+        for ref in reflections:
+            _emit(
+                f"{ref.reflection_id}  conf={ref.confidence}  episode={ref.episode_id}  lesson={ref.lesson[:80]!r}"
+            )
+        return 0
+
+    if args.memory_command == "search":
+        from arion.memory.retrieval import MemoryRetriever
+
+        results = MemoryRetriever(memory).retrieve(args.query, top_k=args.limit)
+        if args.json:
+            _emit([e.to_dict() for e in results])
+            return 0
+        for ep in results:
+            _emit(
+                f"{ep.episode_id}  {ep.outcome:<10} importance={ep.importance:.2f}  {ep.goal[:60]!r}"
+            )
+        return 0
+
+    if args.memory_command == "stats":
+        episodes = memory.list_recent(limit=1000)
+        reflections = memory.list_recent_reflections(limit=1000)
+        from collections import Counter
+
+        outcomes = Counter(e.outcome for e in episodes)
+        consolidations = memory.list_consolidations(limit=1000)
+        stats = {
+            "episodes": len(episodes),
+            "reflections": len(reflections),
+            "consolidations": len(consolidations),
+            "by_outcome": dict(outcomes),
+        }
+        _emit(
+            f"episodes: {stats['episodes']} | reflections: {stats['reflections']} | "
+            f"consolidations: {stats['consolidations']} | by_outcome: {stats['by_outcome']}"
+            if not args.json else stats
+        )
+        return 0
+
+    if args.memory_command == "consolidate":
+        from arion.memory.consolidation import MemoryConsolidator
+
+        records = MemoryConsolidator(memory).consolidate(limit=args.limit)
+        if args.json:
+            _emit([r.to_dict() for r in records])
+            return 0
+        for record in records:
+            print(f"consolidated {record.count} episodes -> {record.consolidation_id} "
+                  f"(category={record.category}, sources={record.source_episode_ids})")
+            print(f"  lesson: {record.merged_lesson[:200]}")
+        print(f"{len(records)} consolidation record(s) created")
+        return 0
+
+    print(f"unknown memory command: {args.memory_command}")
+    return 1
 
 
 if __name__ == "__main__":

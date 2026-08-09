@@ -34,6 +34,7 @@ class Episode:
     goal_id: str | None = None
     plan_summary: list[dict[str, Any]] = field(default_factory=list)  # steps: intent/capability/action/status/params_keys
     actions: list[dict[str, Any]] = field(default_factory=list)      # capability/action/status/attempts
+    resources: list[dict[str, Any]] = field(default_factory=list)    # declared resource values: {capability, action, resource}
     verification: dict[str, Any] = field(default_factory=dict)       # passed/failed step indices
     failures: list[dict[str, Any]] = field(default_factory=list)     # step, capability, action, error (bounded), category
     authorization: dict[str, Any] = field(default_factory=dict)      # denials, approvals_required
@@ -60,6 +61,7 @@ class Episode:
             "goal": self.goal,
             "plan_summary": self.plan_summary,
             "actions": self.actions,
+            "resources": self.resources,
             "outcome": self.outcome,
             "verification": self.verification,
             "failures": self.failures,
@@ -81,6 +83,7 @@ class Episode:
             goal=d.get("goal", ""),
             plan_summary=d.get("plan_summary", []) or [],
             actions=d.get("actions", []) or [],
+            resources=d.get("resources", []) or [],
             outcome=d.get("outcome", "failed"),
             verification=d.get("verification", {}) or {},
             failures=d.get("failures", []) or [],
@@ -178,14 +181,18 @@ class ContextBudget:
 class PlanningContext:
     """Explicit context object handed to the planner/model.
 
-    Contains only relevant, bounded memory - never the whole database.
-    digest() produces the serializable form shown to a model (summaries, no
-    secrets, no raw transcripts).
+    Contains only relevant, bounded memory - never the whole database. Kept
+    STRUCTURED internally: historical_facts (episodes), reflections,
+    recommendations (guidance), and provenance are separate fields, not one
+    opaque string. digest() produces the serializable form shown to a model
+    (summaries, no secrets, no raw transcripts).
     """
 
     goal: str
-    episodes: list[Episode] = field(default_factory=list)
-    reflections: list[Reflection] = field(default_factory=list)
+    episodes: list[Episode] = field(default_factory=list)          # historical_facts
+    reflections: list[Reflection] = field(default_factory=list)    # reflections
+    guidance: list = field(default_factory=list)                   # recommendations (MemoryGuidance)
+    provenance: dict[str, list[str]] = field(default_factory=dict)  # episode_ids, reflection_ids, guidance_ids
     budget: ContextBudget = field(default_factory=ContextBudget)
 
     def digest(self) -> dict[str, Any]:
@@ -193,6 +200,7 @@ class PlanningContext:
         budget = self.budget
         episodes = self.episodes[: budget.max_episodes]
         reflections = self.reflections[: budget.max_reflections]
+        guidance = self.guidance[: budget.max_episodes]
 
         ep = [
             {
@@ -218,19 +226,61 @@ class PlanningContext:
             }
             for r in reflections
         ]
+        guide = [
+            {
+                "guidance_id": g.guidance_id,
+                "category": g.category,
+                "capability": g.capability,
+                "action": g.action,
+                "resource": g.resource,
+                "reason": g.reason[:200],
+                "recommendation": g.recommendation[:200],
+                "confidence": g.confidence,
+                "episode_id": g.episode_id,
+                "reflection_id": g.reflection_id,
+            }
+            for g in guidance
+        ]
+        # Provenance: which memories influenced this context (IDs only).
+        prov = {
+            "episode_ids": [e.episode_id for e in episodes],
+            "reflection_ids": [r.reflection_id for r in reflections],
+            "guidance_ids": [g.guidance_id for g in guidance],
+        }
         # Enforce the character budget across the whole digest (truncate).
-        total = {"episodes": ep, "reflections": ref, "counts": {"episodes": len(ep), "reflections": len(ref)}}
+        total = {
+            "episodes": ep,
+            "reflections": ref,
+            "guidance": guide,
+            "provenance": prov,
+            "counts": {"episodes": len(ep), "reflections": len(ref), "guidance": len(guide)},
+        }
         text = json.dumps(total, separators=(",", ":"))
         if len(text) > budget.max_chars:
             budget_left = budget.max_chars - 80
-            # drop reflections first (least essential), then episodes, until it fits
-            while len(json.dumps(total, separators=(",", ":"))) > budget_left and (ref or ep):
-                if ref:
+            # drop guidance first, then reflections, then episodes, until it fits
+            while len(json.dumps(total, separators=(",", ":"))) > budget_left and (guide or ref or ep):
+                if guide:
+                    guide = guide[: len(guide) - 1]
+                elif ref:
                     ref = ref[: len(ref) - 1]
                 elif ep:
                     ep = ep[: len(ep) - 1]
-                total = {"episodes": ep, "reflections": ref, "counts": {"episodes": len(ep), "reflections": len(ref)}}
-            return {"episodes": ep, "reflections": ref, "counts": {"episodes": len(ep), "reflections": len(ref)}, "truncated": True}
+                total = {
+                    "episodes": ep,
+                    "reflections": ref,
+                    "guidance": guide,
+                    "provenance": prov,
+                    "counts": {"episodes": len(ep), "reflections": len(ref), "guidance": len(guide)},
+                }
+            return {
+                "episodes": ep,
+                "reflections": ref,
+                "guidance": guide,
+                "provenance": prov,
+                "counts": {"episodes": len(ep), "reflections": len(ref), "guidance": len(guide)},
+                "truncated": True,
+            }
         return total
 
     def all_tags(self) -> list[str]:

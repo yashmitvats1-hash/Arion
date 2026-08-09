@@ -124,6 +124,32 @@ Memory is INFORMATIONAL — it never authorizes (`Memory ≠ Authority`):
 - **Events:** `memory.episode.recorded`, `memory.retrieval.completed`,
   `reflection.created`, `planning.context.created` (IDs/counts/tags only).
 
+## Learning loop (ADR-013)
+
+`Memory informs planning; memory never authorizes execution.`
+
+- **ModelReflector** (behind the `Reflector` seam): produces the same
+  structured `Reflection` as `DeterministicReflector`, strictly validated
+  against a reflection schema that forbids authority-bearing fields
+  (`scope`, `permissions`, `actor`, `grant`, `approve`, `authorization`,
+  `capability_registration`, `resource_boundary`, ...). Malformed output is
+  rejected; the engine falls back to the deterministic reflector.
+- **MemoryGuidance**: deterministic conversion of retrieved episodes +
+  reflections into structured recommendations (`avoid` / `prefer` /
+  `informational`) with capability/action/resource scope. `apply_guidance_to_steps`
+  re-targets plans away from known-failing resources. Episodes record their
+  declared resource values (safe metadata, never arbitrary params).
+- **Behavioral change is proven**: the same goal that was denied on a resource
+  later completes by choosing a different resource, driven by retrieved
+  experience (acceptance-gate test asserts Plan A != Plan B meaningfully).
+- **Consolidation**: deterministic, explainable merging of repeated lessons
+  into explicit records (never deletes history); importance decays with age;
+  idempotent so lessons don't pile up.
+- **Provenance**: `PlanningContext` exposes episode/reflection/guidance IDs;
+  `planning.memory.influence` audits which memories influenced each plan.
+- **Poisoning defenses**: adversarial memory/reflection content stays
+  informational; all authorization answers come from the current policy.
+
 ## Structured intelligence boundary (ADR-011)
 
 ```
