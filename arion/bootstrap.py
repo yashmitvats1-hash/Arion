@@ -1,8 +1,8 @@
 """Bootstrap: wiring of layers (composition root).
 
-Central place where Storage, CapabilityRegistry, Planner, Router, Events and
-the Engine are assembled. New capabilities, policies and interfaces are wired
-here without touching layer internals.
+Central place where Storage, CapabilityRegistry, Planner, Router, Events, the
+Policy and the Engine are assembled. New capabilities, policies and interfaces
+are wired here without touching layer internals.
 """
 
 from __future__ import annotations
@@ -14,7 +14,8 @@ from arion.capabilities.registry import CapabilityRegistry
 from arion.intelligence.planner import DeterministicPlanner
 from arion.intelligence.router import DeterministicRouter
 from arion.observability.events import EventLogger, JsonlFileSink
-from arion.orchestration.engine import AllowAllPolicy, ArionEngine
+from arion.orchestration.authz import ApprovalHandler, PermissionPolicy, ResourcePolicy
+from arion.orchestration.engine import ArionEngine
 from arion.state.store import SQLiteStorage
 
 
@@ -22,6 +23,8 @@ def build_engine(
     db_path: str | Path,
     sandbox_root: str | Path,
     jsonl_log: str | Path | None = None,
+    policy: PermissionPolicy | None = None,
+    approval_handler: ApprovalHandler | None = None,
 ) -> ArionEngine:
     storage = SQLiteStorage(db_path)
 
@@ -42,5 +45,6 @@ def build_engine(
         planner=planner,
         router=router,
         events=events,
-        policy=AllowAllPolicy(),
+        policy=policy or ResourcePolicy(),
+        approval_handler=approval_handler,
     )

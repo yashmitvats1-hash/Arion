@@ -6,7 +6,7 @@ the same DB) can resume persisted work without losing state.
 
 import pytest
 
-from arion.capabilities.registry import CapabilityRegistry
+from arion.capabilities.registry import ActionSpec, CapabilityRegistry
 from arion.intelligence.planner import DeterministicPlanner
 from arion.intelligence.router import DeterministicRouter
 from arion.observability.events import EventLogger
@@ -77,7 +77,10 @@ def test_crash_mid_execution_recovers(db_path, sandbox, fresh_engine):
     class CrashOnceCapability:
         name = "crash.once"
         description = "raises a hard exception on first call, works afterwards"
-        actions = []
+        actions = [
+            ActionSpec(name="read", description="read", required_scope="filesystem:read",
+                       risk="low", side_effects="read_only", retry_safe=True)
+        ]
 
         def execute(self, action, params):
             _crash_calls["n"] += 1
@@ -127,6 +130,9 @@ def test_crash_mid_execution_recovers(db_path, sandbox, fresh_engine):
     assert resumed.steps[0].result["content"] == "recovered"
     kinds = [e.kind for e in storage_b.list_events(task.id)]
     assert "task.resumed" in kinds
+    # AT-LEAST-ONCE (ADR-010): the interrupted step was re-executed exactly once
+    # more after the crash (1st global call crashed, 2nd call produced the result)
+    assert _crash_calls["n"] == 2
     storage_b.close()
 
 

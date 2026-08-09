@@ -27,6 +27,7 @@ class TaskStatus(str, Enum):
     PLANNING = "planning"
     PLANNED = "planned"
     RUNNING = "running"
+    AWAITING_APPROVAL = "awaiting_approval"
     COMPLETED = "completed"
     FAILED = "failed"
 

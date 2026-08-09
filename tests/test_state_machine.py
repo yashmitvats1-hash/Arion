@@ -50,20 +50,29 @@ def test_task_fails_when_capability_missing(engine, storage):
     assert "task.failed" in events
 
 
-def test_permission_denied_fails_task(engine, storage):
-    goal = engine.submit_goal("summarize this repository")
+def test_scope_spoofing_does_not_escalate(engine, storage):
+    """Adversarial: a plan claims scope shell:exec while calling filesystem.read.
+
+    Authorization uses the capability's ActionSpec scope (filesystem:read) as
+    the source of truth, so spoofing the claimed scope cannot escalate to shell
+    privileges - the action still runs under read-only, sandboxed permissions.
+    """
+    goal = engine.submit_goal("read the file")
     task = engine.create_task(goal)
     task.steps = [
-        PlanStep(index=0, intent="run shell", capability="filesystem.read", action="read",
-                 scope="shell:exec", params={"cmd": "rm -rf /"}, verification=VerificationPolicy("non_empty"))
+        PlanStep(index=0, intent="spoof scope", capability="filesystem.read", action="read",
+                 scope="shell:exec", params={"path": "README.md"}, verification=VerificationPolicy("non_empty"))
     ]
     storage.save_task(task)
     result = engine.run_task(task.id)
 
-    assert result.status == TaskStatus.FAILED
-    assert "not permitted" in (result.error or "")
+    assert result.status == TaskStatus.COMPLETED
+    assert "content" in result.steps[0].result
     kinds = [e.kind for e in storage.list_events(task.id)]
-    assert "permission.denied" in kinds
+    assert "permission.denied" not in kinds
+    checked = [e for e in storage.list_events(task.id) if e.kind == "permission.checked"]
+    assert checked[0].detail["scope"] == "filesystem:read"  # resolved from ActionSpec
+    assert checked[0].detail["step_declared_scope"] == "shell:exec"  # the spoof is visible but ignored
 
 
 def test_verification_failure_fails_task(engine, storage):
@@ -94,10 +103,15 @@ def test_verification_failure_fails_task(engine, storage):
 
 
 def test_retry_then_success(engine, storage):
+    from arion.capabilities.registry import ActionSpec, CapabilityError
+
     class FlakyCapability:
         name = "flaky.read"
         description = "fails the first attempt, then succeeds"
-        actions = []
+        actions = [
+            ActionSpec(name="read", description="read", required_scope="filesystem:read",
+                       risk="low", side_effects="read_only", retry_safe=True)
+        ]
 
         def __init__(self):
             self.calls = 0
@@ -105,7 +119,7 @@ def test_retry_then_success(engine, storage):
         def execute(self, action, params):
             self.calls += 1
             if self.calls == 1:
-                raise __import__("arion.capabilities.registry", fromlist=["CapabilityError"]).CapabilityError("temporary failure")
+                raise CapabilityError("temporary failure")
             return {"content": "ok", "path": params.get("path")}
 
     engine.registry.register(FlakyCapability())

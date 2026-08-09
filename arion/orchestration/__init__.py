@@ -1,5 +1,29 @@
 """Orchestration layer public surface."""
 
-from arion.orchestration.engine import AllowAllPolicy, ArionEngine, PermissionPolicy
+from arion.orchestration.authz import (
+    ApprovalHandler,
+    ApprovalOutcome,
+    AuthorizationRequest,
+    AutoApproveHandler,
+    AutoDenyHandler,
+    PendingApprovalHandler,
+    PermissionPolicy,
+    PolicyDecision,
+    PolicyOutcome,
+    ResourcePolicy,
+)
+from arion.orchestration.engine import ArionEngine
 
-__all__ = ["AllowAllPolicy", "ArionEngine", "PermissionPolicy"]
+__all__ = [
+    "ApprovalHandler",
+    "ApprovalOutcome",
+    "ArionEngine",
+    "AuthorizationRequest",
+    "AutoApproveHandler",
+    "AutoDenyHandler",
+    "PendingApprovalHandler",
+    "PermissionPolicy",
+    "PolicyDecision",
+    "PolicyOutcome",
+    "ResourcePolicy",
+]

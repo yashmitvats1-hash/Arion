@@ -6,7 +6,6 @@ from arion.capabilities.registry import (
     Capability,
     CapabilityError,
     CapabilityRegistry,
-    Permission,
 )
 
 __all__ = [
@@ -15,5 +14,4 @@ __all__ = [
     "CapabilityError",
     "CapabilityRegistry",
     "FilesystemReadCapability",
-    "Permission",
 ]

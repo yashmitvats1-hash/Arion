@@ -24,10 +24,40 @@ class CapabilityError(Exception):
 
 @dataclass
 class ActionSpec:
+    """Declarative metadata for one capability action (ADR-009).
+
+    - required_scope: the permission scope the orchestrator authorizes against
+      (source of truth - the engine never trusts a plan's claimed scope).
+    - risk: none | low | medium | high - feeds the policy decision.
+    - side_effects: none | read_only | mutating | irreversible - what the
+      action does to the world.
+    - reversible / idempotent / retry_safe: execution-semantics metadata
+      (ADR-010). retry_safe=False means a failure must NOT be automatically
+      retried (the operation may have partially applied).
+    """
+
     name: str
     description: str
     required_scope: str
     params: dict[str, Any] = field(default_factory=dict)
+    risk: str = "low"
+    side_effects: str = "read_only"
+    reversible: bool = True
+    idempotent: bool = True
+    retry_safe: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "required_scope": self.required_scope,
+            "params": self.params,
+            "risk": self.risk,
+            "side_effects": self.side_effects,
+            "reversible": self.reversible,
+            "idempotent": self.idempotent,
+            "retry_safe": self.retry_safe,
+        }
 
 
 class Capability(Protocol):
@@ -40,17 +70,6 @@ class Capability(Protocol):
     def execute(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
         """Execute an action with the given params, returning a structured observation."""
         ...
-
-
-class Permission:
-    """A granted permission: capability scope + optional parameter constraints."""
-
-    def __init__(self, scope: str, constraints: dict[str, Any] | None = None):
-        self.scope = scope
-        self.constraints = constraints or {}
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"scope": self.scope, "constraints": self.constraints}
 
 
 class CapabilityRegistry:
@@ -85,10 +104,7 @@ class CapabilityRegistry:
             {
                 "name": cap.name,
                 "description": cap.description,
-                "actions": [
-                    {"name": a.name, "description": a.description, "required_scope": a.required_scope}
-                    for a in cap.actions
-                ],
+                "actions": [a.to_dict() for a in cap.actions],
             }
             for cap in sorted(self._caps.values(), key=lambda c: c.name)
         ]

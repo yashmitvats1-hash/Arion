@@ -75,3 +75,30 @@ def test_registry_discovery(registry):
     summary = registry.capabilities_summary()
     assert summary[0]["name"] == "filesystem.read"
     assert summary[0]["actions"][0]["required_scope"] == "filesystem:read"
+
+
+def test_action_metadata_declared(registry):
+    """Scenario 6: capability/action metadata is explicit and introspectable."""
+    read = registry.action_spec("filesystem.read", "read")
+    assert read is not None
+    assert read.required_scope == "filesystem:read"
+    assert read.risk == "low"
+    assert read.side_effects == "read_only"
+    assert read.reversible is True
+    assert read.idempotent is True
+    assert read.retry_safe is True
+
+    listing = registry.action_spec("filesystem.read", "list")
+    assert listing is not None
+    assert listing.required_scope == "filesystem:read"
+    assert listing.risk == "low"
+
+    # unknown action -> no spec
+    assert registry.action_spec("filesystem.read", "write") is None
+
+    # summary exposes the metadata for discovery/planning
+    summary = registry.capabilities_summary()[0]
+    action_dict = summary["actions"][0]
+    assert action_dict["risk"] == "low"
+    assert action_dict["side_effects"] == "read_only"
+    assert action_dict["retry_safe"] is True

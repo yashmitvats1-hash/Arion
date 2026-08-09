@@ -28,11 +28,21 @@ class FilesystemReadCapability:
             name="read",
             description="Read a text file from the sandbox (size-capped).",
             required_scope="filesystem:read",
+            risk="low",
+            side_effects="read_only",
+            reversible=True,
+            idempotent=True,
+            retry_safe=True,
         ),
         ActionSpec(
             name="list",
             description="List entries of a directory inside the sandbox.",
             required_scope="filesystem:read",
+            risk="low",
+            side_effects="read_only",
+            reversible=True,
+            idempotent=True,
+            retry_safe=True,
         ),
     ]
 

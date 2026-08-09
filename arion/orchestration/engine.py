@@ -5,19 +5,41 @@ execution, verification, checkpoints, recovery and completion. The LLM/model is
 only ever an intelligence component the engine calls (via the ModelRouter) -
 it never drives the loop (architectural rule, ADR-004).
 
+Authorization (ADR-009): every step is authorized against the capability's
+declared ActionSpec metadata (scope, risk, side effects) and the step's
+parameters - never against a scope the plan merely claims. The policy returns
+ALLOW | DENY | REQUIRE_APPROVAL; approval routes through an ApprovalHandler
+seam so a human approval interface can be attached without touching the engine.
+
+Execution semantics (ADR-010): step execution is AT-LEAST-ONCE - after a
+crash, a resumed task re-executes the interrupted step. Automatic retries
+within a step are permitted only for actions whose metadata marks them
+retry-safe; non-retry-safe actions fail immediately so a partially applied
+side effect is never blindly re-run.
+
 Conceptual flow per task:
-  Goal -> Task -> Plan -> Permission -> Capability -> Observation
+  Goal -> Task -> Plan -> Authorization -> Capability -> Observation
         -> Verification -> Checkpoint -> Complete/Recover
 """
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any
 
 from arion.capabilities.registry import CapabilityError, CapabilityRegistry
 from arion.intelligence.planner import Planner
 from arion.intelligence.router import ModelRouter
 from arion.observability.events import AuditEvent, EventLogger
+from arion.orchestration.authz import (
+    ApprovalHandler,
+    ApprovalOutcome,
+    AuthorizationRequest,
+    PermissionPolicy,
+    PendingApprovalHandler,
+    PolicyDecision,
+    PolicyOutcome,
+    ResourcePolicy,
+)
 from arion.state.models import (
     Checkpoint,
     Goal,
@@ -31,28 +53,6 @@ from arion.state.models import (
 from arion.state.store import Storage
 
 
-class PermissionPolicy(Protocol):
-    """Decides whether a requested scope/params may run."""
-
-    def check(self, scope: str, params: dict[str, Any]) -> tuple[bool, str | None]: ...
-
-
-class AllowAllPolicy:
-    """Default policy for the vertical slice: allow only declared read scopes.
-
-    In this slice every planned step declares a read-only scope, so allow-all
-    is still safe. Future policies (explicit allowlists, human approval, time
-    windows) implement the same protocol.
-    """
-
-    def check(self, scope: str, params: dict[str, Any]) -> tuple[bool, str | None]:
-        if not scope:
-            return False, "empty permission scope"
-        if not scope.startswith("filesystem:"):
-            return False, f"scope {scope!r} not permitted by current policy"
-        return True, None
-
-
 class ArionEngine:
     """Drives goals through the full task lifecycle with checkpointing."""
 
@@ -64,13 +64,17 @@ class ArionEngine:
         router: ModelRouter,
         events: EventLogger,
         policy: PermissionPolicy | None = None,
+        approval_handler: ApprovalHandler | None = None,
+        agent: str = "system",
     ):
         self.storage = storage
         self.registry = registry
         self.planner = planner
         self.router = router
         self.events = events
-        self.policy = policy or AllowAllPolicy()
+        self.policy = policy or ResourcePolicy()
+        self.approval_handler = approval_handler or PendingApprovalHandler()
+        self.agent = agent
 
     # ---------- public API ----------
 
@@ -96,7 +100,11 @@ class ArionEngine:
         return task
 
     def run_task(self, task_id: str) -> Task:
-        """Resume-or-start a task and drive it to completion/failure.
+        """Resume-or-start a task and drive it to a stopping point.
+
+        Stopping points: COMPLETED, FAILED, or AWAITING_APPROVAL (the task is
+        checkpointed and returned so an approval interface can act; calling
+        run_task again after approval resumes from the exact same step).
 
         Survives restarts: if a checkpoint exists, state is restored and the
         task resumes from the checkpointed step instead of starting over.
@@ -124,7 +132,14 @@ class ArionEngine:
             step = task.active_step
             if step is None:
                 break
+            task.status = TaskStatus.RUNNING
             self._execute_step(task, step)
+
+            if step.status == StepStatus.PENDING and task.status == TaskStatus.AWAITING_APPROVAL:
+                self._checkpoint(task, reason="awaiting approval")
+                self.storage.save_task(task)
+                return task
+
             self.storage.save_task(task)
 
             if step.status == StepStatus.FAILED:
@@ -170,53 +185,133 @@ class ArionEngine:
     def _execute_step(self, task: Task, step: PlanStep) -> None:
         self._emit("step.started", task_id=task.id, step_id=_step_id(step), detail={"intent": step.intent})
 
-        # 1. Permission check
-        allowed, denial = self.policy.check(step.scope, step.params)
-        if not allowed:
-            step.status = StepStatus.FAILED
-            step.error = denial or "permission denied"
-            self._emit(
-                "permission.denied",
-                task_id=task.id,
-                step_id=_step_id(step),
-                success=False,
-                detail={"scope": step.scope, "params": step.params, "reason": step.error},
-            )
-            return
-        self._emit(
-            "permission.checked",
-            task_id=task.id,
-            step_id=_step_id(step),
-            detail={"scope": step.scope, "params": step.params},
-        )
-
-        # 2. Capability discovery
+        # 1. Capability discovery + action spec (source of truth for metadata)
         capability = self.registry.get(step.capability)
         if capability is None:
             step.status = StepStatus.FAILED
             step.error = f"capability not found: {step.capability}"
             self._emit("error", task_id=task.id, step_id=_step_id(step), success=False, detail={"error": step.error})
             return
-        self._emit("capability.discovered", task_id=task.id, step_id=_step_id(step), detail={"capability": step.capability})
+        spec = self.registry.action_spec(step.capability, step.action)
+        if spec is None:
+            step.status = StepStatus.FAILED
+            step.error = f"unknown action {step.action!r} for capability {step.capability!r}"
+            self._emit("error", task_id=task.id, step_id=_step_id(step), success=False, detail={"error": step.error})
+            return
+        self._emit(
+            "capability.discovered",
+            task_id=task.id,
+            step_id=_step_id(step),
+            detail={"capability": step.capability, "action": step.action, "required_scope": spec.required_scope},
+        )
+
+        # 2. Authorization (policy decides; scope comes from the ActionSpec, not the plan)
+        request = AuthorizationRequest(
+            agent=self.agent,
+            task_id=task.id,
+            step_index=step.index,
+            capability=step.capability,
+            action=step.action,
+            scope=spec.required_scope,
+            params=dict(step.params),
+            resource=self._extract_resource(spec.required_scope, step.params),
+            risk=spec.risk,
+            side_effects=spec.side_effects,
+            idempotent=spec.idempotent,
+            retry_safe=spec.retry_safe,
+        )
+        decision = self.policy.decide(request)
+        self._emit(
+            "permission.checked",
+            task_id=task.id,
+            step_id=_step_id(step),
+            detail={**decision.to_dict(), "params": request.params, "step_declared_scope": step.scope},
+        )
+
+        if decision.outcome == PolicyOutcome.DENY:
+            step.status = StepStatus.FAILED
+            step.error = decision.reason
+            self._emit(
+                "permission.denied",
+                task_id=task.id,
+                step_id=_step_id(step),
+                success=False,
+                detail=decision.to_dict(),
+            )
+            return
+
+        if decision.outcome == PolicyOutcome.REQUIRE_APPROVAL:
+            if not self._handle_approval(task, step, request, decision):
+                return  # denied or paused (task will be checkpointed by the caller)
 
         # 3. Execute with retries, then 4. verify
+        self._execute_with_retries(task, step, capability, spec)
+
+    # ---------- authorization helpers ----------
+
+    def _handle_approval(
+        self,
+        task: Task,
+        step: PlanStep,
+        request: AuthorizationRequest,
+        decision: PolicyDecision,
+    ) -> bool:
+        """Approval seam: route a REQUIRE_APPROVAL decision to the handler.
+
+        Returns True when the action may proceed (approved), False when it was
+        denied or is still pending (the caller must not execute).
+        """
+        self._emit("approval.requested", task_id=task.id, step_id=_step_id(step), detail=decision.to_dict())
+        outcome = self.approval_handler.request(request, decision)
+        if outcome == ApprovalOutcome.APPROVED:
+            self._emit("approval.granted", task_id=task.id, step_id=_step_id(step), detail=decision.to_dict())
+            return True
+        if outcome == ApprovalOutcome.DENIED:
+            step.status = StepStatus.FAILED
+            step.error = "approval denied"
+            self._emit(
+                "approval.denied",
+                task_id=task.id,
+                step_id=_step_id(step),
+                success=False,
+                detail=decision.to_dict(),
+            )
+            return False
+        # PENDING: pause the task; a later run_task (after approval) resumes here
+        task.status = TaskStatus.AWAITING_APPROVAL
+        step.status = StepStatus.PENDING
+        return False
+
+    @staticmethod
+    def _extract_resource(scope: str, params: dict[str, Any]) -> str | None:
+        """Best-effort resource extraction for the policy (e.g. filesystem path)."""
+        if scope.startswith("filesystem:"):
+            p = params.get("path")
+            return p if isinstance(p, str) else None
+        return None
+
+    # ---------- execution & verification ----------
+
+    def _execute_with_retries(self, task: Task, step: PlanStep, capability, spec) -> None:
         verify_failed = False
+        exec_error: str | None = None
         while step.attempts < step.max_attempts:
             step.attempts += 1
             step.status = StepStatus.RUNNING
             try:
                 observation = capability.execute(step.action, dict(step.params))
             except CapabilityError as exc:
-                step.error = str(exc)
+                exec_error = str(exc)
                 step.result = None
-                if step.attempts >= step.max_attempts:
+                # retry only if the action is metadata-marked retry-safe
+                if step.attempts >= step.max_attempts or not spec.retry_safe:
                     break
                 self._emit(
                     "step.retrying",
                     task_id=task.id,
                     step_id=_step_id(step),
                     success=False,
-                    detail={"attempt": step.attempts, "error": step.error},
+                    detail={"attempt": step.attempts, "error": exec_error},
                 )
                 continue
             except Exception as exc:  # unexpected capability bug - fail loudly
@@ -240,7 +335,7 @@ class ArionEngine:
                 return
             verify_failed = True
             step.error = "verification failed"
-            if step.attempts < step.max_attempts:
+            if step.attempts < step.max_attempts and spec.retry_safe:
                 self._emit(
                     "step.retrying",
                     task_id=task.id,
@@ -252,7 +347,15 @@ class ArionEngine:
             break
 
         step.status = StepStatus.FAILED
-        step.error = step.error or "step failed"
+        step.error = step.error or exec_error or "step failed"
+        if exec_error is not None:
+            self._emit(
+                "capability.executed",
+                task_id=task.id,
+                step_id=_step_id(step),
+                success=False,
+                detail={"error": exec_error},
+            )
         kind = "verification.failed" if verify_failed else "error"
         self._emit(
             kind,
