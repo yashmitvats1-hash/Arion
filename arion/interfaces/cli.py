@@ -219,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
             _print_task(engine, latest.id)
         if goal.status_value == "failed":
             print(f"goal error: {goal.last_replan_reason or 'failed'}")
+            engine.shutdown()  # ADR-024: join bounded workers, no orphans
             storage.close()
             return 1
     elif args.command == "resume":
@@ -253,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "locks":
         return _locks_command(args, engine)
 
+    engine.shutdown()  # ADR-024: join bounded workers, no orphans
     storage.close()
     return 0
 

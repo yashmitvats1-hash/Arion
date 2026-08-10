@@ -509,6 +509,45 @@ loop (ADR-016):
 - **Demo:** `scripts/demo_adr023_lock_fairness.py` (real subprocesses:
   FIFO handoff, restart survival, timeout, live re-authz, adversarial).
 
+## Bounded In-Process Concurrency (ADR-024)
+
+- **Scope:** `ArionEngine(max_concurrency=N)` runs up to N *steps* of a
+  task concurrently on bounded scheduler worker threads (default 1 = the
+  historical sequential behavior). Concurrency is per engine/process; no
+  distributed execution, no new capabilities, no shell/subprocess.
+- **Scheduler authority:** `arion/orchestration/scheduler.py` is the ONLY
+  source of worker lifecycle state (runnable/running/completed/failed/
+  cancelled) with explicit `enqueue/cancel/shutdown/run_until_done`,
+  injectable clock/sleeper, and joined (non-orphan) workers after
+  `shutdown()`. The scheduler is NOT an authorization authority.
+- **What may run concurrently:** independent read-only steps overlap; mutating
+  steps serialize per canonical resource through the existing durable
+  SQLite lock + FIFO queue; different-resource mutations overlap with their
+  own locks. Dependency edges stay authoritative; the cursor step is always
+  dispatched (approval requests, serial-path behavior unchanged); every
+  concurrent step runs its OWN live authorization — no authz decision is
+  reused.
+- **Durable restart safety:** per-step terminal status is persisted from the
+  worker immediately, so a crash mid-round never replays a completed
+  mutation; an interrupted step resumes under the existing at-least-once/
+  recovery contract with bounded metadata only (no thread objects, stack
+  traces, capability outputs, or model output ever persisted).
+- **Per-step durable waiters:** `task.lock_wait` is step-scoped, so concurrent
+  same-task waiters on one resource hold distinct durable FIFO positions.
+- **Cancellation/shutdown:** queued items are cancelled by the scheduler and
+  never run; a running mutation is never pretended-away (its outcome stands,
+  failures still create durable recovery); cancelled FIFO waiters never
+  acquire; `shutdown()` joins bounded workers and the CLI calls it before
+  exiting.
+- **Store thread-safety:** `SQLiteStorage` guards one connection with an
+  RLock (`check_same_thread=False`); cross-process authority is unchanged
+  (`BEGIN IMMEDIATE` + WAL), so in-process threads and other processes
+  compete on exactly the same lock/queue authority.
+- **Demo:** `scripts/demo_adr024_concurrency.py` (30 checks, deterministic,
+  offline): parallel reads, same-resource FIFO serialization, different-
+  resource concurrency, blocked mutation not stalling reads, restart/cancel/
+  shutdown with no orphan work.
+
 ## Structured intelligence boundary (ADR-011)
 
 ```

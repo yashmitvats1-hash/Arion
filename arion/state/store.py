@@ -6,10 +6,24 @@ in Postgres or a vector store later must not change any other layer.
 
 from __future__ import annotations
 
+import functools
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any, Protocol
+
+
+def _threadsafe(method):
+    """Guard a SQLiteStorage public method with the connection's RLock so the
+    ADR-024 worker threads never touch the connection concurrently."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._sql_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 from arion.state.models import Checkpoint, Goal, Task, TaskStatus, new_id, utcnow
 from arion.observability.events import AuditEvent
@@ -160,7 +174,13 @@ class SQLiteStorage:
 
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
-        self._conn = sqlite3.connect(self.db_path, timeout=10)
+        # check_same_thread=False: the ADR-024 in-process step scheduler runs
+        # steps on bounded worker threads; every public method is guarded by
+        # _sql_lock (a threading.RLock), so only one thread touches the
+        # connection at a time. Cross-process atomicity is unchanged
+        # (BEGIN IMMEDIATE + WAL).
+        self._sql_lock = threading.RLock()
+        self._conn = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._conn.executescript(SCHEMA)
@@ -168,6 +188,7 @@ class SQLiteStorage:
         self._migrate_approvals()
         self._conn.commit()
 
+    @_threadsafe
     def _migrate_goals(self) -> None:
         """Lightweight additive migration: extend legacy goals rows with the
         goal-lifecycle columns (ADR-016)."""
@@ -185,6 +206,7 @@ class SQLiteStorage:
             if col not in cols:
                 self._conn.execute(ddl)
 
+    @_threadsafe
     def _migrate_approvals(self) -> None:
         """Lightweight additive migration: add the expiry column to
         approval_requests created before ADR-019. Never drops data (the
@@ -195,6 +217,7 @@ class SQLiteStorage:
 
     # ---- goals ----
 
+    @_threadsafe
     def save_goal(self, goal: Goal) -> None:
         import json as _json
 
@@ -220,12 +243,14 @@ class SQLiteStorage:
         )
         self._conn.commit()
 
+    @_threadsafe
     def load_goal(self, goal_id: str) -> Goal | None:
         row = self._conn.execute(
             "SELECT " + ", ".join(_GOAL_COLS) + " FROM goals WHERE id=?", (goal_id,)
         ).fetchone()
         return _goal_from_row(row) if row else None
 
+    @_threadsafe
     def list_goals(self, status: str | None = None) -> list[Goal]:
         cols = ", ".join(_GOAL_COLS)
         if status:
@@ -238,6 +263,7 @@ class SQLiteStorage:
 
     # ---- tasks ----
 
+    @_threadsafe
     def save_task(self, task: Task) -> None:
         task.updated_at = utcnow()
         self._conn.execute(
@@ -246,10 +272,12 @@ class SQLiteStorage:
         )
         self._conn.commit()
 
+    @_threadsafe
     def load_task(self, task_id: str) -> Task | None:
         row = self._conn.execute("SELECT snapshot FROM tasks WHERE id=?", (task_id,)).fetchone()
         return Task.from_dict(json.loads(row[0])) if row else None
 
+    @_threadsafe
     def list_tasks(self, status: str | None = None) -> list[Task]:
         if status:
             rows = self._conn.execute("SELECT snapshot FROM tasks WHERE status=? ORDER BY updated_at", (status,)).fetchall()
@@ -259,6 +287,7 @@ class SQLiteStorage:
 
     # ---- checkpoints ----
 
+    @_threadsafe
     def save_checkpoint(self, checkpoint: Checkpoint) -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO checkpoints (id, task_id, status, step_index, snapshot, reason, created_at)"
@@ -275,6 +304,7 @@ class SQLiteStorage:
         )
         self._conn.commit()
 
+    @_threadsafe
     def latest_checkpoint(self, task_id: str) -> Checkpoint | None:
         row = self._conn.execute(
             "SELECT id, task_id, status, step_index, snapshot, reason, created_at FROM checkpoints"
@@ -283,6 +313,7 @@ class SQLiteStorage:
         ).fetchone()
         return Checkpoint.from_dict(_row_to_dict(row, _CKPT_COLS)) if row else None
 
+    @_threadsafe
     def list_checkpoints(self, task_id: str) -> list[Checkpoint]:
         rows = self._conn.execute(
             "SELECT id, task_id, status, step_index, snapshot, reason, created_at FROM checkpoints"
@@ -293,6 +324,7 @@ class SQLiteStorage:
 
     # ---- audit events ----
 
+    @_threadsafe
     def append_event(self, event: AuditEvent) -> None:
         self._conn.execute(
             "INSERT INTO audit_events (id, ts, task_id, step_id, kind, actor, success, detail) VALUES (?,?,?,?,?,?,?,?)",
@@ -300,6 +332,7 @@ class SQLiteStorage:
         )
         self._conn.commit()
 
+    @_threadsafe
     def list_events(self, task_id: str | None = None) -> list[AuditEvent]:
         if task_id:
             rows = self._conn.execute(
@@ -315,6 +348,7 @@ class SQLiteStorage:
 
     # ---- EventSink protocol (observability -> storage) ----
 
+    @_threadsafe
     def emit(self, event: AuditEvent) -> None:
         """Implement EventSink so the EventLogger can persist events directly."""
         self.append_event(event)
@@ -328,6 +362,7 @@ class SQLiteStorage:
         "decision_actor", "decided_at", "expired_at", "created_at", "updated_at",
     )
 
+    @_threadsafe
     def create_request(self, request: "ApprovalRequest") -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO approval_requests "
@@ -336,6 +371,7 @@ class SQLiteStorage:
         )
         self._conn.commit()
 
+    @_threadsafe
     def get_request(self, approval_id: str) -> "ApprovalRequest | None":
         row = self._conn.execute(
             f"SELECT {', '.join(self._APPROVAL_COLS)} FROM approval_requests WHERE approval_id=?",
@@ -343,6 +379,7 @@ class SQLiteStorage:
         ).fetchone()
         return _approval_from_row(row) if row else None
 
+    @_threadsafe
     def list_requests(self, status: str | None = None) -> list["ApprovalRequest"]:
         cols = ", ".join(self._APPROVAL_COLS)
         if status:
@@ -353,6 +390,7 @@ class SQLiteStorage:
             rows = self._conn.execute(f"SELECT {cols} FROM approval_requests ORDER BY created_at").fetchall()
         return [_approval_from_row(r) for r in rows]
 
+    @_threadsafe
     def update_request(self, request: "ApprovalRequest") -> None:
         request.updated_at = utcnow()
         self._conn.execute(
@@ -363,6 +401,7 @@ class SQLiteStorage:
         )
         self._conn.commit()
 
+    @_threadsafe
     def latest_request_for_step(self, task_id: str, step_index: int) -> "ApprovalRequest | None":
         row = self._conn.execute(
             f"SELECT {', '.join(self._APPROVAL_COLS)} FROM approval_requests"
@@ -378,6 +417,7 @@ class SQLiteStorage:
         "resource", "reason", "status", "created_at", "acknowledged_at", "acknowledged_by",
     )
 
+    @_threadsafe
     def create_recovery(self, recovery: "MutationRecovery") -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO mutation_recoveries "
@@ -386,6 +426,7 @@ class SQLiteStorage:
         )
         self._conn.commit()
 
+    @_threadsafe
     def get_recovery(self, recovery_id: str) -> "MutationRecovery | None":
         row = self._conn.execute(
             f"SELECT {', '.join(self._RECOVERY_COLS)} FROM mutation_recoveries WHERE recovery_id=?",
@@ -393,6 +434,7 @@ class SQLiteStorage:
         ).fetchone()
         return _recovery_from_row(row) if row else None
 
+    @_threadsafe
     def list_recoveries(self, status: str | None = None,
                         goal_id: str | None = None,
                         task_id: str | None = None) -> list["MutationRecovery"]:
@@ -414,6 +456,7 @@ class SQLiteStorage:
         ).fetchall()
         return [_recovery_from_row(r) for r in rows]
 
+    @_threadsafe
     def update_recovery(self, recovery: "MutationRecovery") -> None:
         self._conn.execute(
             "UPDATE mutation_recoveries SET status=?, acknowledged_at=?, acknowledged_by=?, "
@@ -430,6 +473,7 @@ class SQLiteStorage:
         "owner_id", "acquired_at", "expires_at",
     )
 
+    @_threadsafe
     def acquire(self, resource_kind: str, resource: str, capability: str,
                 action: str, owner_id: str, lease_seconds: float,
                 now: str | None = None,
@@ -547,6 +591,7 @@ class SQLiteStorage:
             self._conn.rollback()
             raise
 
+    @_threadsafe
     def release(self, lock_id: str, owner_id: str) -> bool:
         """Release a lock owned by `owner_id`. Returns True when this call
         removed the lock; False when it was already gone (idempotent for the
@@ -581,6 +626,7 @@ class SQLiteStorage:
             self._conn.rollback()
             raise
 
+    @_threadsafe
     def get(self, lock_id: str) -> "MutationLock | None":
         row = self._conn.execute(
             f"SELECT {', '.join(self._LOCK_COLS)} FROM mutation_locks WHERE lock_id=?",
@@ -588,6 +634,7 @@ class SQLiteStorage:
         ).fetchone()
         return _lock_from_row(row) if row else None
 
+    @_threadsafe
     def list(self, resource_kind: str | None = None,
              resource: str | None = None) -> list["MutationLock"]:
         cols = ", ".join(self._LOCK_COLS)
@@ -605,6 +652,7 @@ class SQLiteStorage:
         ).fetchall()
         return [_lock_from_row(r) for r in rows]
 
+    @_threadsafe
     def reclaim_expired(self, now: str | None = None,
                         resource_kind: str | None = None,
                         resource: str | None = None) -> list[str]:
@@ -647,6 +695,7 @@ class SQLiteStorage:
         "next_retry", "status", "created_at", "updated_at",
     )
 
+    @_threadsafe
     def enqueue_waiter(self, resource_kind: str, resource: str, task_id: str,
                        goal_id: str | None, step_index: int, deadline: str,
                        now: str | None = None) -> "LockWaiter":
@@ -697,6 +746,7 @@ class SQLiteStorage:
             self._conn.rollback()
             raise
 
+    @_threadsafe
     def get_waiter(self, waiter_id: str) -> "LockWaiter | None":
         row = self._conn.execute(
             f"SELECT {', '.join(self._WAITER_COLS)} FROM mutation_lock_waiters WHERE waiter_id=?",
@@ -704,6 +754,7 @@ class SQLiteStorage:
         ).fetchone()
         return _waiter_from_row(row) if row else None
 
+    @_threadsafe
     def peek_waiter(self, resource_kind: str, resource: str,
                     now: str | None = None) -> "LockWaiter | None":
         """The oldest ELIGIBLE waiter for a resource (FIFO head).
@@ -726,6 +777,7 @@ class SQLiteStorage:
         ).fetchone()
         return _waiter_from_row(row) if row else None
 
+    @_threadsafe
     def update_waiter(self, waiter_id: str, attempts: int | None = None,
                       next_retry: str | None = None) -> None:
         sets, params = [], []
@@ -744,6 +796,7 @@ class SQLiteStorage:
             f"UPDATE mutation_lock_waiters SET {', '.join(sets)} WHERE waiter_id=?", params)
         self._conn.commit()
 
+    @_threadsafe
     def dequeue_waiter(self, waiter_id: str, status: str = "acquired") -> bool:
         """Transition a queued waiter to a terminal status (acquired |
         timed_out | cancelled). Idempotent: a non-queued or unknown waiter
@@ -759,6 +812,7 @@ class SQLiteStorage:
         self._conn.commit()
         return cur.rowcount > 0
 
+    @_threadsafe
     def cancel_waiter_for_task(self, task_id: str, status: str = "cancelled") -> int:
         """Cancel every queued waiter of a task (task became terminal)."""
         from arion.state.locks import LockWaiterStatus
@@ -772,6 +826,7 @@ class SQLiteStorage:
         self._conn.commit()
         return cur.rowcount
 
+    @_threadsafe
     def reclaim_stale_waiters(self, now: str | None = None) -> list[str]:
         """Atomically mark expired queued waiters as timed_out. Idempotent:
         already-terminal waiters are never touched again."""
@@ -801,6 +856,7 @@ class SQLiteStorage:
             self._conn.rollback()
             raise
 
+    @_threadsafe
     def list_waiters(self, resource_kind: str | None = None,
                      resource: str | None = None,
                      status: str | None = None) -> list["LockWaiter"]:
@@ -822,6 +878,7 @@ class SQLiteStorage:
         ).fetchall()
         return [_waiter_from_row(r) for r in rows]
 
+    @_threadsafe
     def release_and_select_next(self, lock_id: str, owner_id: str,
                                 now: str | None = None) -> tuple[bool, "LockWaiter | None"]:
         """Atomically release a lock AND select the next eligible FIFO waiter.
@@ -883,6 +940,7 @@ class SQLiteStorage:
             self._conn.rollback()
             raise
 
+    @_threadsafe
     def close(self) -> None:
         self._conn.close()
 

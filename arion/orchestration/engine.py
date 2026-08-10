@@ -101,6 +101,8 @@ class ArionEngine:
         lock_wait_backoff_max: float = 2.0,
         lock_sleeper: Any | None = None,
         lock_wait_observer: Any | None = None,
+        max_concurrency: int = 1,
+        scheduler: Any | None = None,
     ):
         self.storage = storage
         self.registry = registry
@@ -149,6 +151,27 @@ class ArionEngine:
         self.lock_wait_backoff_max = max(0.0, float(lock_wait_backoff_max))
         self.lock_sleeper = lock_sleeper  # injectable sleeper for deterministic tests
         self.lock_wait_observer = lock_wait_observer  # observability-only callback (ADR-023)
+        # Bounded in-process step scheduler (ADR-024): default max_concurrency=1
+        # reproduces the historical sequential behavior. The scheduler is the
+        # ONLY source of worker lifecycle state; it is NOT an authorization
+        # authority - every dispatched step still passes live authorization +
+        # the durable mutation lock + FIFO queue before its capability runs.
+        from arion.orchestration.scheduler import StepScheduler
+
+        self.max_concurrency = max(1, int(max_concurrency))
+        self.scheduler = scheduler or StepScheduler(
+            max_concurrency=self.max_concurrency,
+            clock=(lock_clock if callable(lock_clock) else None),
+            sleeper=lock_sleeper,
+        )
+        # In-flight mutation locks held by THIS engine's running steps
+        # (ADR-024 dispatch: a step whose resource is already held by a
+        # running step of this task is not dispatched in the same round when
+        # waiting is disabled). Coordination only - never authorization.
+        import threading as _threading
+
+        self._inflight_locks: set[tuple[str, str]] = set()
+        self._inflight_lock = _threading.RLock()
         # The goal manager's lock_contention recheck resolves via the engine's
         # live lock store (the lock store is the only lock authority).
         if self.goal_manager is not None:
@@ -401,13 +424,22 @@ class ArionEngine:
                 "capability": step.capability, "action": step.action, "owner_id": owner,
                 "waited": False,
             })
+            self._track_inflight_lock(kind, resource, True)
             return lock, False
 
         # ---- bounded waiting + durable FIFO queue (ADR-022/023) ----
 
         # Waiting budget: preserve across restarts (never reset). A fresh wait
-        # session (different resource or no prior metadata) starts a new one.
-        prior = task.lock_wait if (task.lock_wait or {}).get("resource") == resource else None
+        # session (different resource, a DIFFERENT step of the same task, or
+        # no prior metadata) starts a new one. task.lock_wait is a single
+        # task-level slot: under ADR-024 concurrent dispatch two steps of the
+        # same task may wait on the same resource at once, so waiter identity
+        # is scoped per STEP (step_index in the metadata) - a step can never
+        # reuse a sibling's waiter row.
+        prior = None
+        if (task.lock_wait or {}).get("resource") == resource \
+                and (task.lock_wait or {}).get("step_index") == step.index:
+            prior = task.lock_wait
         deadline = prior.get("deadline") if prior else None
         attempts = int(prior.get("attempts", 0)) if prior else 0
         now0 = self._lock_now()
@@ -470,17 +502,19 @@ class ArionEngine:
                     "waiter_id": waiter_id,
                     "waited": attempts > 0,
                 })
+                self._track_inflight_lock(kind, resource, True)
                 return lock, attempts > 0
             except MutationLockError:
                 # bounded waiting: persist + backoff, then retry coordination
                 # (never the mutation/plan/approval)
                 attempts += 1
                 backoff = min(
-                    self.lock_wait_backoff_base * (2 ** (attempts - 1)),
+                    self.lock_wait_backoff_base * (2 ** min(attempts - 1, 20)),
                     self.lock_wait_backoff_max,
                 )
                 next_retry = _iso_plus(now, backoff)
                 task.lock_wait = {
+                    "step_index": step.index,
                     "resource_kind": kind,
                     "resource": resource,
                     "waiter_id": waiter_id,
@@ -620,6 +654,24 @@ class ArionEngine:
             blocker["waiter_id"] = waiter_id
         self._set_lock_blocker(task.goal_id or "", blocker)
 
+    def _track_inflight_lock(self, resource_kind: str | None, resource: str | None,
+                             acquired: bool) -> None:
+        """Track which canonical resources THIS engine's running steps hold
+        (ADR-024 dispatch). Coordination only - never authorization; the
+        durable lock store remains the sole lock authority."""
+        if not resource_kind or not resource:
+            return
+        with self._inflight_lock:
+            key = (resource_kind, resource)
+            if acquired:
+                self._inflight_locks.add(key)
+            else:
+                self._inflight_locks.discard(key)
+
+    def _inflight_lock_held(self, resource_kind: str | None, resource: str | None) -> bool:
+        with self._inflight_lock:
+            return (resource_kind, resource) in self._inflight_locks
+
     def _revalidate_before_mutation(self, task: Task, step: PlanStep, spec,
                                     waited: bool) -> bool:
         """Re-check LIVE authorization immediately before mutating (ADR-022).
@@ -708,6 +760,7 @@ class ArionEngine:
                 "action": lock.action,
                 "owner_id": lock.owner_id,
             })
+            self._track_inflight_lock(lock.resource_kind, lock.resource, False)
         except Exception as exc:
             self._emit("error", task_id=task.id, step_id=_step_id(step), success=False,
                        detail={"error": f"lock release failed: {exc}"})
@@ -828,6 +881,14 @@ class ArionEngine:
                     pass
                 return False
         return False
+
+    def shutdown(self, timeout: float = 30.0) -> None:
+        """Stop the in-process step scheduler (ADR-024): no new work is
+        accepted, queued (not-running) work is cancelled, bounded active
+        workers are joined. After shutdown returns, no worker thread may
+        continue mutating. Idempotent."""
+        if getattr(self, "scheduler", None) is not None:
+            self.scheduler.shutdown(timeout=timeout)
 
     # ---------- approval expiry (ADR-019) ----------
 
@@ -1493,63 +1554,110 @@ class ArionEngine:
                 self._record_memory(task)
                 return task
 
+        # ADR-024: dependency-aware concurrent dispatch. The scheduler runs
+        # ready steps on bounded workers; every dispatched step still goes
+        # through the FULL per-step pipeline (live authorization -> approval
+        # -> durable mutation lock -> FIFO queue -> capability -> verify),
+        # so concurrency never grants authorization. max_concurrency=1
+        # reproduces the historical sequential behavior exactly.
+        self._skipped_emitted = getattr(self, "_skipped_emitted", set())
         while True:
-            step = task.active_step
-            if step is None:
-                # Walked past the last step: every step was either executed or
-                # explicitly skipped, so the task reaches a terminal state.
-                skipped = sum(1 for s in task.steps if s.status == StepStatus.SKIPPED)
+            # emit step.skipped provenance for skipped steps we walk past
+            for st in task.steps:
+                if st.status == StepStatus.SKIPPED and (task.id, st.index) not in self._skipped_emitted:
+                    self._skipped_emitted.add((task.id, st.index))
+                    self._emit("step.skipped", task_id=task.id, step_id=_step_id(st), detail={
+                        "reason": st.skipped_reason or "skipped", "guidance": st.guidance[:5],
+                    })
+
+            pending = [i for i, st in enumerate(task.steps) if st.status == StepStatus.PENDING]
+            if not pending:
+                # every step handled -> terminal COMPLETED (existing semantics)
+                skipped = sum(1 for st in task.steps if st.status == StepStatus.SKIPPED)
                 task.status = TaskStatus.COMPLETED
                 task.completed_at = utcnow()
                 self.storage.save_task(task)
                 self._checkpoint(task, reason="task completed")
-                self._emit(
-                    "task.completed",
-                    task_id=task.id,
-                    detail={"steps": len(task.steps), "skipped_steps": skipped},
-                )
+                self._emit("task.completed", task_id=task.id,
+                           detail={"steps": len(task.steps), "skipped_steps": skipped})
                 self._record_memory(task)
-                # ADR-023: a terminal task must never remain an eligible
-                # waiter; cancel any queued waiter rows it still owns.
                 self._cancel_waiters_for_task(task)
                 return task
 
-            if step.status == StepStatus.SKIPPED:
-                # Explicitly skipped step (memory guidance): never executed,
-                # audited with its provenance, terminal for dependency purposes.
-                self._emit(
-                    "step.skipped",
-                    task_id=task.id,
-                    step_id=_step_id(step),
-                    detail={
-                        "reason": step.skipped_reason or "skipped",
-                        "guidance": step.guidance[:5],
-                    },
-                )
-            else:
-                task.status = TaskStatus.RUNNING
-                self._execute_step(task, step)
+            cursor = min(pending)
+            task.current_step = cursor
 
-                if step.status == StepStatus.PENDING and task.status == TaskStatus.AWAITING_APPROVAL:
-                    self._checkpoint(task, reason="awaiting approval")
-                    self.storage.save_task(task)
-                    return task
+            # The cursor step is ALWAYS dispatched (this is how approvals get
+            # requested and the serial path behaves). Additional ready steps
+            # are dispatched when: all dependencies are terminal-success or
+            # explicitly SKIPPED, no self-lock collision (waiting disabled),
+            # and the live policy decision is not REQUIRE_APPROVAL-without-
+            # an-existing-approved-record (such a step waits for the cursor).
+            dispatch = [cursor]
+            chosen_resources: set[tuple[str, str]] = set()
+            cursor_spec = self.registry.action_spec(task.steps[cursor].capability, task.steps[cursor].action)
+            if cursor_spec is not None:
+                ck, cr = self._lock_canonical(cursor_spec, task.steps[cursor])
+                if ck and cr:
+                    chosen_resources.add((ck, cr))
+            for i in pending:
+                if i == cursor:
+                    continue
+                step = task.steps[i]
+                if not self._step_deps_terminal(task, step):
+                    continue
+                spec = self.registry.action_spec(step.capability, step.action)
+                if spec is None:
+                    dispatch.append(i)  # will fail fast inside _execute_step
+                    continue
+                if getattr(spec, "side_effects", "read_only") == "mutating":
+                    k, r = self._lock_canonical(spec, step)
+                    if k and r:
+                        key = (k, r)
+                        if self.lock_wait_max_seconds <= 0:
+                            # waiting disabled: never dispatch two same-resource
+                            # mutators in one round (the second would fail
+                            # instantly at acquire)
+                            if key in chosen_resources or self._inflight_lock_held(k, r):
+                                continue
+                        chosen_resources.add(key)
+                request = self._build_authz_request(task, step, spec)
+                decision = self.policy.decide(request)
+                if (decision.outcome == PolicyOutcome.REQUIRE_APPROVAL
+                        and not self._step_has_approved_record(task, step, spec)):
+                    continue  # leave pending; handled when it becomes the cursor
+                dispatch.append(i)
 
+            dispatch = dispatch[: self.max_concurrency]
+            task.status = TaskStatus.RUNNING
+            for i in dispatch:
+                step = task.steps[i]
+                self.scheduler.enqueue(
+                    f"{task.id}:{i}", task.id, i,
+                    (lambda s=step: self._run_step_worker(task, s)))
+            self.scheduler.run_until_done()
+
+            self.storage.save_task(task)
+
+            cstep = task.steps[cursor]
+            if cstep.status == StepStatus.PENDING and task.status == TaskStatus.AWAITING_APPROVAL:
+                # cursor paused on approval: durable stop, exact-step resume
+                self._checkpoint(task, reason="awaiting approval")
                 self.storage.save_task(task)
-
-                if step.status == StepStatus.FAILED:
-                    task.status = TaskStatus.FAILED
-                    task.error = step.error or "step failed"
-                    task.completed_at = utcnow()
-                    self.storage.save_task(task)
-                    # ADR-023: a terminal task must never remain an eligible
-                    # waiter; cancel any queued waiter rows it still owns.
-                    self._cancel_waiters_for_task(task)
-                    self._emit("task.failed", task_id=task.id, detail={"step_index": step.index, "error": task.error})
-                    self._record_memory(task)
-                    return task
-
-            task.current_step += 1
+                return task
+            if cstep.status == StepStatus.FAILED or any(
+                    task.steps[i].status == StepStatus.FAILED for i in dispatch):
+                failed_step = next((task.steps[i] for i in dispatch
+                                    if task.steps[i].status == StepStatus.FAILED), cstep)
+                task.status = TaskStatus.FAILED
+                task.error = failed_step.error or "step failed"
+                task.completed_at = utcnow()
+                self.storage.save_task(task)
+                self._cancel_waiters_for_task(task)
+                self._emit("task.failed", task_id=task.id,
+                           detail={"step_index": failed_step.index, "error": task.error})
+                self._record_memory(task)
+                return task
             self._checkpoint(task, reason="step completed")
 
         if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
@@ -1658,6 +1766,44 @@ class ArionEngine:
             )
         self._checkpoint(task, reason="plan produced")
         return task
+
+    def _step_deps_terminal(self, task: Task, step: PlanStep) -> bool:
+        """ADR-024 readiness: a step may be dispatched only when every
+        prerequisite is terminal-success or explicitly SKIPPED (existing
+        semantics). Dependencies are authoritative - the scheduler never
+        bypasses them."""
+        for ref in (step.depends_on or []):
+            if 0 <= ref < len(task.steps):
+                st = task.steps[ref].status
+                if st not in (StepStatus.SUCCEEDED, StepStatus.SKIPPED):
+                    return False
+        return True
+
+    def _step_has_approved_record(self, task: Task, step: PlanStep, spec) -> bool:
+        """True when this step already has an APPROVED record whose canonical
+        fingerprint still matches the LIVE spec (stale records never count)."""
+        rec = self._approved_record_for(task, step.index)
+        if rec is None:
+            return False
+        try:
+            request = self._build_authz_request(task, step, spec)
+            return self._authz_fingerprint(request) == rec.get("fingerprint")
+        except Exception:
+            return False
+
+    def _run_step_worker(self, task: Task, step: PlanStep) -> None:
+        """Execute one step on a scheduler worker (ADR-024 Phase D).
+
+        Terminal per-step status is persisted IMMEDIATELY after the step
+        finishes, so a crash mid-round (or process kill) never replays a
+        completed mutation on restart: the durable per-step state is the
+        unit of restart, not the whole round. Bounded metadata only - the
+        task snapshot is the pre-existing durable record (step ids, statuses,
+        timestamps); no thread objects, stack traces, capability outputs or
+        model output are ever persisted."""
+        self._execute_step(task, step)
+        if step.status in (StepStatus.SUCCEEDED, StepStatus.FAILED, StepStatus.SKIPPED):
+            self.storage.save_task(task)
 
     def _execute_step(self, task: Task, step: PlanStep) -> None:
         self._emit(
