@@ -100,6 +100,7 @@ class ArionEngine:
         lock_wait_backoff_base: float = 0.25,
         lock_wait_backoff_max: float = 2.0,
         lock_sleeper: Any | None = None,
+        lock_wait_observer: Any | None = None,
     ):
         self.storage = storage
         self.registry = registry
@@ -147,6 +148,7 @@ class ArionEngine:
         self.lock_wait_backoff_base = max(0.0, float(lock_wait_backoff_base))
         self.lock_wait_backoff_max = max(0.0, float(lock_wait_backoff_max))
         self.lock_sleeper = lock_sleeper  # injectable sleeper for deterministic tests
+        self.lock_wait_observer = lock_wait_observer  # observability-only callback (ADR-023)
         # The goal manager's lock_contention recheck resolves via the engine's
         # live lock store (the lock store is the only lock authority).
         if self.goal_manager is not None:
@@ -352,6 +354,13 @@ class ArionEngine:
         durably on the task and survives restarts without resetting the retry
         budget. Deadline expiry raises MutationLockTimeoutError (typed).
 
+        ADR-023: with bounded waiting, the task first joins a DURABLE FIFO
+        queue for the canonical resource. The queue decides who gets the
+        OPPORTUNITY to acquire (oldest eligible waiter first) - it can never
+        grant authorization. Acquisition is head-gated atomically inside the
+        store, so a newer waiter can never overtake an older one, and the
+        queue position survives restarts.
+
         Returns (lock, waited): `waited` is True when this session contended
         at least once before acquiring (callers must re-validate live
         authorization in that case). Raises MutationLockError on contention
@@ -364,13 +373,6 @@ class ArionEngine:
         if kind is None or resource is None:
             return None, False  # no lockable resource (e.g. non-resource mutation)
 
-        # Waiting budget: preserve across restarts (never reset). A fresh wait
-        # session (different resource or no prior metadata) starts a new one.
-        prior = task.lock_wait if (task.lock_wait or {}).get("resource") == resource else None
-        deadline = prior.get("deadline") if prior else None
-        attempts = int(prior.get("attempts", 0)) if prior else 0
-        waited = prior is not None
-
         self._emit("mutation.lock.requested", task_id=task.id, step_id=_step_id(step), detail={
             "resource_kind": kind,
             "resource": resource,
@@ -379,33 +381,78 @@ class ArionEngine:
         })
         owner = self._lock_owner()
 
-        while True:
-            now = self._lock_now()
-            if self.lock_wait_max_seconds > 0:
-                if deadline is None:
-                    deadline = _iso_plus(now, self.lock_wait_max_seconds)
-                if now >= deadline:
-                    # durable, typed, explainable timeout - coordination only
-                    self._fail_lock_wait_timeout(task, step, kind, resource, deadline, attempts, owner)
-                    raise MutationLockTimeoutError(
-                        f"mutation lock wait timed out for {kind!r} {resource!r} "
-                        f"(deadline {deadline}, attempts {attempts})"
-                    )
+        # Waiting disabled: immediate, durable contention failure (ADR-021
+        # semantics preserved - no queue, no waiter rows).
+        if self.lock_wait_max_seconds <= 0:
             try:
-                # reclaim any already-expired rows for this resource (bounded,
-                # atomic inside the store's transaction) and audit.
-                reclaimed = self.mutation_lock_store.reclaim_expired(
-                    now=now, resource_kind=kind, resource=resource)
-                for lock_id in reclaimed:
-                    self._emit("mutation.lock.reclaimed", task_id=task.id,
-                               step_id=_step_id(step), detail={
-                                   "lock_id": lock_id, "resource_kind": kind,
-                                   "resource": resource, "reason": "stale lease expired",
-                               })
                 lock = self.mutation_lock_store.acquire(
                     kind, resource, step.capability, step.action, owner,
-                    lease_seconds=self.mutation_lock_lease_seconds, now=now)
-                # success: clear the durable wait state + goal blocker
+                    lease_seconds=self.mutation_lock_lease_seconds,
+                    now=self._lock_now())
+            except MutationLockError:
+                self._emit("mutation.lock.contended", task_id=task.id,
+                           step_id=_step_id(step), success=False, detail={
+                               "resource_kind": kind, "resource": resource,
+                               "capability": step.capability, "action": step.action,
+                           })
+                raise
+            self._emit("mutation.lock.acquired", task_id=task.id, step_id=_step_id(step), detail={
+                "lock_id": lock.lock_id, "resource_kind": kind, "resource": resource,
+                "capability": step.capability, "action": step.action, "owner_id": owner,
+                "waited": False,
+            })
+            return lock, False
+
+        # ---- bounded waiting + durable FIFO queue (ADR-022/023) ----
+
+        # Waiting budget: preserve across restarts (never reset). A fresh wait
+        # session (different resource or no prior metadata) starts a new one.
+        prior = task.lock_wait if (task.lock_wait or {}).get("resource") == resource else None
+        deadline = prior.get("deadline") if prior else None
+        attempts = int(prior.get("attempts", 0)) if prior else 0
+        now0 = self._lock_now()
+        if deadline is None:
+            deadline = _iso_plus(now0, self.lock_wait_max_seconds)
+
+        # Durable queue membership: reuse the persisted waiter on restart
+        # (position preserved); otherwise enqueue a new one atomically.
+        waiter_id = prior.get("waiter_id") if prior else None
+        waiter = None
+        if waiter_id is not None:
+            waiter = self.mutation_lock_store.get_waiter(waiter_id)
+            if waiter is None or waiter.status.value != "queued":
+                waiter = None  # stale/terminal: enqueue fresh
+        if waiter is None:
+            waiter = self.mutation_lock_store.enqueue_waiter(
+                kind, resource, task.id, task.goal_id, step.index, deadline, now=now0)
+            waiter_id = waiter.waiter_id
+            self._emit("mutation.lock.queued", task_id=task.id, step_id=_step_id(step),
+                       success=False, detail={
+                           "waiter_id": waiter.waiter_id,
+                           "resource_kind": kind, "resource": resource,
+                           "capability": step.capability, "action": step.action,
+                           "position": waiter.seq, "deadline": deadline,
+                       })
+
+        while True:
+            now = self._lock_now()
+            if now >= deadline:
+                # durable, typed, explainable timeout - coordination only
+                self.mutation_lock_store.dequeue_waiter(waiter_id, "timed_out")
+                self._fail_lock_wait_timeout(task, step, kind, resource, deadline,
+                                             attempts, owner, waiter_id)
+                raise MutationLockTimeoutError(
+                    f"mutation lock wait timed out for {kind!r} {resource!r} "
+                    f"(deadline {deadline}, attempts {attempts})"
+                )
+            try:
+                lock = self.mutation_lock_store.acquire(
+                    kind, resource, step.capability, step.action, owner,
+                    lease_seconds=self.mutation_lock_lease_seconds,
+                    now=now, waiter_id=waiter_id)
+                # success: leave the queue, clear the durable wait state +
+                # goal blocker
+                self.mutation_lock_store.dequeue_waiter(waiter_id, "acquired")
                 task.lock_wait = None
                 if self.goal_manager is not None and task.goal_id:
                     try:
@@ -420,22 +467,14 @@ class ArionEngine:
                     "capability": step.capability,
                     "action": step.action,
                     "owner_id": owner,
-                    "waited": waited or attempts > 0,
+                    "waiter_id": waiter_id,
+                    "waited": attempts > 0,
                 })
-                return lock, bool(waited or attempts > 0)
+                return lock, attempts > 0
             except MutationLockError:
-                if self.lock_wait_max_seconds <= 0:
-                    # waiting disabled: immediate, durable contention failure
-                    # (ADR-021 semantics preserved)
-                    self._emit("mutation.lock.contended", task_id=task.id,
-                               step_id=_step_id(step), success=False, detail={
-                                   "resource_kind": kind, "resource": resource,
-                                   "capability": step.capability, "action": step.action,
-                               })
-                    raise
                 # bounded waiting: persist + backoff, then retry coordination
+                # (never the mutation/plan/approval)
                 attempts += 1
-                waited = True
                 backoff = min(
                     self.lock_wait_backoff_base * (2 ** (attempts - 1)),
                     self.lock_wait_backoff_max,
@@ -444,16 +483,23 @@ class ArionEngine:
                 task.lock_wait = {
                     "resource_kind": kind,
                     "resource": resource,
+                    "waiter_id": waiter_id,
+                    "position": waiter.seq,
                     "deadline": deadline,
                     "attempts": attempts,
                     "next_retry": next_retry,
                 }
-                self._persist_lock_wait(task, step, kind, resource, deadline, attempts, next_retry)
+                self.mutation_lock_store.update_waiter(waiter_id,
+                                                       attempts=attempts,
+                                                       next_retry=next_retry)
+                self._persist_lock_wait(task, step, kind, resource, deadline,
+                                        attempts, next_retry, waiter_id, waiter.seq)
                 if attempts == 1:
                     self._emit("mutation.lock.waiting", task_id=task.id,
                                step_id=_step_id(step), success=False, detail={
                                    "resource_kind": kind, "resource": resource,
                                    "capability": step.capability, "action": step.action,
+                                   "waiter_id": waiter_id, "position": waiter.seq,
                                    "deadline": deadline, "next_retry": next_retry,
                                })
                 else:
@@ -461,24 +507,64 @@ class ArionEngine:
                                step_id=_step_id(step), success=False, detail={
                                    "resource_kind": kind, "resource": resource,
                                    "capability": step.capability, "action": step.action,
+                                   "waiter_id": waiter_id, "position": waiter.seq,
                                    "attempt": attempts, "deadline": deadline,
                                    "backoff_seconds": backoff, "next_retry": next_retry,
                                })
+                self._notify_lock_wait_observer(waiter_id, waiter.seq, kind, resource,
+                                                task.id, task.goal_id, attempts, deadline,
+                                                next_retry)
                 # NEVER sleep inside a SQLite transaction: the store's acquire
                 # already committed/rolled back before we got here.
                 self._lock_sleep(backoff)
 
+    def _cancel_waiters_for_task(self, task: Task) -> None:
+        """Best-effort: cancel any queued FIFO waiters owned by a terminal
+        task so a finished task can never block the queue (ADR-023)."""
+        if self.mutation_lock_store is None or not hasattr(self.mutation_lock_store, "cancel_waiter_for_task"):
+            return
+        try:
+            self.mutation_lock_store.cancel_waiter_for_task(task.id, "cancelled")
+        except Exception:
+            pass
+
+    def _notify_lock_wait_observer(self, waiter_id: str, position: int, kind: str,
+                                   resource: str, task_id: str, goal_id: str | None,
+                                   attempts: int, deadline: str, next_retry: str) -> None:
+        """Observability-only callback (ADR-023): lets a host process (e.g. a
+        demo subprocess) observe that a task is waiting, with bounded queue
+        metadata. Never affects coordination or authorization."""
+        if self.lock_wait_observer is None:
+            return
+        try:
+            self.lock_wait_observer({
+                "waiter_id": waiter_id,
+                "position": position,
+                "resource_kind": kind,
+                "resource": resource,
+                "task_id": task_id,
+                "goal_id": goal_id,
+                "attempts": attempts,
+                "deadline": deadline,
+                "next_retry": next_retry,
+            })
+        except Exception:
+            pass
+
     def _persist_lock_wait(self, task: Task, step: PlanStep, kind: str, resource: str,
-                           deadline: str, attempts: int, next_retry: str) -> None:
+                           deadline: str, attempts: int, next_retry: str,
+                           waiter_id: str | None = None,
+                           position: int | None = None) -> None:
         """Durably persist the waiting state (task row + goal blocker + a
-        checkpoint) so a restart resumes with the SAME budget/deadline."""
+        checkpoint) so a restart resumes with the SAME budget/deadline and
+        FIFO queue position."""
         try:
             self.storage.save_task(task)
             self._checkpoint(task, reason="waiting for mutation lock")
         except Exception as exc:
             self._emit("error", task_id=task.id, step_id=_step_id(step), success=False,
                        detail={"error": f"persist lock wait failed: {exc}"})
-        self._set_lock_blocker(task.goal_id or "", {
+        blocker = {
             "task_id": task.id,
             "step_index": step.index,
             "capability": step.capability,
@@ -489,11 +575,16 @@ class ArionEngine:
             "attempts": attempts,
             "next_retry": next_retry,
             "reason": "mutation resource is locked by another owner; waiting (bounded)",
-        })
+        }
+        if waiter_id:
+            blocker["waiter_id"] = waiter_id
+        if position is not None:
+            blocker["position"] = position
+        self._set_lock_blocker(task.goal_id or "", blocker)
 
     def _fail_lock_wait_timeout(self, task: Task, step: PlanStep, kind: str,
                                 resource: str, deadline: str, attempts: int,
-                                owner: str) -> None:
+                                owner: str, waiter_id: str | None = None) -> None:
         """Durable, explainable timeout state: the step/task FAIL with a typed
         reason, the goal keeps an explainable lock_contention blocker (cleared
         when the lock is eventually released so the goal can replan), and NO
@@ -513,7 +604,7 @@ class ArionEngine:
                        "capability": step.capability, "action": step.action,
                        "deadline": deadline, "attempts": attempts,
                    })
-        self._set_lock_blocker(task.goal_id or "", {
+        blocker = {
             "task_id": task.id,
             "step_index": step.index,
             "capability": step.capability,
@@ -524,7 +615,10 @@ class ArionEngine:
             "attempts": attempts,
             "reason": "mutation lock wait timed out (deadline "
                       f"{deadline}, attempts {attempts})",
-        })
+        }
+        if waiter_id:
+            blocker["waiter_id"] = waiter_id
+        self._set_lock_blocker(task.goal_id or "", blocker)
 
     def _revalidate_before_mutation(self, task: Task, step: PlanStep, spec,
                                     waited: bool) -> bool:
@@ -591,12 +685,21 @@ class ArionEngine:
 
     def _release_mutation_lock(self, lock, task: Task, step: PlanStep) -> None:
         """Release the advisory lock after the mutation window (idempotent).
+
+        ADR-023: release + next-waiter selection is ATOMIC at the SQLite layer
+        (release_and_select_next) - the next FIFO waiter is selected in the
+        same transaction, so there is no check-then-act race on handoff.
+
         Never fails the task: a stuck release must not mask the mutation's
         own outcome, but it is audited loudly."""
         if lock is None or self.mutation_lock_store is None:
             return
         try:
-            self.mutation_lock_store.release(lock.lock_id, lock.owner_id)
+            if hasattr(self.mutation_lock_store, "release_and_select_next"):
+                self.mutation_lock_store.release_and_select_next(
+                    lock.lock_id, lock.owner_id, now=self._lock_now())
+            else:
+                self.mutation_lock_store.release(lock.lock_id, lock.owner_id)
             self._emit("mutation.lock.released", task_id=task.id, step_id=_step_id(step), detail={
                 "lock_id": lock.lock_id,
                 "resource_kind": lock.resource_kind,
@@ -1406,6 +1509,9 @@ class ArionEngine:
                     detail={"steps": len(task.steps), "skipped_steps": skipped},
                 )
                 self._record_memory(task)
+                # ADR-023: a terminal task must never remain an eligible
+                # waiter; cancel any queued waiter rows it still owns.
+                self._cancel_waiters_for_task(task)
                 return task
 
             if step.status == StepStatus.SKIPPED:
@@ -1436,6 +1542,9 @@ class ArionEngine:
                     task.error = step.error or "step failed"
                     task.completed_at = utcnow()
                     self.storage.save_task(task)
+                    # ADR-023: a terminal task must never remain an eligible
+                    # waiter; cancel any queued waiter rows it still owns.
+                    self._cancel_waiters_for_task(task)
                     self._emit("task.failed", task_id=task.id, detail={"step_index": step.index, "error": task.error})
                     self._record_memory(task)
                     return task

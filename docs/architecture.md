@@ -473,6 +473,42 @@ loop (ADR-016):
 - **Demo:** `scripts/demo_adr022_lock_wait.py` (two real subprocesses:
   wait→success, timeout, stale-authorization; offline).
 
+## Fair, Durable Mutation-Lock Wait Queues (ADR-023)
+
+- **Durable FIFO wait queue** (`mutation_lock_waiters` table): every waiter
+  gets a durable position (seq) per canonical resource, assigned atomically
+  (`1 + MAX(seq)` inside `BEGIN IMMEDIATE`); rows are append/audit-safe
+  (queued → acquired | timed_out | cancelled, never deleted) and carry only
+  bounded identifiers/timestamps (task/goal/step, resource, enqueue time,
+  position, deadline, attempts, status).
+- **Head-gated acquisition:** `acquire(waiter_id=...)` succeeds only for the
+  oldest ELIGIBLE waiter (queued + deadline not passed + task not terminal,
+  checked inside the same transaction as the lock insert) — a newer waiter
+  can never overtake an older one; acquire + dequeue is atomic; expired
+  waiters are marked timed_out durably even when the acquire fails.
+- **Release handoff is atomic:** `release_and_select_next` deletes the lock
+  and selects the next eligible head in ONE transaction (no check-then-act
+  race); the engine uses it on every release.
+- **Engine:** with bounded waiting, the task joins the queue on first
+  contention and REUSES its waiter/position across restarts (deadline +
+  attempt budget preserved); timeout dequeues cleanly (typed
+  `MutationLockTimeoutError`, no mutation, no recovery); a terminal task
+  cancels its queued waiters. `task.lock_wait` + the goal blocker carry
+  waiter_id + position.
+- **Fairness is coordination, never authorization:** queue position is not in
+  the authorization fingerprint, policy, actor, ActionSpec, approval, or
+  recovery semantics; the lock store remains the sole lock/queue authority
+  and the live authorization layer remains the sole execution authority —
+  live re-validation still runs after every waited acquire.
+- **Audit:** `mutation.lock.queued` added to the lock vocabulary (requested →
+  queued → waiting → retry → acquired → released).
+- **CLI:** `arion locks waiters` shows position/waiter_id/status;
+  `arion locks queue <resource>` shows the durable queue (all statuses);
+  `show <id>` resolves lock/waiter/task ids; nothing grants or transfers
+  ownership; unknown ids fail closed.
+- **Demo:** `scripts/demo_adr023_lock_fairness.py` (real subprocesses:
+  FIFO handoff, restart survival, timeout, live re-authz, adversarial).
+
 ## Structured intelligence boundary (ADR-011)
 
 ```
@@ -546,7 +582,9 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/arion locks reclaim <lock_id> # expired locks only; never authorizes
 .venv/bin/python scripts/demo_adr021_lock_two_process.py  # two-process lock demo (offline)
 .venv/bin/python scripts/demo_adr022_lock_wait.py         # bounded lock-wait demo A-C (offline)
-.venv/bin/arion locks waiters        # tasks waiting (bounded) on mutation locks (ADR-022)
+.venv/bin/python scripts/demo_adr023_lock_fairness.py     # fair lock-wait queue demo A-E (offline)
+.venv/bin/arion locks waiters        # tasks waiting (bounded) on mutation locks (ADR-022/023)
+.venv/bin/arion locks queue <resource>  # durable FIFO wait queue for a resource (ADR-023)
 .venv/bin/python -m pytest
 ```
 

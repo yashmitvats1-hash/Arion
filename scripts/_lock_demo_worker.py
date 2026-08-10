@@ -98,7 +98,8 @@ class AlwaysFailWrite(FilesystemWriteCapability):
 
 
 def build_engine(db_path, sandbox, write_cap=None,
-                 wait_max=5.0, backoff_base=0.25, backoff_max=2.0):
+                 wait_max=5.0, backoff_base=0.25, backoff_max=2.0,
+                 observer=None):
     storage = SQLiteStorage(db_path)
     registry = CapabilityRegistry()
     registry.register(FilesystemReadCapability(sandbox))
@@ -124,6 +125,7 @@ def build_engine(db_path, sandbox, write_cap=None,
         lock_wait_max_seconds=wait_max,
         lock_wait_backoff_base=backoff_base,
         lock_wait_backoff_max=backoff_max,
+        lock_wait_observer=observer,
     )
     return engine, gm
 
@@ -164,6 +166,7 @@ def main() -> int:
     ap.add_argument("--lease", type=float, default=2.0)
     ap.add_argument("--goal", default=None)
     ap.add_argument("--wait-max", type=float, default=5.0)
+    ap.add_argument("--mark-queued", action="store_true", help="print QUEUED marker when entering the wait queue")
     ap.add_argument("--backoff-base", type=float, default=0.25)
     ap.add_argument("--backoff-max", type=float, default=2.0)
     args = ap.parse_args()
@@ -183,11 +186,24 @@ def main() -> int:
         return 0
 
     if args.mode == "wait-write":
-        # ADR-022: full pipeline with bounded lock-contention waiting; the
-        # engine waits in-process until the holder releases (or the deadline).
+        # ADR-022/023: full pipeline with bounded lock-contention waiting
+        # (durable FIFO queue); the engine waits in-process until the holder
+        # releases (or the deadline). With --mark-queued, prints a QUEUED
+        # marker line (JSON) the first time the task enters the wait queue.
+        observer = None
+        if getattr(args, "mark_queued", False):
+            marked = {"done": False}
+
+            def observer(info):
+                if marked["done"]:
+                    return
+                marked["done"] = True
+                print("QUEUED " + json.dumps(info), flush=True)
+
         engine, gm = build_engine(db, sb, wait_max=args.wait_max,
                                   backoff_base=args.backoff_base,
-                                  backoff_max=args.backoff_max)
+                                  backoff_max=args.backoff_max,
+                                  observer=observer)
         gid = args.goal or engine.submit_goal("write notes").id
         engine.run_goal(gid)
         _approve_pending(engine)
@@ -198,6 +214,7 @@ def main() -> int:
         last = tasks[-1] if tasks else None
         out = {
             "goal_id": gid,
+            "task_id": last.id if last else None,
             "goal_status": final.status.value if hasattr(final, "status") else str(final),
             "task_status": last.status.value if last else None,
             "task_error": last.error if last else None,

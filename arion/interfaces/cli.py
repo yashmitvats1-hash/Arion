@@ -172,7 +172,10 @@ def build_parser() -> argparse.ArgumentParser:
     locks_sub = locks.add_subparsers(dest="locks_command", required=True)
 
     locks_list = locks_sub.add_parser("list", help="list mutation locks", parents=[common, common_memory])
-    locks_waiters = locks_sub.add_parser("waiters", help="list tasks waiting (bounded) on mutation locks (ADR-022)", parents=[common, common_memory])
+    locks_waiters = locks_sub.add_parser("waiters", help="list tasks waiting (bounded) on mutation locks (ADR-022/023)", parents=[common, common_memory])
+    locks_queue = locks_sub.add_parser("queue", help="show the durable FIFO wait queue for a resource (ADR-023)", parents=[common, common_memory])
+    locks_queue.add_argument("resource")
+    locks_queue.add_argument("--kind", default="filesystem:path", help="resource kind (default filesystem:path)")
     locks_show = locks_sub.add_parser("show", help="show a mutation lock or waiter", parents=[common, common_memory])
     locks_show.add_argument("id")
 
@@ -276,21 +279,26 @@ def _locks_command(args, engine) -> int:
         else:
             print(obj)
 
-    def _waiters():
-        tasks = [t for t in engine.storage.list_tasks() if getattr(t, "lock_wait", None)]
+    def _waiters(status="queued"):
+        """Bounded ADR-023 waiters: the durable FIFO queue rows (status
+        queued) merged with the task's own persisted wait metadata."""
+        waiters = store.list_waiters(status=status) if hasattr(store, "list_waiters") else []
         out = []
-        for t in tasks:
-            lw = t.lock_wait or {}
+        for w in waiters:
+            task = engine.storage.load_task(w.task_id) if engine.storage else None
+            lw = (task.lock_wait or {}) if task else {}
             out.append({
                 "status": "waiting",
-                "task_id": t.id,
-                "goal_id": t.goal_id,
-                "step_index": t.current_step,
-                "resource_kind": lw.get("resource_kind"),
-                "resource": lw.get("resource"),
-                "attempts": lw.get("attempts"),
-                "deadline": lw.get("deadline"),
-                "next_retry": lw.get("next_retry"),
+                "task_id": w.task_id,
+                "goal_id": w.goal_id,
+                "step_index": w.step_index,
+                "resource_kind": w.resource_kind,
+                "resource": w.resource,
+                "waiter_id": w.waiter_id,
+                "position": w.seq,
+                "attempts": lw.get("attempts", w.attempts),
+                "deadline": lw.get("deadline", w.deadline),
+                "next_retry": lw.get("next_retry", w.next_retry),
             })
         return out
 
@@ -313,13 +321,30 @@ def _locks_command(args, engine) -> int:
             print("no tasks waiting on mutation locks")
             return 0
         for w in waiters:
-            print(f"task={w['task_id']}  waiting  {w['resource_kind']}/{w['resource']}  "
-                  f"attempts={w['attempts']}  deadline={w['deadline']}  "
+            print(f"task={w['task_id']}  waiting  pos={w['position']}  {w['resource_kind']}/{w['resource']}  "
+                  f"waiter={w['waiter_id']}  attempts={w['attempts']}  deadline={w['deadline']}  "
                   f"next_retry={w['next_retry']}" + (f"  goal={w['goal_id']}" if w["goal_id"] else ""))
         return 0
 
+    if args.locks_command == "queue":
+        # safe inspection of the durable FIFO queue for one resource (all
+        # statuses, oldest first); never grants or transfers anything.
+        rows = store.list_waiters(resource_kind=args.kind, resource=args.resource) \
+            if hasattr(store, "list_waiters") else []
+        if args.json:
+            _emit([r.to_dict() for r in rows])
+            return 0
+        if not rows:
+            print(f"no waiters for {args.kind} {args.resource}")
+            return 0
+        for r in rows:
+            print(f"pos={r.seq}  {r.status.value:<9} task={r.task_id}  waiter={r.waiter_id}  "
+                  f"deadline={r.deadline}  attempts={r.attempts}"
+                  + (f"  goal={r.goal_id}" if r.goal_id else ""))
+        return 0
+
     if args.locks_command == "show":
-        # show <id>: a lock id, or a task id with durable wait metadata
+        # show <id>: a lock id, a waiter id, or a task id with wait metadata
         lock = store.get(args.id)
         if lock is not None:
             if args.json:
@@ -330,6 +355,17 @@ def _locks_command(args, engine) -> int:
             print(f"  owner={lock.owner_id}")
             print(f"  acquired_at={lock.acquired_at}  expires_at={lock.expires_at}")
             return 0
+        waiter = store.get_waiter(args.id) if hasattr(store, "get_waiter") else None
+        if waiter is not None:
+            if args.json:
+                _emit(waiter.to_dict())
+                return 0
+            print(f"waiter {waiter.waiter_id}: {waiter.status.value} (pos {waiter.seq})")
+            print(f"  {waiter.resource_kind}/{waiter.resource}  task={waiter.task_id}"
+                  + (f"  goal={waiter.goal_id}" if waiter.goal_id else ""))
+            print(f"  enqueued_at={waiter.enqueued_at}  deadline={waiter.deadline}  "
+                  f"attempts={waiter.attempts}")
+            return 0
         waiter = next((w for w in _waiters() if w["task_id"] == args.id), None)
         if waiter is not None:
             if args.json:
@@ -337,6 +373,7 @@ def _locks_command(args, engine) -> int:
                 return 0
             print(f"task {waiter['task_id']}: waiting for mutation lock")
             print(f"  {waiter['resource_kind']}/{waiter['resource']}")
+            print(f"  pos={waiter['position']}  waiter={waiter['waiter_id']}")
             print(f"  attempts={waiter['attempts']}  deadline={waiter['deadline']}  "
                   f"next_retry={waiter['next_retry']}"
                   + (f"  goal={waiter['goal_id']}" if waiter["goal_id"] else ""))

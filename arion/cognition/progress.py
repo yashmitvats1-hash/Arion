@@ -159,6 +159,8 @@ class DeterministicProgressEvaluator:
                         "plan_version": t.plan_version,
                         "resource_kind": t.lock_wait.get("resource_kind"),
                         "resource": t.lock_wait.get("resource"),
+                        "waiter_id": t.lock_wait.get("waiter_id"),
+                        "position": t.lock_wait.get("position"),
                         "deadline": t.lock_wait.get("deadline"),
                         "attempts": t.lock_wait.get("attempts"),
                         "next_retry": t.lock_wait.get("next_retry"),

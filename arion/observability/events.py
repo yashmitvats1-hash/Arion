@@ -74,6 +74,7 @@ EVENT_KINDS = (
     "recovery.acknowledged",
     "planning.recovery.advisory",
     "mutation.lock.requested",
+    "mutation.lock.queued",
     "mutation.lock.acquired",
     "mutation.lock.contended",
     "mutation.lock.waiting",

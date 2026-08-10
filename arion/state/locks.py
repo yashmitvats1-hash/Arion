@@ -54,6 +54,70 @@ class MutationLockTimeoutError(MutationLockError):
     """
 
 
+class LockWaiterStatus(str, Enum):
+    """Durable states of one FIFO mutation-lock waiter (ADR-023).
+
+    The row is append/audit-safe: it is never deleted, only transitioned
+    queued -> acquired | timed_out | cancelled. Eligibility for lock
+    acquisition is exactly status == QUEUED (plus deadline/task checks).
+    """
+
+    QUEUED = "queued"
+    ACQUIRED = "acquired"     # this waiter won the lock (then released it)
+    TIMED_OUT = "timed_out"   # deadline elapsed while queued
+    CANCELLED = "cancelled"   # task became terminal while queued
+
+
+@dataclass
+class LockWaiter:
+    """One durable FIFO queue entry for a canonical mutation resource.
+
+    Fairness is COORDINATION, never authorization: the queue only decides who
+    gets the OPPORTUNITY to acquire the lock; the live authorization layer
+    still runs independently before every mutation. Metadata is bounded -
+    identifiers + timestamps only, never file contents/secrets.
+    """
+
+    waiter_id: str
+    resource_kind: str
+    resource: str          # canonical resource identifier
+    task_id: str
+    goal_id: str | None
+    step_index: int
+    seq: int               # durable FIFO position for this resource (1-based)
+    enqueued_at: str
+    deadline: str          # absolute wait deadline (injectable clock)
+    attempts: int = 0
+    next_retry: str | None = None
+    status: LockWaiterStatus = LockWaiterStatus.QUEUED
+    created_at: str = field(default_factory=utcnow)
+    updated_at: str = field(default_factory=utcnow)
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["status"] = self.status.value
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "LockWaiter":
+        return cls(
+            waiter_id=d["waiter_id"],
+            resource_kind=d["resource_kind"],
+            resource=d["resource"],
+            task_id=d["task_id"],
+            goal_id=d.get("goal_id"),
+            step_index=int(d.get("step_index", 0)),
+            seq=int(d.get("seq", 0)),
+            enqueued_at=d.get("enqueued_at", utcnow()),
+            deadline=d.get("deadline", utcnow()),
+            attempts=int(d.get("attempts", 0)),
+            next_retry=d.get("next_retry"),
+            status=LockWaiterStatus(d.get("status", LockWaiterStatus.QUEUED.value)),
+            created_at=d.get("created_at", utcnow()),
+            updated_at=d.get("updated_at", utcnow()),
+        )
+
+
 @dataclass
 class MutationLock:
     """One durable advisory lock on a canonical mutation resource.
@@ -130,11 +194,33 @@ class MutationLockStore(Protocol):
 
     def acquire(self, resource_kind: str, resource: str, capability: str,
                 action: str, owner_id: str, lease_seconds: float,
-                now: str | None = None) -> MutationLock: ...
+                now: str | None = None,
+                waiter_id: str | None = None) -> MutationLock: ...
     def release(self, lock_id: str, owner_id: str) -> bool: ...
+    def release_and_select_next(self, lock_id: str, owner_id: str,
+                                now: str | None = None) -> tuple[bool, "LockWaiter | None"]: ...
     def get(self, lock_id: str) -> MutationLock | None: ...
     def list(self, resource_kind: str | None = None,
              resource: str | None = None) -> list[MutationLock]: ...
     def reclaim_expired(self, now: str | None = None,
                         resource_kind: str | None = None,
                         resource: str | None = None) -> list[str]: ...
+
+    # ---- durable FIFO wait queue (ADR-023) ----
+
+    def enqueue_waiter(self, resource_kind: str, resource: str, task_id: str,
+                       goal_id: str | None, step_index: int, deadline: str,
+                       now: str | None = None) -> "LockWaiter": ...
+    def get_waiter(self, waiter_id: str) -> "LockWaiter | None": ...
+    def peek_waiter(self, resource_kind: str, resource: str,
+                    now: str | None = None) -> "LockWaiter | None": ...
+    def update_waiter(self, waiter_id: str, attempts: int | None = None,
+                      next_retry: str | None = None) -> None: ...
+    def dequeue_waiter(self, waiter_id: str,
+                       status: str = "acquired") -> bool: ...
+    def cancel_waiter_for_task(self, task_id: str,
+                               status: str = "cancelled") -> int: ...
+    def reclaim_stale_waiters(self, now: str | None = None) -> list[str]: ...
+    def list_waiters(self, resource_kind: str | None = None,
+                     resource: str | None = None,
+                     status: str | None = None) -> list["LockWaiter"]: ...

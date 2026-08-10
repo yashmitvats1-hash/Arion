@@ -11,10 +11,10 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Protocol
 
-from arion.state.models import Checkpoint, Goal, Task, new_id, utcnow
+from arion.state.models import Checkpoint, Goal, Task, TaskStatus, new_id, utcnow
 from arion.observability.events import AuditEvent
 from arion.state.recovery import MutationRecovery
-from arion.state.locks import MutationLock, MutationLockError
+from arion.state.locks import LockWaiter, LockWaiterStatus, MutationLock, MutationLockError
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS goals (
@@ -113,6 +113,24 @@ CREATE TABLE IF NOT EXISTS mutation_locks (
     UNIQUE(resource_kind, resource)
 );
 CREATE INDEX IF NOT EXISTS idx_locks_resource ON mutation_locks(resource_kind, resource);
+CREATE TABLE IF NOT EXISTS mutation_lock_waiters (
+    waiter_id     TEXT PRIMARY KEY,
+    resource_kind TEXT NOT NULL,
+    resource      TEXT NOT NULL,
+    task_id       TEXT NOT NULL,
+    goal_id       TEXT,
+    step_index    INTEGER NOT NULL,
+    seq           INTEGER NOT NULL,
+    enqueued_at   TEXT NOT NULL,
+    deadline      TEXT NOT NULL,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    next_retry    TEXT,
+    status        TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_waiters_resource ON mutation_lock_waiters(resource_kind, resource, status, seq);
+CREATE INDEX IF NOT EXISTS idx_waiters_task ON mutation_lock_waiters(task_id);
 """
 
 
@@ -414,7 +432,8 @@ class SQLiteStorage:
 
     def acquire(self, resource_kind: str, resource: str, capability: str,
                 action: str, owner_id: str, lease_seconds: float,
-                now: str | None = None) -> "MutationLock":
+                now: str | None = None,
+                waiter_id: str | None = None) -> "MutationLock":
         """Atomically acquire the advisory lock for a canonical resource.
 
         Cross-process safe: BEGIN IMMEDIATE takes the SQLite write lock so no
@@ -423,8 +442,16 @@ class SQLiteStorage:
         the resource); a live row fails the insert (UNIQUE constraint) and is
         rolled back into a typed MutationLockError. Never 'check then insert'
         outside a transaction.
+
+        ADR-023 fairness: when `waiter_id` is given, the caller may only
+        acquire when it is the HEAD of the durable FIFO queue for this
+        resource (oldest eligible waiter). Expired queued waiters are marked
+        timed_out and terminal-task waiters are skipped inside the same
+        transaction, so the head is always the oldest still-eligible waiter
+        and a newer waiter can never overtake it. Omitting `waiter_id`
+        preserves the ADR-021 immediate (non-queue) semantics.
         """
-        from arion.state.locks import MutationLock, MutationLockError, _add_seconds
+        from arion.state.locks import LockWaiter, LockWaiterStatus, MutationLock, MutationLockError, _add_seconds
 
         if now is None:
             now = utcnow()
@@ -439,8 +466,47 @@ class SQLiteStorage:
             acquired_at=now,
             expires_at=expires,
         )
+        # FIFO fairness (ADR-023): mark expired queued waiters for this
+        # resource as timed_out in their OWN committed transaction BEFORE the
+        # head check, so the hygiene update is durable even when the acquire
+        # below fails (a failed acquire rolls back only the head-check/lock
+        # insert, never the cleanup).
+        if waiter_id is not None:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._conn.execute(
+                    "UPDATE mutation_lock_waiters SET status=?, updated_at=? "
+                    "WHERE resource_kind=? AND resource=? AND status=? AND deadline <= ?",
+                    (LockWaiterStatus.TIMED_OUT.value, now, resource_kind, resource,
+                     LockWaiterStatus.QUEUED.value, now),
+                )
+                self._conn.commit()
+            except sqlite3.OperationalError as exc:
+                self._conn.rollback()
+                raise MutationLockError(
+                    f"could not clean stale waiters (database busy): {exc}") from exc
         try:
             self._conn.execute("BEGIN IMMEDIATE")
+            # FIFO fairness (ADR-023): the caller must be the HEAD of the
+            # durable FIFO queue for this resource (oldest eligible waiter).
+            # Terminal-task waiters are skipped via the JOIN; a newer waiter
+            # can never overtake an older one.
+            if waiter_id is not None:
+                head = self._conn.execute(
+                    "SELECT w.waiter_id FROM mutation_lock_waiters w "
+                    "JOIN tasks t ON t.id = w.task_id "
+                    "WHERE w.resource_kind=? AND w.resource=? AND w.status=? "
+                    "AND w.deadline > ? AND t.status NOT IN (?, ?) "
+                    "ORDER BY w.seq LIMIT 1",
+                    (resource_kind, resource, LockWaiterStatus.QUEUED.value, now,
+                     TaskStatus.COMPLETED.value, TaskStatus.FAILED.value),
+                ).fetchone()
+                if head is None or head[0] != waiter_id:
+                    self._conn.rollback()
+                    raise MutationLockError(
+                        f"mutation lock queue: not this waiter's turn "
+                        f"(waiter {waiter_id}) for {resource_kind!r} {resource!r}"
+                    )
             # reclaim any expired row for this exact resource (atomic with insert)
             self._conn.execute(
                 "DELETE FROM mutation_locks WHERE resource_kind=? AND resource=? AND expires_at <= ?",
@@ -451,6 +517,16 @@ class SQLiteStorage:
                 f"({', '.join(self._LOCK_COLS)}) VALUES ({', '.join('?' * len(self._LOCK_COLS))})",
                 _lock_row(lock),
             )
+            # the winning waiter leaves the queue in the SAME transaction:
+            # acquire + dequeue is atomic, so a concurrent peek can never see
+            # both a held lock AND a queued head for this waiter.
+            if waiter_id is not None:
+                self._conn.execute(
+                    "UPDATE mutation_lock_waiters SET status=?, updated_at=? "
+                    "WHERE waiter_id=? AND status=?",
+                    (LockWaiterStatus.ACQUIRED.value, now, waiter_id,
+                     LockWaiterStatus.QUEUED.value),
+                )
             self._conn.commit()
             return lock
         except sqlite3.IntegrityError as exc:
@@ -464,6 +540,9 @@ class SQLiteStorage:
             raise MutationLockError(
                 f"could not acquire mutation lock (database busy): {exc}"
             ) from exc
+        except MutationLockError:
+            self._conn.rollback()
+            raise
         except Exception:
             self._conn.rollback()
             raise
@@ -560,6 +639,250 @@ class SQLiteStorage:
             self._conn.rollback()
             raise
 
+    # ---- durable FIFO wait queue (ADR-023) ----
+
+    _WAITER_COLS = (
+        "waiter_id", "resource_kind", "resource", "task_id", "goal_id",
+        "step_index", "seq", "enqueued_at", "deadline", "attempts",
+        "next_retry", "status", "created_at", "updated_at",
+    )
+
+    def enqueue_waiter(self, resource_kind: str, resource: str, task_id: str,
+                       goal_id: str | None, step_index: int, deadline: str,
+                       now: str | None = None) -> "LockWaiter":
+        """Atomically enqueue a FIFO waiter for a canonical resource.
+
+        The durable position (seq) is 1 + MAX(seq) for that resource inside
+        BEGIN IMMEDIATE, so concurrent enqueues from different processes get
+        distinct, commit-ordered positions. One waiter per resource per task
+        is the engine's responsibility; the store does not dedupe here.
+        """
+        from arion.state.locks import LockWaiter, LockWaiterStatus
+
+        if now is None:
+            now = utcnow()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM mutation_lock_waiters "
+                "WHERE resource_kind=? AND resource=?",
+                (resource_kind, resource),
+            ).fetchone()
+            seq = int(row[0])
+            waiter = LockWaiter(
+                waiter_id=new_id("waiter"),
+                resource_kind=resource_kind,
+                resource=resource,
+                task_id=task_id,
+                goal_id=goal_id,
+                step_index=step_index,
+                seq=seq,
+                enqueued_at=now,
+                deadline=deadline,
+                status=LockWaiterStatus.QUEUED,
+                created_at=now,
+                updated_at=now,
+            )
+            self._conn.execute(
+                "INSERT INTO mutation_lock_waiters "
+                f"({', '.join(self._WAITER_COLS)}) VALUES ({', '.join('?' * len(self._WAITER_COLS))})",
+                _waiter_row(waiter),
+            )
+            self._conn.commit()
+            return waiter
+        except sqlite3.OperationalError as exc:
+            self._conn.rollback()
+            raise MutationLockError(f"could not enqueue mutation lock waiter (database busy): {exc}") from exc
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def get_waiter(self, waiter_id: str) -> "LockWaiter | None":
+        row = self._conn.execute(
+            f"SELECT {', '.join(self._WAITER_COLS)} FROM mutation_lock_waiters WHERE waiter_id=?",
+            (waiter_id,),
+        ).fetchone()
+        return _waiter_from_row(row) if row else None
+
+    def peek_waiter(self, resource_kind: str, resource: str,
+                    now: str | None = None) -> "LockWaiter | None":
+        """The oldest ELIGIBLE waiter for a resource (FIFO head).
+
+        Eligible = status queued AND deadline not passed AND task not
+        terminal. Recomputes on every call, so removing/expiring the head
+        automatically promotes the next eligible waiter - positions of the
+        remaining waiters are never rewritten.
+        """
+        if now is None:
+            now = utcnow()
+        row = self._conn.execute(
+            "SELECT w.* FROM mutation_lock_waiters w "
+            "JOIN tasks t ON t.id = w.task_id "
+            "WHERE w.resource_kind=? AND w.resource=? AND w.status=? "
+            "AND w.deadline > ? AND t.status NOT IN (?, ?) "
+            "ORDER BY w.seq LIMIT 1",
+            (resource_kind, resource, LockWaiterStatus.QUEUED.value, now,
+             TaskStatus.COMPLETED.value, TaskStatus.FAILED.value),
+        ).fetchone()
+        return _waiter_from_row(row) if row else None
+
+    def update_waiter(self, waiter_id: str, attempts: int | None = None,
+                      next_retry: str | None = None) -> None:
+        sets, params = [], []
+        if attempts is not None:
+            sets.append("attempts = ?")
+            params.append(int(attempts))
+        if next_retry is not None:
+            sets.append("next_retry = ?")
+            params.append(next_retry)
+        if not sets:
+            return
+        sets.append("updated_at = ?")
+        params.append(utcnow())
+        params.append(waiter_id)
+        self._conn.execute(
+            f"UPDATE mutation_lock_waiters SET {', '.join(sets)} WHERE waiter_id=?", params)
+        self._conn.commit()
+
+    def dequeue_waiter(self, waiter_id: str, status: str = "acquired") -> bool:
+        """Transition a queued waiter to a terminal status (acquired |
+        timed_out | cancelled). Idempotent: a non-queued or unknown waiter
+        returns False. The row is kept for audit (append-safe)."""
+        from arion.state.locks import LockWaiterStatus
+
+        status = LockWaiterStatus(status)
+        cur = self._conn.execute(
+            "UPDATE mutation_lock_waiters SET status=?, updated_at=? "
+            "WHERE waiter_id=? AND status=?",
+            (status.value, utcnow(), waiter_id, LockWaiterStatus.QUEUED.value),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def cancel_waiter_for_task(self, task_id: str, status: str = "cancelled") -> int:
+        """Cancel every queued waiter of a task (task became terminal)."""
+        from arion.state.locks import LockWaiterStatus
+
+        status = LockWaiterStatus(status)
+        cur = self._conn.execute(
+            "UPDATE mutation_lock_waiters SET status=?, updated_at=? "
+            "WHERE task_id=? AND status=?",
+            (status.value, utcnow(), task_id, LockWaiterStatus.QUEUED.value),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def reclaim_stale_waiters(self, now: str | None = None) -> list[str]:
+        """Atomically mark expired queued waiters as timed_out. Idempotent:
+        already-terminal waiters are never touched again."""
+        if now is None:
+            now = utcnow()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            rows = self._conn.execute(
+                "SELECT waiter_id FROM mutation_lock_waiters "
+                "WHERE status=? AND deadline <= ?",
+                (LockWaiterStatus.QUEUED.value, now),
+            ).fetchall()
+            ids = [r[0] for r in rows]
+            if ids:
+                self._conn.execute(
+                    "UPDATE mutation_lock_waiters SET status=?, updated_at=? "
+                    "WHERE status=? AND deadline <= ?",
+                    (LockWaiterStatus.TIMED_OUT.value, now,
+                     LockWaiterStatus.QUEUED.value, now),
+                )
+            self._conn.commit()
+            return ids
+        except sqlite3.OperationalError as exc:
+            self._conn.rollback()
+            raise MutationLockError(f"could not reclaim stale waiters (database busy): {exc}") from exc
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def list_waiters(self, resource_kind: str | None = None,
+                     resource: str | None = None,
+                     status: str | None = None) -> list["LockWaiter"]:
+        cols = ", ".join(self._WAITER_COLS)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if resource_kind:
+            clauses.append("resource_kind = ?")
+            params.append(resource_kind)
+        if resource:
+            clauses.append("resource = ?")
+            params.append(resource)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT {cols} FROM mutation_lock_waiters {where} ORDER BY seq", params
+        ).fetchall()
+        return [_waiter_from_row(r) for r in rows]
+
+    def release_and_select_next(self, lock_id: str, owner_id: str,
+                                now: str | None = None) -> tuple[bool, "LockWaiter | None"]:
+        """Atomically release a lock AND select the next eligible FIFO waiter.
+
+        Runs in ONE BEGIN IMMEDIATE transaction: the ownership check, the
+        lock deletion, expired-waiter cleanup, and the next-head selection.
+        Returns (released, next_head). A non-owner gets a typed error; an
+        already-gone lock returns (False, None). The selected waiter is
+        exactly what peek_waiter would return immediately after - no
+        check-then-act window.
+        """
+        from arion.state.locks import MutationLockError
+
+        if now is None:
+            now = utcnow()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                f"SELECT {', '.join(self._LOCK_COLS)} FROM mutation_locks WHERE lock_id=?",
+                (lock_id,),
+            ).fetchone()
+            if row is None:
+                self._conn.rollback()
+                return False, None
+            lock = _lock_from_row(row)
+            if lock.owner_id != owner_id:
+                self._conn.rollback()
+                raise MutationLockError(
+                    f"lock {lock_id} is owned by another owner; cannot release"
+                )
+            self._conn.execute(
+                "DELETE FROM mutation_locks WHERE lock_id=? AND owner_id=?", (lock_id, owner_id))
+            # mark expired waiters for the released resource (same transaction)
+            self._conn.execute(
+                "UPDATE mutation_lock_waiters SET status=?, updated_at=? "
+                "WHERE resource_kind=? AND resource=? AND status=? AND deadline <= ?",
+                (LockWaiterStatus.TIMED_OUT.value, now, lock.resource_kind,
+                 lock.resource, LockWaiterStatus.QUEUED.value, now),
+            )
+            head = self._conn.execute(
+                "SELECT w.* FROM mutation_lock_waiters w "
+                "JOIN tasks t ON t.id = w.task_id "
+                "WHERE w.resource_kind=? AND w.resource=? AND w.status=? "
+                "AND w.deadline > ? AND t.status NOT IN (?, ?) "
+                "ORDER BY w.seq LIMIT 1",
+                (lock.resource_kind, lock.resource, LockWaiterStatus.QUEUED.value,
+                 now, TaskStatus.COMPLETED.value, TaskStatus.FAILED.value),
+            ).fetchone()
+            self._conn.commit()
+            return True, (_waiter_from_row(head) if head else None)
+        except sqlite3.OperationalError as exc:
+            self._conn.rollback()
+            raise MutationLockError(f"could not release mutation lock (database busy): {exc}") from exc
+        except Exception:
+            self._conn.rollback()
+            raise
+            raise MutationLockError(f"could not reclaim expired locks (database busy): {exc}") from exc
+        except Exception:
+            self._conn.rollback()
+            raise
+
     def close(self) -> None:
         self._conn.close()
 
@@ -631,6 +954,22 @@ def _lock_from_row(row: tuple[Any, ...]) -> "MutationLock":
 
     d = {c: v for c, v in zip(SQLiteStorage._LOCK_COLS, row)}
     return MutationLock.from_dict(d)
+
+
+def _waiter_row(waiter: "LockWaiter") -> tuple[Any, ...]:
+    return (
+        waiter.waiter_id, waiter.resource_kind, waiter.resource, waiter.task_id,
+        waiter.goal_id, waiter.step_index, waiter.seq, waiter.enqueued_at,
+        waiter.deadline, waiter.attempts, waiter.next_retry, waiter.status.value,
+        waiter.created_at, waiter.updated_at,
+    )
+
+
+def _waiter_from_row(row: tuple[Any, ...]) -> "LockWaiter":
+    from arion.state.locks import LockWaiter
+
+    d = {c: v for c, v in zip(SQLiteStorage._WAITER_COLS, row)}
+    return LockWaiter.from_dict(d)
 
 
 def _goal_from_row(row: tuple[Any, ...]) -> Goal:
