@@ -97,7 +97,7 @@ def main() -> int:
             locked_seen = True
             # B attempts while A holds the lock
             b1 = json.loads(run_worker("attempt-write", "--db", str(db_a),
-                                       "--sandbox", str(sb_a)))
+                                       "--sandbox", str(sb_a), "--wait-max", "0"))
             check(b1["contended"] is True and "lock contention" in (b1["task_error"] or ""),
                   "process B: authorization ok -> lock contention -> task failed (no mutation)")
             check(b1["goal_status"] == "blocked", "process B: goal durably BLOCKED on contention")
@@ -110,7 +110,7 @@ def main() -> int:
     # A released -> B unblocks, replans, gets FRESH authorization, mutates
     gid_b = b1["goal_id"]
     b2 = json.loads(run_worker("attempt-write", "--db", str(db_a),
-                               "--sandbox", str(sb_a), "--goal", gid_b))
+                               "--sandbox", str(sb_a), "--goal", gid_b, "--wait-max", "0"))
     check(b2["goal_status"] == "completed" and b2["locks"] == [],
           "process B: after A released, B replanned -> fresh approval -> lock -> write -> release")
     check((sb_a / "notes.txt").read_text(encoding="utf-8") == "hello",
@@ -126,7 +126,7 @@ def main() -> int:
                                        "--sandbox", str(sb_b), "--lease", "2.0"))
     check(crash_lock["owner_id"] == "proc-crash", "process A: lock acquired by proc-crash (then crashed)")
     # immediately after the crash, the lock is still there (not released)
-    cont = json.loads(run_worker("attempt-write", "--db", str(db_b), "--sandbox", str(sb_b)))
+    cont = json.loads(run_worker("attempt-write", "--db", str(db_b), "--sandbox", str(sb_b), "--wait-max", "0"))
     check(cont["contended"] is True, "process B (before expiry): stale lock still contends (no mutation)")
     time.sleep(2.5)  # lease (2s) elapses
     b_out = json.loads(run_worker("reclaim-write", "--db", str(db_b), "--sandbox", str(sb_b)))
@@ -242,6 +242,7 @@ def main() -> int:
                               boundaries={FS: RelativePathBoundary()}),
         approval_handler=PendingApprovalHandler(), goal_manager=gm, world_monitor=wm,
         memory=SQLiteMemoryStore(db_e),
+        lock_wait_max_seconds=0.0,  # ADR-021 semantics: immediate contention failure
     )
     engine.memory.record_episode(Episode(
         episode_id="ep_forge", goal="write notes", outcome="completed", task_id="t",

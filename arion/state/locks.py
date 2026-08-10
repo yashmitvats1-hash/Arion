@@ -45,6 +45,15 @@ class MutationLockError(Exception):
     """Typed failure for the mutation lock store (fail closed)."""
 
 
+class MutationLockTimeoutError(MutationLockError):
+    """Bounded lock-contention waiting exhausted its deadline (ADR-022).
+
+    Durable, typed, explainable: the task was waiting (coordination only)
+    for a resource that stayed locked past the deadline. NOT a mutation
+    failure - no recovery record is created, and the capability never ran.
+    """
+
+
 @dataclass
 class MutationLock:
     """One durable advisory lock on a canonical mutation resource.

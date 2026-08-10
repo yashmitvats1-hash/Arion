@@ -125,12 +125,14 @@ class DeterministicProgressEvaluator:
             "tasks": len(tasks),
             "completed": 0, "failed": 0, "skipped": 0, "pending": 0,
             "awaiting_approval": 0,
+            "waiting_for_lock": 0,
             "plan_versions": 0,
             "world_changes": [w.to_dict() if hasattr(w, "to_dict") else w for w in world_changes[:10]],
         }
         blockers = list(goal.blockers or [])
 
         awaiting: list[dict[str, Any]] = []
+        lock_waiters: list[dict[str, Any]] = []
         for t in tasks:
             st = t.status.value if hasattr(t.status, "value") else str(t.status)
             if st == TaskStatus.COMPLETED.value:
@@ -145,6 +147,21 @@ class DeterministicProgressEvaluator:
                         "task_id": t.id,
                         "step_index": t.current_step,
                         "plan_version": t.plan_version,
+                    })
+                if getattr(t, "lock_wait", None):
+                    # ADR-022: a task waiting (bounded) on a mutation lock is
+                    # its own durable state - distinct from approval-pending,
+                    # missing capability, recovery, and terminal failure.
+                    evidence["waiting_for_lock"] += 1
+                    lock_waiters.append({
+                        "task_id": t.id,
+                        "step_index": t.current_step,
+                        "plan_version": t.plan_version,
+                        "resource_kind": t.lock_wait.get("resource_kind"),
+                        "resource": t.lock_wait.get("resource"),
+                        "deadline": t.lock_wait.get("deadline"),
+                        "attempts": t.lock_wait.get("attempts"),
+                        "next_retry": t.lock_wait.get("next_retry"),
                     })
         for t in tasks:
             for s in getattr(t, "steps", []):
@@ -188,6 +205,19 @@ class DeterministicProgressEvaluator:
                 blockers=blockers, next_action="await_approval",
                 evidence={**evidence, "reason": "awaiting_approval",
                           "approval_pending_steps": awaiting[:10]},
+            )
+
+        # Rule 3b: a task durably waiting (bounded) for a mutation lock
+        # (ADR-022) is its own state - coordination, never authorization. The
+        # goal stays BLOCKED with an explainable lock_contention blocker; the
+        # blocker clears when the live lock store reports the resource free.
+        if lock_waiters:
+            return ProgressResult(
+                goal_id=goal.id, progress=progress,
+                status=GoalStatus.BLOCKED.value if blockers else goal.status_value,
+                blockers=blockers, next_action="await_lock",
+                evidence={**evidence, "reason": "awaiting_lock",
+                          "lock_waiting_steps": lock_waiters[:10]},
             )
 
         # Rule 4: blockers.

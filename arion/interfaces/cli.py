@@ -172,11 +172,12 @@ def build_parser() -> argparse.ArgumentParser:
     locks_sub = locks.add_subparsers(dest="locks_command", required=True)
 
     locks_list = locks_sub.add_parser("list", help="list mutation locks", parents=[common, common_memory])
-    locks_show = locks_sub.add_parser("show", help="show a mutation lock", parents=[common, common_memory])
-    locks_show.add_argument("lock_id")
+    locks_waiters = locks_sub.add_parser("waiters", help="list tasks waiting (bounded) on mutation locks (ADR-022)", parents=[common, common_memory])
+    locks_show = locks_sub.add_parser("show", help="show a mutation lock or waiter", parents=[common, common_memory])
+    locks_show.add_argument("id")
 
     locks_reclaim = locks_sub.add_parser("reclaim", help="reclaim an EXPIRED mutation lock (ADR-021; never authorizes)", parents=[common, common_memory])
-    locks_reclaim.add_argument("lock_id")
+    locks_reclaim.add_argument("id")
 
     return parser
 
@@ -254,12 +255,13 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _locks_command(args, engine) -> int:
-    """arion locks list|show|reclaim (advisory mutation locks, ADR-021).
+    """arion locks list|waiters|show|reclaim (ADR-021/022).
 
     Uses the domain lock store / engine interfaces only - never raw SQLite.
     Output is bounded and secret-free (lock/resource/owner identifiers and
     timestamps). Reclaim only removes EXPIRED coordination records; it never
-    authorizes a mutation.
+    authorizes a mutation. Waiters expose bounded ADR-022 wait metadata
+    (task/goal/step, resource, attempts, deadline, next retry).
     """
     import json
 
@@ -274,6 +276,24 @@ def _locks_command(args, engine) -> int:
         else:
             print(obj)
 
+    def _waiters():
+        tasks = [t for t in engine.storage.list_tasks() if getattr(t, "lock_wait", None)]
+        out = []
+        for t in tasks:
+            lw = t.lock_wait or {}
+            out.append({
+                "status": "waiting",
+                "task_id": t.id,
+                "goal_id": t.goal_id,
+                "step_index": t.current_step,
+                "resource_kind": lw.get("resource_kind"),
+                "resource": lw.get("resource"),
+                "attempts": lw.get("attempts"),
+                "deadline": lw.get("deadline"),
+                "next_retry": lw.get("next_retry"),
+            })
+        return out
+
     if args.locks_command == "list":
         locks = store.list()
         if args.json:
@@ -284,23 +304,49 @@ def _locks_command(args, engine) -> int:
                   f"{l.capability}/{l.action}  owner={l.owner_id}  expires={l.expires_at}")
         return 0
 
-    if args.locks_command == "show":
-        lock = store.get(args.lock_id)
-        if lock is None:
-            print(f"lock {args.lock_id} not found")
-            return 1
+    if args.locks_command == "waiters":
+        waiters = _waiters()
         if args.json:
-            _emit(lock.to_dict())
+            _emit(waiters)
             return 0
-        print(f"lock {lock.lock_id}: held")
-        print(f"  {lock.capability}/{lock.action} on {lock.resource_kind} {lock.resource}")
-        print(f"  owner={lock.owner_id}")
-        print(f"  acquired_at={lock.acquired_at}  expires_at={lock.expires_at}")
+        if not waiters:
+            print("no tasks waiting on mutation locks")
+            return 0
+        for w in waiters:
+            print(f"task={w['task_id']}  waiting  {w['resource_kind']}/{w['resource']}  "
+                  f"attempts={w['attempts']}  deadline={w['deadline']}  "
+                  f"next_retry={w['next_retry']}" + (f"  goal={w['goal_id']}" if w["goal_id"] else ""))
         return 0
+
+    if args.locks_command == "show":
+        # show <id>: a lock id, or a task id with durable wait metadata
+        lock = store.get(args.id)
+        if lock is not None:
+            if args.json:
+                _emit(lock.to_dict())
+                return 0
+            print(f"lock {lock.lock_id}: held")
+            print(f"  {lock.capability}/{lock.action} on {lock.resource_kind} {lock.resource}")
+            print(f"  owner={lock.owner_id}")
+            print(f"  acquired_at={lock.acquired_at}  expires_at={lock.expires_at}")
+            return 0
+        waiter = next((w for w in _waiters() if w["task_id"] == args.id), None)
+        if waiter is not None:
+            if args.json:
+                _emit(waiter)
+                return 0
+            print(f"task {waiter['task_id']}: waiting for mutation lock")
+            print(f"  {waiter['resource_kind']}/{waiter['resource']}")
+            print(f"  attempts={waiter['attempts']}  deadline={waiter['deadline']}  "
+                  f"next_retry={waiter['next_retry']}"
+                  + (f"  goal={waiter['goal_id']}" if waiter["goal_id"] else ""))
+            return 0
+        print(f"no lock or waiter found for id: {args.id}")
+        return 1
 
     if args.locks_command == "reclaim":
         try:
-            reclaimed = engine.reclaim_lock(args.lock_id)
+            reclaimed = engine.reclaim_lock(args.id)
         except Exception as exc:
             print(f"lock reclaim rejected: {exc}")
             return 1

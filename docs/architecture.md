@@ -440,6 +440,39 @@ loop (ADR-016):
 - **Demo:** `scripts/demo_adr021_lock_two_process.py` (two real subprocesses,
   scenarios A–E, offline).
 
+## Bounded Lock-Contention Waiting/Backoff (ADR-022)
+
+- **Durable waiting state** — a task that hits a mutation-lock contention
+  enters a bounded wait instead of failing immediately: `Task.lock_wait`
+  metadata (resource, deadline, attempts, next_retry) persisted on the task +
+  the goal's `lock_contention` blocker (upserted each retry). Entering the
+  wait is NOT a mutation failure: no recovery record, no `mutation.failed`,
+  capability never executes. Waiting is coordination-only — never an
+  authorization mechanism.
+- **Deterministic bounded backoff** — `delay = min(base * 2^(attempt-1),
+  max)` with engine-configurable deadline (`lock_wait_max_seconds`),
+  injectable clock + sleeper for deterministic tests; never sleeps inside a
+  SQLite transaction. `lock_wait_max_seconds=0` disables waiting (ADR-021
+  immediate-contention semantics, available by configuration).
+- **Ordering preserved:** plan → authorize → approval if required → live
+  re-authz → contention → bounded wait/backoff → retry acquisition →
+  **re-validate LIVE authorization** → mutate → verify → release. After a
+  waited acquisition the engine re-checks the current ActionSpec/policy and
+  forces the normal fresh authorization/approval path if anything became
+  stale (releasing the acquired lock if the step pauses/denies).
+- **Restart safety:** the retry budget/deadline survive restarts (never
+  reset); past-deadline resumes time out immediately; while the resource is
+  still locked the goal is durably BLOCKED (`await_lock` — a distinct
+  evaluator state) without spinning; a crashed waiter holds no lock (no
+  immortal waiter).
+- **Audit:** `mutation.lock.waiting` / `mutation.lock.retry` /
+  `mutation.lock.timeout` (typed `MutationLockTimeoutError`), metadata only.
+- **CLI:** `arion locks waiters` and `arion locks show <id>` (lock or
+  waiter) with `--json` — task/goal/step, resource, attempts, deadline, next
+  retry, status; bounded and secret-free.
+- **Demo:** `scripts/demo_adr022_lock_wait.py` (two real subprocesses:
+  wait→success, timeout, stale-authorization; offline).
+
 ## Structured intelligence boundary (ADR-011)
 
 ```
@@ -512,6 +545,8 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/arion locks show <lock_id>
 .venv/bin/arion locks reclaim <lock_id> # expired locks only; never authorizes
 .venv/bin/python scripts/demo_adr021_lock_two_process.py  # two-process lock demo (offline)
+.venv/bin/python scripts/demo_adr022_lock_wait.py         # bounded lock-wait demo A-C (offline)
+.venv/bin/arion locks waiters        # tasks waiting (bounded) on mutation locks (ADR-022)
 .venv/bin/python -m pytest
 ```
 

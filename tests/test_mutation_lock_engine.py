@@ -134,6 +134,7 @@ def _engine(db_path, sandbox, planner=None, write_cap=None, append_cap=None,
         policy=policy or _policy(), approval_handler=PendingApprovalHandler(),
         goal_manager=gm, world_monitor=wm,
         mutation_lock_lease_seconds=lease_seconds, lock_clock=clock,
+        lock_wait_max_seconds=0.0,  # ADR-021 legacy: immediate contention failure
     )
     return engine, gm, storage, registry
 

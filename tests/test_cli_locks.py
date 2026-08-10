@@ -141,3 +141,65 @@ def test_cli_locks_unknown_id(tmp_path, capsys, monkeypatch):
     rc, out = _run(["locks", "reclaim", "lock_nope", "--db", db], capsys)
     assert rc == 1
     assert "unknown" in out.lower() or "not found" in out.lower()
+
+
+def test_cli_locks_waiters_expose_wait_metadata(tmp_path, capsys, monkeypatch):
+    """`arion locks waiters` exposes bounded ADR-022 wait metadata for tasks
+    durably waiting on a mutation lock; `show <task_id>` shows the waiter."""
+    from tests.test_lock_waiting import FakeTime, InterruptSleeper, _approve, _engine, _hold_lock
+    import pytest as _pytest
+
+    sb = tmp_path / "wsandbox"
+    sb.mkdir(parents=True, exist_ok=True)
+    db = str(tmp_path / "arion.db")
+    ft = FakeTime()
+    holder, holder_lock = _hold_lock(db, sb)
+    engine, gm, storage, _ = _engine(db, sb, max_wait=10_000.0, clock=ft.now,
+                                     sleeper=InterruptSleeper(ft, interrupt_after=1))
+    gid = engine.submit_goal("write notes").id
+    _approve(engine, gid)
+    with _pytest.raises(RuntimeError, match="simulated crash"):
+        engine.run_goal(gid)
+    task = gm.task_history(gid)[-1]
+    engine.storage.close()
+
+    rc, out = _run(["locks", "waiters", "--json", "--db", db], capsys)
+    assert rc == 0
+    data = json.loads(out)
+    assert len(data) == 1
+    w = data[0]
+    assert w["status"] == "waiting"
+    assert w["task_id"] == task.id
+    assert w["resource"] == "notes.txt"
+    assert w["deadline"] == task.lock_wait["deadline"]
+    assert w["attempts"] == task.lock_wait["attempts"]
+    assert w["next_retry"] == task.lock_wait["next_retry"]
+    assert "content" not in json.dumps(data)  # bounded, secret-free
+
+    rc, out = _run(["locks", "waiters", "--db", db], capsys)
+    assert task.id in out
+
+    rc, out = _run(["locks", "show", task.id, "--json", "--db", db], capsys)
+    d = json.loads(out)
+    assert d["task_id"] == task.id and d["status"] == "waiting"
+    holder.close()
+
+
+def test_cli_locks_show_distinguishes_lock_and_waiter(tmp_path, capsys, monkeypatch):
+    from arion.state.store import SQLiteStorage as SS
+
+    monkeypatch.chdir(tmp_path)
+    sb = tmp_path / "csandbox"
+    sb.mkdir(parents=True, exist_ok=True)
+    db = str(tmp_path / "arion.db")
+    # a plain lock
+    engine = _engine(db, sb)
+    lock = engine.mutation_lock_store.acquire("filesystem:path", "notes.txt",
+                                              "filesystem.write", "write", "proc-cli",
+                                              300, now=None)
+    engine.storage.close()
+    rc, out = _run(["locks", "show", lock.lock_id, "--json", "--db", db], capsys)
+    assert json.loads(out)["lock_id"] == lock.lock_id
+    # unknown id fails closed
+    rc, out = _run(["locks", "show", "nope", "--db", db], capsys)
+    assert rc == 1

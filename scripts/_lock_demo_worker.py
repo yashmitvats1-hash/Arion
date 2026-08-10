@@ -97,7 +97,8 @@ class AlwaysFailWrite(FilesystemWriteCapability):
         raise CapabilityError("disk full")
 
 
-def build_engine(db_path, sandbox, write_cap=None):
+def build_engine(db_path, sandbox, write_cap=None,
+                 wait_max=5.0, backoff_base=0.25, backoff_max=2.0):
     storage = SQLiteStorage(db_path)
     registry = CapabilityRegistry()
     registry.register(FilesystemReadCapability(sandbox))
@@ -120,6 +121,9 @@ def build_engine(db_path, sandbox, write_cap=None):
                               risk_deny=set(), risk_approve={"high"},
                               boundaries={FS: RelativePathBoundary()}),
         approval_handler=PendingApprovalHandler(), goal_manager=gm, world_monitor=wm,
+        lock_wait_max_seconds=wait_max,
+        lock_wait_backoff_base=backoff_base,
+        lock_wait_backoff_max=backoff_max,
     )
     return engine, gm
 
@@ -130,6 +134,10 @@ def _approve_pending(engine) -> None:
     if reqs:
         engine.resolve_approval_request(reqs[-1].approval_id, ApprovalOutcome.APPROVED,
                                         actor="user:alice")
+
+
+def storage_events(engine):
+    return engine.storage.list_events()
 
 
 def _finish(engine, gid) -> dict:
@@ -155,8 +163,50 @@ def main() -> int:
     ap.add_argument("--hold", type=float, default=2.0)
     ap.add_argument("--lease", type=float, default=2.0)
     ap.add_argument("--goal", default=None)
+    ap.add_argument("--wait-max", type=float, default=5.0)
+    ap.add_argument("--backoff-base", type=float, default=0.25)
+    ap.add_argument("--backoff-max", type=float, default=2.0)
     args = ap.parse_args()
     db, sb = args.db, Path(args.sandbox)
+
+    if args.mode == "hold-release":
+        # ADR-022: acquire the lock via the store, hold it, release it.
+        engine, gm = build_engine(db, sb, wait_max=args.wait_max)
+        lock = engine.mutation_lock_store.acquire(
+            FS, canonical_resource(FS, "notes.txt"), "filesystem.write", "write",
+            "proc-hold-release", lease_seconds=3600.0, now=None)
+        print("HOLDING", flush=True)
+        time.sleep(args.hold)
+        engine.mutation_lock_store.release(lock.lock_id, "proc-hold-release")
+        print("RELEASED", flush=True)
+        engine.storage.close()
+        return 0
+
+    if args.mode == "wait-write":
+        # ADR-022: full pipeline with bounded lock-contention waiting; the
+        # engine waits in-process until the holder releases (or the deadline).
+        engine, gm = build_engine(db, sb, wait_max=args.wait_max,
+                                  backoff_base=args.backoff_base,
+                                  backoff_max=args.backoff_max)
+        gid = args.goal or engine.submit_goal("write notes").id
+        engine.run_goal(gid)
+        _approve_pending(engine)
+        final = engine.run_goal(gid)
+        lock_events = [e.kind for e in engine.storage.list_events()
+                       if e.kind.startswith("mutation.lock")]
+        tasks = engine.goal_manager.task_history(gid)
+        last = tasks[-1] if tasks else None
+        out = {
+            "goal_id": gid,
+            "goal_status": final.status.value if hasattr(final, "status") else str(final),
+            "task_status": last.status.value if last else None,
+            "task_error": last.error if last else None,
+            "locks": [l.to_dict() for l in engine.mutation_lock_store.list()],
+            "lock_events": lock_events,
+        }
+        engine.storage.close()
+        print(json.dumps(out), flush=True)
+        return 0
 
     if args.mode == "slow-write":
         engine, gm = build_engine(db, sb, SlowWrite(sb, args.hold))
@@ -167,7 +217,7 @@ def main() -> int:
         return 0
 
     if args.mode == "attempt-write":
-        engine, gm = build_engine(db, sb)
+        engine, gm = build_engine(db, sb, wait_max=args.wait_max)
         gid = args.goal or engine.submit_goal("write notes").id
         engine.run_goal(gid)
         _approve_pending(engine)
@@ -177,7 +227,7 @@ def main() -> int:
         return 0
 
     if args.mode == "queue-approval":
-        engine, gm = build_engine(db, sb)
+        engine, gm = build_engine(db, sb, wait_max=args.wait_max)
         gid = engine.submit_goal("write notes").id
         out = _finish(engine, gid)  # runs to BLOCKED (approval pending), then exits
         print(json.dumps(out), flush=True)

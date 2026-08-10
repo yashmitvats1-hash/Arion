@@ -60,6 +60,16 @@ from arion.state.models import (
 from arion.state.store import Storage
 
 
+def _iso_plus(iso: str, seconds: float) -> str:
+    """ISO timestamp + seconds (lock wait deadlines; deterministic clock)."""
+    from datetime import datetime, timedelta, timezone
+
+    dt = datetime.fromisoformat(iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (dt + timedelta(seconds=seconds)).isoformat()
+
+
 class ArionEngine:
     """Drives goals through the full task lifecycle with checkpointing."""
 
@@ -86,6 +96,10 @@ class ArionEngine:
         mutation_lock_store: Any | None = None,
         mutation_lock_lease_seconds: float = 300.0,
         lock_clock: Any | None = None,
+        lock_wait_max_seconds: float = 5.0,
+        lock_wait_backoff_base: float = 0.25,
+        lock_wait_backoff_max: float = 2.0,
+        lock_sleeper: Any | None = None,
     ):
         self.storage = storage
         self.registry = registry
@@ -125,6 +139,14 @@ class ArionEngine:
             self.mutation_lock_store = storage  # type: ignore[assignment]
         self.mutation_lock_lease_seconds = max(0.0, float(mutation_lock_lease_seconds))
         self.lock_clock = lock_clock  # injectable clock for deterministic lease tests
+        # Bounded lock-contention waiting (ADR-022): coordination ONLY.
+        # max<=0 disables waiting (contention fails immediately, ADR-021
+        # semantics); otherwise the engine retries lock acquisition with
+        # deterministic exponential backoff until the deadline.
+        self.lock_wait_max_seconds = max(0.0, float(lock_wait_max_seconds))
+        self.lock_wait_backoff_base = max(0.0, float(lock_wait_backoff_base))
+        self.lock_wait_backoff_max = max(0.0, float(lock_wait_backoff_max))
+        self.lock_sleeper = lock_sleeper  # injectable sleeper for deterministic tests
         # The goal manager's lock_contention recheck resolves via the engine's
         # live lock store (the lock store is the only lock authority).
         if self.goal_manager is not None:
@@ -257,6 +279,17 @@ class ArionEngine:
             return str(self.lock_clock())
         return utcnow()
 
+    def _lock_sleep(self, seconds: float) -> None:
+        """Sleep between lock-retry attempts (injectable for deterministic
+        tests; defaults to the real clock). Never holds a SQLite transaction
+        while sleeping - the lock store commits before this is called."""
+        if self.lock_sleeper is not None:
+            self.lock_sleeper(seconds)
+        else:
+            import time
+
+            time.sleep(seconds)
+
     def _lock_owner(self) -> str:
         """Explicit, unique owner/process identity for this engine's locks."""
         return f"proc:{os.getpid()}:{new_id('owner')}"
@@ -310,13 +343,34 @@ class ArionEngine:
         Called ONLY after authorization succeeded (live policy + approval).
         A lock is coordination, not permission: acquiring it never grants
         anything, it only prevents a concurrent mutation of the same resource.
-        Returns the lock, or raises MutationLockError on contention.
+
+        ADR-022: when bounded waiting is configured (lock_wait_max_seconds>0),
+        a contention is retried with deterministic exponential backoff until
+        the deadline instead of failing immediately. Waiting retries the
+        COORDINATION ONLY - never the mutation, never the plan, never the
+        approval. The wait state (deadline/attempts/next_retry) is persisted
+        durably on the task and survives restarts without resetting the retry
+        budget. Deadline expiry raises MutationLockTimeoutError (typed).
+
+        Returns (lock, waited): `waited` is True when this session contended
+        at least once before acquiring (callers must re-validate live
+        authorization in that case). Raises MutationLockError on contention
+        (when waiting is disabled) / MutationLockTimeoutError on deadline
+        expiry.
         """
-        from arion.state.locks import MutationLockError
+        from arion.state.locks import MutationLockError, MutationLockTimeoutError
 
         kind, resource = self._lock_canonical(spec, step)
         if kind is None or resource is None:
-            return None  # no lockable resource (e.g. non-resource mutation)
+            return None, False  # no lockable resource (e.g. non-resource mutation)
+
+        # Waiting budget: preserve across restarts (never reset). A fresh wait
+        # session (different resource or no prior metadata) starts a new one.
+        prior = task.lock_wait if (task.lock_wait or {}).get("resource") == resource else None
+        deadline = prior.get("deadline") if prior else None
+        attempts = int(prior.get("attempts", 0)) if prior else 0
+        waited = prior is not None
+
         self._emit("mutation.lock.requested", task_id=task.id, step_id=_step_id(step), detail={
             "resource_kind": kind,
             "resource": resource,
@@ -324,32 +378,216 @@ class ArionEngine:
             "action": step.action,
         })
         owner = self._lock_owner()
-        now = self._lock_now()
-        # reclaim any already-expired rows for this resource (bounded, atomic
-        # inside the store's transaction) and emit the audit trail.
+
+        while True:
+            now = self._lock_now()
+            if self.lock_wait_max_seconds > 0:
+                if deadline is None:
+                    deadline = _iso_plus(now, self.lock_wait_max_seconds)
+                if now >= deadline:
+                    # durable, typed, explainable timeout - coordination only
+                    self._fail_lock_wait_timeout(task, step, kind, resource, deadline, attempts, owner)
+                    raise MutationLockTimeoutError(
+                        f"mutation lock wait timed out for {kind!r} {resource!r} "
+                        f"(deadline {deadline}, attempts {attempts})"
+                    )
+            try:
+                # reclaim any already-expired rows for this resource (bounded,
+                # atomic inside the store's transaction) and audit.
+                reclaimed = self.mutation_lock_store.reclaim_expired(
+                    now=now, resource_kind=kind, resource=resource)
+                for lock_id in reclaimed:
+                    self._emit("mutation.lock.reclaimed", task_id=task.id,
+                               step_id=_step_id(step), detail={
+                                   "lock_id": lock_id, "resource_kind": kind,
+                                   "resource": resource, "reason": "stale lease expired",
+                               })
+                lock = self.mutation_lock_store.acquire(
+                    kind, resource, step.capability, step.action, owner,
+                    lease_seconds=self.mutation_lock_lease_seconds, now=now)
+                # success: clear the durable wait state + goal blocker
+                task.lock_wait = None
+                if self.goal_manager is not None and task.goal_id:
+                    try:
+                        self.goal_manager.clear_blocker(task.goal_id, "lock_contention",
+                                                        reason="lock_acquired")
+                    except Exception:
+                        pass
+                self._emit("mutation.lock.acquired", task_id=task.id, step_id=_step_id(step), detail={
+                    "lock_id": lock.lock_id,
+                    "resource_kind": kind,
+                    "resource": resource,
+                    "capability": step.capability,
+                    "action": step.action,
+                    "owner_id": owner,
+                    "waited": waited or attempts > 0,
+                })
+                return lock, bool(waited or attempts > 0)
+            except MutationLockError:
+                if self.lock_wait_max_seconds <= 0:
+                    # waiting disabled: immediate, durable contention failure
+                    # (ADR-021 semantics preserved)
+                    self._emit("mutation.lock.contended", task_id=task.id,
+                               step_id=_step_id(step), success=False, detail={
+                                   "resource_kind": kind, "resource": resource,
+                                   "capability": step.capability, "action": step.action,
+                               })
+                    raise
+                # bounded waiting: persist + backoff, then retry coordination
+                attempts += 1
+                waited = True
+                backoff = min(
+                    self.lock_wait_backoff_base * (2 ** (attempts - 1)),
+                    self.lock_wait_backoff_max,
+                )
+                next_retry = _iso_plus(now, backoff)
+                task.lock_wait = {
+                    "resource_kind": kind,
+                    "resource": resource,
+                    "deadline": deadline,
+                    "attempts": attempts,
+                    "next_retry": next_retry,
+                }
+                self._persist_lock_wait(task, step, kind, resource, deadline, attempts, next_retry)
+                if attempts == 1:
+                    self._emit("mutation.lock.waiting", task_id=task.id,
+                               step_id=_step_id(step), success=False, detail={
+                                   "resource_kind": kind, "resource": resource,
+                                   "capability": step.capability, "action": step.action,
+                                   "deadline": deadline, "next_retry": next_retry,
+                               })
+                else:
+                    self._emit("mutation.lock.retry", task_id=task.id,
+                               step_id=_step_id(step), success=False, detail={
+                                   "resource_kind": kind, "resource": resource,
+                                   "capability": step.capability, "action": step.action,
+                                   "attempt": attempts, "deadline": deadline,
+                                   "backoff_seconds": backoff, "next_retry": next_retry,
+                               })
+                # NEVER sleep inside a SQLite transaction: the store's acquire
+                # already committed/rolled back before we got here.
+                self._lock_sleep(backoff)
+
+    def _persist_lock_wait(self, task: Task, step: PlanStep, kind: str, resource: str,
+                           deadline: str, attempts: int, next_retry: str) -> None:
+        """Durably persist the waiting state (task row + goal blocker + a
+        checkpoint) so a restart resumes with the SAME budget/deadline."""
         try:
-            reclaimed = self.mutation_lock_store.reclaim_expired(
-                now=now, resource_kind=kind, resource=resource)
-            for lock_id in reclaimed:
-                self._emit("mutation.lock.reclaimed", task_id=task.id,
-                           step_id=_step_id(step), detail={
-                               "lock_id": lock_id, "resource_kind": kind,
-                               "resource": resource, "reason": "stale lease expired",
-                           })
-            lock = self.mutation_lock_store.acquire(
-                kind, resource, step.capability, step.action, owner,
-                lease_seconds=self.mutation_lock_lease_seconds, now=now)
-        except MutationLockError:
-            raise
-        self._emit("mutation.lock.acquired", task_id=task.id, step_id=_step_id(step), detail={
-            "lock_id": lock.lock_id,
-            "resource_kind": kind,
-            "resource": resource,
+            self.storage.save_task(task)
+            self._checkpoint(task, reason="waiting for mutation lock")
+        except Exception as exc:
+            self._emit("error", task_id=task.id, step_id=_step_id(step), success=False,
+                       detail={"error": f"persist lock wait failed: {exc}"})
+        self._set_lock_blocker(task.goal_id or "", {
+            "task_id": task.id,
+            "step_index": step.index,
             "capability": step.capability,
             "action": step.action,
-            "owner_id": owner,
+            "resource_kind": kind,
+            "resource": resource,
+            "deadline": deadline,
+            "attempts": attempts,
+            "next_retry": next_retry,
+            "reason": "mutation resource is locked by another owner; waiting (bounded)",
         })
-        return lock
+
+    def _fail_lock_wait_timeout(self, task: Task, step: PlanStep, kind: str,
+                                resource: str, deadline: str, attempts: int,
+                                owner: str) -> None:
+        """Durable, explainable timeout state: the step/task FAIL with a typed
+        reason, the goal keeps an explainable lock_contention blocker (cleared
+        when the lock is eventually released so the goal can replan), and NO
+        recovery record is created (lock contention != mutation failure)."""
+        step.status = StepStatus.FAILED
+        step.error = (f"mutation lock wait timed out for {kind!r} {resource!r} "
+                      f"(deadline {deadline}, attempts {attempts})")
+        task.error = step.error
+        task.lock_wait = None
+        try:
+            self.storage.save_task(task)
+        except Exception:
+            pass
+        self._emit("mutation.lock.timeout", task_id=task.id, step_id=_step_id(step),
+                   success=False, detail={
+                       "resource_kind": kind, "resource": resource,
+                       "capability": step.capability, "action": step.action,
+                       "deadline": deadline, "attempts": attempts,
+                   })
+        self._set_lock_blocker(task.goal_id or "", {
+            "task_id": task.id,
+            "step_index": step.index,
+            "capability": step.capability,
+            "action": step.action,
+            "resource_kind": kind,
+            "resource": resource,
+            "deadline": deadline,
+            "attempts": attempts,
+            "reason": "mutation lock wait timed out (deadline "
+                      f"{deadline}, attempts {attempts})",
+        })
+
+    def _revalidate_before_mutation(self, task: Task, step: PlanStep, spec,
+                                    waited: bool) -> bool:
+        """Re-check LIVE authorization immediately before mutating (ADR-022).
+
+        Only meaningful after the task actually WAITED for the lock: the
+        approval/authorization window may have gone stale while waiting. We
+        rebuild the authorization request from the CURRENT ActionSpec and
+        policy, and re-run the approval seam (which compares the canonical
+        fingerprint and forces a FRESH approval when anything security-
+        relevant changed). Returns True when the step may proceed; False when
+        the step was paused (fresh approval queued) or denied - the caller
+        must NOT execute the capability."""
+        if not waited:
+            return True  # no contention: the single authz check already ran
+        from arion.orchestration.authz import PolicyOutcome
+
+        # LIVE spec, not the stale one captured before the wait: the
+        # ActionSpec/policy may have changed while we waited.
+        live_spec = self.registry.action_spec(step.capability, step.action) or spec
+        request = self._build_authz_request(task, step, live_spec)
+        decision = self.policy.decide(request)
+        self._emit(
+            "permission.checked",
+            task_id=task.id,
+            step_id=_step_id(step),
+            detail={
+                **decision.to_dict(),
+                "params": request.params,
+                "actor": request.actor.id,
+                "revalidated_after_lock_wait": True,
+            },
+        )
+        if decision.outcome == PolicyOutcome.DENY:
+            step.status = StepStatus.FAILED
+            step.error = decision.reason
+            self._emit("permission.denied", task_id=task.id, step_id=_step_id(step),
+                       success=False, detail=decision.to_dict())
+            return False
+        if decision.outcome == PolicyOutcome.REQUIRE_APPROVAL:
+            if not self._handle_approval(task, step, request, decision):
+                return False  # paused (fresh approval queued) or denied
+        return True
+
+    def _build_authz_request(self, task: Task, step: PlanStep, spec) -> "AuthorizationRequest":
+        """Build the authorization request from the LIVE ActionSpec (never
+        from the plan's claims) - shared by the execution path and the
+        post-wait revalidation."""
+        return AuthorizationRequest(
+            actor=self.actor,
+            task_id=task.id,
+            step_index=step.index,
+            capability=step.capability,
+            action=step.action,
+            scope=spec.required_scope,
+            params=dict(step.params),
+            resource=self._extract_resource(spec, step.params),
+            resource_kind=spec.resource_kind,
+            risk=spec.risk,
+            side_effects=spec.side_effects,
+            idempotent=spec.idempotent,
+            retry_safe=spec.retry_safe,
+        )
 
     def _release_mutation_lock(self, lock, task: Task, step: PlanStep) -> None:
         """Release the advisory lock after the mutation window (idempotent).
@@ -375,20 +613,45 @@ class ArionEngine:
         """Durably block the goal while the mutation resource is locked by
         another owner (operational coordination, not authorization)."""
         kind, resource = self._lock_canonical(spec, step)
-        if self.goal_manager is not None and task.goal_id:
-            try:
-                self.goal_manager.set_blocked(task.goal_id, {
-                    "type": "lock_contention",
-                    "task_id": task.id,
-                    "step_index": step.index,
-                    "capability": step.capability,
-                    "action": step.action,
-                    "resource_kind": kind,
-                    "resource": resource,
-                    "reason": "mutation resource is locked by another owner",
-                }, reason="lock_contention")
-            except Exception:
-                pass
+        self._set_lock_blocker(task.goal_id if task.goal_id else "", {
+            "task_id": task.id,
+            "step_index": step.index,
+            "capability": step.capability,
+            "action": step.action,
+            "resource_kind": kind,
+            "resource": resource,
+            "reason": "mutation resource is locked by another owner",
+        })
+
+    def _set_lock_blocker(self, goal_id: str, fields: dict) -> None:
+        """Add-or-UPDATE the goal's lock_contention blocker (ADR-022).
+
+        The blocker is the durable, explainable surface of a lock-wait/timeout
+        session; its metadata (deadline/attempts/next_retry/reason) must track
+        the latest retry - set_blocked alone is idempotent by key and would
+        keep stale metadata."""
+        if not goal_id or self.goal_manager is None:
+            return
+        try:
+            gm = self.goal_manager
+            goal = gm.get_goal(goal_id)
+            if goal is None:
+                return
+            blockers = list(goal.blockers or [])
+            idx = next((i for i, b in enumerate(blockers)
+                        if (b.get("key") or b.get("type")) == "lock_contention"), None)
+            if idx is None:
+                gm.set_blocked(goal_id, {"type": "lock_contention", **fields},
+                               reason="lock_contention")
+                return
+            kept = dict(blockers[idx])
+            blockers[idx] = {"key": "lock_contention", "type": "lock_contention",
+                             **fields, "added_at": kept.get("added_at", utcnow())}
+            goal.blockers = blockers
+            goal.updated_at = utcnow()
+            self.storage.save_goal(goal)
+        except Exception:
+            pass
 
     def reclaim_stale_locks(self, now: str | None = None) -> list[str]:
         """Explicitly reclaim all expired locks (leases elapsed). Returns the
@@ -638,6 +901,24 @@ class ArionEngine:
             if action == "await_approval":
                 # approval-pending: stop cleanly; never spin on the awaiting
                 # task. The goal is durably BLOCKED (approval_pending blocker).
+                return gm.get_goal(goal_id)
+            if action == "await_lock":
+                # waiting for a mutation lock (ADR-022): the task has durable
+                # wait metadata + a lock_contention blocker. While the
+                # resource is still locked, stop cleanly (no spin, no sleep)
+                # and return the goal; the blocker clears when the live lock
+                # store shows the resource free, and only THEN does the
+                # waiting task resume with its preserved deadline/retry
+                # budget (the wait loop acquires - or times out durably -
+                # under the original deadline).
+                if gm.recheck_blockers(goal_id):
+                    pending = gm.pending_task(goal_id)
+                    if pending is not None:
+                        pending = self.run_task(pending.id)
+                        if pending.status in (TaskStatus.FAILED, TaskStatus.AWAITING_APPROVAL):
+                            return gm.get_goal(goal_id)
+                        continue
+                    continue
                 return gm.get_goal(goal_id)
             if action == "resolve_blocker":
                 # durably BLOCKED: re-check blockers against the CURRENT world
@@ -1298,21 +1579,7 @@ class ArionEngine:
         )
 
         # 2. Authorization (policy decides; scope comes from the ActionSpec, not the plan)
-        request = AuthorizationRequest(
-            actor=self.actor,
-            task_id=task.id,
-            step_index=step.index,
-            capability=step.capability,
-            action=step.action,
-            scope=spec.required_scope,
-            params=dict(step.params),
-            resource=self._extract_resource(spec, step.params),
-            resource_kind=spec.resource_kind,
-            risk=spec.risk,
-            side_effects=spec.side_effects,
-            idempotent=spec.idempotent,
-            retry_safe=spec.retry_safe,
-        )
+        request = self._build_authz_request(task, step, spec)
         decision = self.policy.decide(request)
         self._emit(
             "permission.checked",
@@ -1551,17 +1818,26 @@ class ArionEngine:
         exec_error: str | None = None
         mutating = getattr(spec, "side_effects", "read_only") == "mutating"
         lock: Any = None
+        waited = False
         if mutating:
-            # ORDERING (ADR-021): authorization (live policy + approval) has
-            # already succeeded in _execute_step BEFORE we reach this point.
-            # The advisory mutation lock is acquired NOW, immediately before
-            # the actual mutation, and released on EVERY terminal path. A
-            # lock is coordination - never permission.
-            from arion.state.locks import MutationLockError
+            # ORDERING (ADR-021/022): authorization (live policy + approval)
+            # has already succeeded in _execute_step BEFORE we reach this
+            # point. The advisory mutation lock is acquired NOW, immediately
+            # before the actual mutation, with BOUNDED WAITING on contention
+            # (ADR-022), and released on EVERY terminal path. A lock is
+            # coordination - never permission; waiting is coordination too.
+            from arion.state.locks import MutationLockError, MutationLockTimeoutError
 
             try:
-                lock = self._acquire_mutation_lock(task, step, spec)
+                lock, waited = self._acquire_mutation_lock(task, step, spec)
+            except MutationLockTimeoutError as exc:
+                # durable typed timeout (blocker set inside); task fails via
+                # the normal FAILED path in run_task
+                step.error = str(exc)
+                return  # capability NEVER executes; no recovery record
             except MutationLockError as exc:
+                # waiting disabled: immediate, durable contention failure
+                # (ADR-021 semantics preserved)
                 step.status = StepStatus.FAILED
                 step.error = f"mutation lock contention: {exc}"
                 self._emit("mutation.lock.contended", task_id=task.id,
@@ -1572,6 +1848,14 @@ class ArionEngine:
                            })
                 self._set_lock_contention_blocker(task, step, spec)
                 return  # capability NEVER executes; task fails durably
+            if lock is not None:
+                # After a WAITED acquire, re-check LIVE authorization before
+                # mutating: the approval/authorization window may have gone
+                # stale while waiting. If the step pauses (fresh approval
+                # queued) or is denied, release the lock and do NOT execute.
+                if not self._revalidate_before_mutation(task, step, spec, waited=waited):
+                    self._release_mutation_lock(lock, task, step)
+                    return
         try:
             self._execute_attempts(task, step, capability, spec, mutating,
                                    verify_failed, exec_error)

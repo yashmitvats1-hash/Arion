@@ -91,6 +91,7 @@ def _engine(db_path, sandbox, planner=None, memory=False, actor=None):
         router=DeterministicRouter(planner), events=events,
         policy=_policy(), approval_handler=PendingApprovalHandler(),
         goal_manager=gm, world_monitor=wm, memory=memory_store, actor=actor,
+        lock_wait_max_seconds=0.0,  # ADR-021 legacy: immediate contention failure
     )
     return engine, gm, storage, registry
 
