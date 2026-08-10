@@ -397,6 +397,49 @@ loop (ADR-016):
   (domain/store interfaces only; bounded, secret-free, fail-closed).
 - **Demo:** `scripts/demo_adr020_append_recovery.py` (scenarios A–E, offline).
 
+## Cross-Process Advisory Mutation Locks (ADR-021)
+
+- **Durable advisory locks** (`arion/state/locks.py` + SQLite
+  `mutation_locks`): one lock per canonical security-relevant resource
+  (`resource_kind` + canonical resource — `os.path.normpath` for
+  filesystem:path, so `./notes.txt` / `notes.txt` / `a/../notes.txt` and
+  write-vs-append all contend). Acquisition/reclamation are ATOMIC across
+  processes via `BEGIN IMMEDIATE` SQLite transactions; the DB is the
+  coordination authority (no in-memory locks, no lock files, no polling
+  races). Typed `MutationLockError` on contention.
+- **Ordering enforced by construction:** plan → authorization → approval if
+  required → live re-authorization → **acquire mutation lock** → mutate →
+  verify → **release lock**. The engine never does `lock → authorize →
+  mutate`. A mutation lock is coordination, NOT authorization; authorization
+  is evaluated independently for every mutation attempt.
+- **Contention behavior:** the capability never executes; the task fails
+  durably with `mutation lock contention`; the goal is durably BLOCKED
+  (`lock_contention` blocker, rechecked against the live lock store); no
+  duplicate approvals, no replan loop, no recovery record; after the lock is
+  released the goal replans and the new task needs its own fresh approval.
+- **Release guarantees:** locks are released on every terminal path — success,
+  mutation failure (recovery REQUIRED + released), verification failure
+  (recovery REQUIRED + released), unexpected exception. Authorization
+  failures / pending / stale approvals never reach the lock.
+- **Leases:** `expires_at = acquired_at + lease_seconds` with an injectable
+  clock; expired locks are reclaimable atomically (auto-reclaimed on acquire
+  of the same resource, or explicitly via `reclaim_stale_locks()` /
+  `reclaim_lock(id)`); a crashed owner never permanently wedges a resource.
+- **Approval/recovery interaction:** approvals never imply lock ownership
+  (an approved task still contends); pending/expired/denied/stale approvals
+  never acquire locks; recovery never clears or transfers locks — a future
+  task acquires a fresh lock after its own fresh authorization.
+- **Adversarial:** memory/reflection/strategy/model output (`lock_acquired`,
+  `approved`, `owner`, forged metadata) and actor-identity claims cannot
+  create, release, transfer, or bypass locks — the lock store is the only
+  lock authority.
+- **Audit:** `mutation.lock.requested/acquired/contended/reclaimed/released`
+  with bounded metadata only.
+- **CLI:** `arion locks list|show|reclaim <lock_id>` with `--json`
+  (fail-closed reclaim; never authorizes).
+- **Demo:** `scripts/demo_adr021_lock_two_process.py` (two real subprocesses,
+  scenarios A–E, offline).
+
 ## Structured intelligence boundary (ADR-011)
 
 ```
@@ -465,6 +508,10 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/python scripts/demo_adr020_append_recovery.py # append + recovery A-E demo (offline)
 .venv/bin/arion recovery list        # mutation recovery registry (ADR-020)
 .venv/bin/arion recovery acknowledge <recovery_id>
+.venv/bin/arion locks list              # advisory mutation locks (ADR-021)
+.venv/bin/arion locks show <lock_id>
+.venv/bin/arion locks reclaim <lock_id> # expired locks only; never authorizes
+.venv/bin/python scripts/demo_adr021_lock_two_process.py  # two-process lock demo (offline)
 .venv/bin/python -m pytest
 ```
 

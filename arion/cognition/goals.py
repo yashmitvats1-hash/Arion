@@ -49,6 +49,9 @@ class GoalManager:
         strategy_selector: Any | None = None,
         progress_evaluator: ProgressEvaluator | None = None,
         world_monitor: Any | None = None,
+        lock_contention_resolver: Any | None = None,  # ADR-021: callable(blocker)->bool;
+                                                      # True when a lock_contention blocker
+                                                      # may clear (lock no longer active)
     ):
         self.storage = storage
         self.cognitive_store = cognitive_store
@@ -56,6 +59,7 @@ class GoalManager:
         self.strategy_selector = strategy_selector or StrategySelector()
         self.progress_evaluator = progress_evaluator or DeterministicProgressEvaluator()
         self.world_monitor = world_monitor
+        self.lock_contention_resolver = lock_contention_resolver
 
     # ------------------------------------------------------------------ #
     # Goal lifecycle
@@ -207,6 +211,12 @@ class GoalManager:
                 tid = b.get("task_id")
                 task = self.storage.load_task(tid) if tid else None
                 if task is None or task.status != TaskStatus.AWAITING_APPROVAL:
+                    dropped_keys.add(key)
+            elif key == "lock_contention":
+                # ADR-021: the blocker clears when the mutation resource is no
+                # longer actively locked (resolved via the engine's live lock
+                # store - the lock store is the only lock authority).
+                if self.lock_contention_resolver is not None and self.lock_contention_resolver(b):
                     dropped_keys.add(key)
         if not dropped_keys:
             return False

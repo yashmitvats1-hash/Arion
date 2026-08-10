@@ -11,9 +11,10 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Protocol
 
-from arion.state.models import Checkpoint, Goal, Task, utcnow
+from arion.state.models import Checkpoint, Goal, Task, new_id, utcnow
 from arion.observability.events import AuditEvent
 from arion.state.recovery import MutationRecovery
+from arion.state.locks import MutationLock, MutationLockError
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS goals (
@@ -100,6 +101,18 @@ CREATE TABLE IF NOT EXISTS mutation_recoveries (
 );
 CREATE INDEX IF NOT EXISTS idx_recoveries_goal ON mutation_recoveries(goal_id, status);
 CREATE INDEX IF NOT EXISTS idx_recoveries_task ON mutation_recoveries(task_id, step_index);
+CREATE TABLE IF NOT EXISTS mutation_locks (
+    lock_id      TEXT PRIMARY KEY,
+    resource_kind TEXT NOT NULL,
+    resource     TEXT NOT NULL,
+    capability   TEXT NOT NULL,
+    action       TEXT NOT NULL,
+    owner_id     TEXT NOT NULL,
+    acquired_at  TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    UNIQUE(resource_kind, resource)
+);
+CREATE INDEX IF NOT EXISTS idx_locks_resource ON mutation_locks(resource_kind, resource);
 """
 
 
@@ -392,6 +405,161 @@ class SQLiteStorage:
         )
         self._conn.commit()
 
+    # ---- advisory mutation locks (ADR-021) ----
+
+    _LOCK_COLS = (
+        "lock_id", "resource_kind", "resource", "capability", "action",
+        "owner_id", "acquired_at", "expires_at",
+    )
+
+    def acquire(self, resource_kind: str, resource: str, capability: str,
+                action: str, owner_id: str, lease_seconds: float,
+                now: str | None = None) -> "MutationLock":
+        """Atomically acquire the advisory lock for a canonical resource.
+
+        Cross-process safe: BEGIN IMMEDIATE takes the SQLite write lock so no
+        other process can interleave; expired rows for the same resource are
+        reclaimed inside the SAME transaction (a crashed owner never wedges
+        the resource); a live row fails the insert (UNIQUE constraint) and is
+        rolled back into a typed MutationLockError. Never 'check then insert'
+        outside a transaction.
+        """
+        from arion.state.locks import MutationLock, MutationLockError, _add_seconds
+
+        if now is None:
+            now = utcnow()
+        expires = _add_seconds(now, max(0.0, float(lease_seconds)))
+        lock = MutationLock(
+            lock_id=new_id("lock"),
+            resource_kind=resource_kind,
+            resource=resource,
+            capability=capability,
+            action=action,
+            owner_id=owner_id,
+            acquired_at=now,
+            expires_at=expires,
+        )
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            # reclaim any expired row for this exact resource (atomic with insert)
+            self._conn.execute(
+                "DELETE FROM mutation_locks WHERE resource_kind=? AND resource=? AND expires_at <= ?",
+                (resource_kind, resource, now),
+            )
+            self._conn.execute(
+                "INSERT INTO mutation_locks "
+                f"({', '.join(self._LOCK_COLS)}) VALUES ({', '.join('?' * len(self._LOCK_COLS))})",
+                _lock_row(lock),
+            )
+            self._conn.commit()
+            return lock
+        except sqlite3.IntegrityError as exc:
+            self._conn.rollback()
+            raise MutationLockError(
+                f"mutation resource is locked by another owner: {resource_kind!r} {resource!r}"
+            ) from exc
+        except sqlite3.OperationalError as exc:
+            # e.g. 'database is locked' (another writer) - fail closed
+            self._conn.rollback()
+            raise MutationLockError(
+                f"could not acquire mutation lock (database busy): {exc}"
+            ) from exc
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def release(self, lock_id: str, owner_id: str) -> bool:
+        """Release a lock owned by `owner_id`. Returns True when this call
+        removed the lock; False when it was already gone (idempotent for the
+        owner). A non-owner cannot release an existing lock (typed error).
+
+        Atomic across processes: the ownership check and the delete run in one
+        BEGIN IMMEDIATE transaction."""
+        from arion.state.locks import MutationLockError
+
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                f"SELECT {', '.join(self._LOCK_COLS)} FROM mutation_locks WHERE lock_id=?",
+                (lock_id,),
+            ).fetchone()
+            if row is None:
+                self._conn.rollback()
+                return False  # already released/reclaimed: idempotent
+            if _lock_from_row(row).owner_id != owner_id:
+                self._conn.rollback()
+                raise MutationLockError(
+                    f"lock {lock_id} is owned by another owner; cannot release"
+                )
+            self._conn.execute(
+                "DELETE FROM mutation_locks WHERE lock_id=? AND owner_id=?", (lock_id, owner_id))
+            self._conn.commit()
+            return True
+        except sqlite3.OperationalError as exc:
+            self._conn.rollback()
+            raise MutationLockError(f"could not release mutation lock (database busy): {exc}") from exc
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def get(self, lock_id: str) -> "MutationLock | None":
+        row = self._conn.execute(
+            f"SELECT {', '.join(self._LOCK_COLS)} FROM mutation_locks WHERE lock_id=?",
+            (lock_id,),
+        ).fetchone()
+        return _lock_from_row(row) if row else None
+
+    def list(self, resource_kind: str | None = None,
+             resource: str | None = None) -> list["MutationLock"]:
+        cols = ", ".join(self._LOCK_COLS)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if resource_kind:
+            clauses.append("resource_kind = ?")
+            params.append(resource_kind)
+        if resource:
+            clauses.append("resource = ?")
+            params.append(resource)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT {cols} FROM mutation_locks {where} ORDER BY acquired_at", params
+        ).fetchall()
+        return [_lock_from_row(r) for r in rows]
+
+    def reclaim_expired(self, now: str | None = None,
+                        resource_kind: str | None = None,
+                        resource: str | None = None) -> list[str]:
+        """Atomically reclaim (delete) expired locks. Returns the reclaimed
+        lock ids. Active locks are never touched. Cross-process safe."""
+        if now is None:
+            now = utcnow()
+        clauses = ["expires_at <= ?"]
+        params: list[Any] = [now]
+        if resource_kind:
+            clauses.append("resource_kind = ?")
+            params.append(resource_kind)
+        if resource:
+            clauses.append("resource = ?")
+            params.append(resource)
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            rows = self._conn.execute(
+                f"SELECT lock_id FROM mutation_locks WHERE {' AND '.join(clauses)}", params
+            ).fetchall()
+            ids = [r[0] for r in rows]
+            if ids:
+                self._conn.execute(
+                    f"DELETE FROM mutation_locks WHERE {' AND '.join(clauses)}", params
+                )
+            self._conn.commit()
+            return ids
+        except sqlite3.OperationalError as exc:
+            self._conn.rollback()
+            raise MutationLockError(f"could not reclaim expired locks (database busy): {exc}") from exc
+        except Exception:
+            self._conn.rollback()
+            raise
+
     def close(self) -> None:
         self._conn.close()
 
@@ -449,6 +617,20 @@ def _recovery_from_row(row: tuple[Any, ...]) -> "MutationRecovery":
 
     d = {c: v for c, v in zip(SQLiteStorage._RECOVERY_COLS, row)}
     return MutationRecovery.from_dict(d)
+
+
+def _lock_row(lock: "MutationLock") -> tuple[Any, ...]:
+    return (
+        lock.lock_id, lock.resource_kind, lock.resource, lock.capability,
+        lock.action, lock.owner_id, lock.acquired_at, lock.expires_at,
+    )
+
+
+def _lock_from_row(row: tuple[Any, ...]) -> "MutationLock":
+    from arion.state.locks import MutationLock
+
+    d = {c: v for c, v in zip(SQLiteStorage._LOCK_COLS, row)}
+    return MutationLock.from_dict(d)
 
 
 def _goal_from_row(row: tuple[Any, ...]) -> Goal:

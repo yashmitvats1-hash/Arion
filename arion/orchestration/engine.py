@@ -24,6 +24,7 @@ Conceptual flow per task:
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from arion.capabilities.registry import CapabilityError, CapabilityRegistry
@@ -82,6 +83,9 @@ class ArionEngine:
         approval_store: ApprovalStore | None = None,
         approval_ttl_seconds: float | None = None,
         recovery_store: Any | None = None,
+        mutation_lock_store: Any | None = None,
+        mutation_lock_lease_seconds: float = 300.0,
+        lock_clock: Any | None = None,
     ):
         self.storage = storage
         self.registry = registry
@@ -111,6 +115,23 @@ class ArionEngine:
         self.recovery_store = recovery_store
         if self.recovery_store is None and hasattr(storage, "create_recovery"):
             self.recovery_store = storage  # type: ignore[assignment]
+        # Advisory cross-process mutation locks (ADR-021): the storage backend
+        # is the default implementation; an explicit store can be injected.
+        # A lock is COORDINATION, never authorization - it is acquired only
+        # AFTER live authorization succeeds and released on every terminal
+        # path of the mutation.
+        self.mutation_lock_store = mutation_lock_store
+        if self.mutation_lock_store is None and hasattr(storage, "acquire"):
+            self.mutation_lock_store = storage  # type: ignore[assignment]
+        self.mutation_lock_lease_seconds = max(0.0, float(mutation_lock_lease_seconds))
+        self.lock_clock = lock_clock  # injectable clock for deterministic lease tests
+        # The goal manager's lock_contention recheck resolves via the engine's
+        # live lock store (the lock store is the only lock authority).
+        if self.goal_manager is not None:
+            try:
+                self.goal_manager.lock_contention_resolver = self._lock_contention_resolver
+            except Exception:
+                pass
 
     # ---------- mutation recovery (ADR-020) ----------
 
@@ -226,6 +247,221 @@ class ArionEngine:
             except Exception:
                 pass
         return self.recovery_store.get_recovery(recovery_id)
+
+    # ---------- advisory mutation locks (ADR-021) ----------
+
+    def _lock_now(self) -> str:
+        """Clock for lock lease timestamps (injectable for deterministic
+        tests; defaults to the real clock)."""
+        if self.lock_clock is not None:
+            return str(self.lock_clock())
+        return utcnow()
+
+    def _lock_owner(self) -> str:
+        """Explicit, unique owner/process identity for this engine's locks."""
+        return f"proc:{os.getpid()}:{new_id('owner')}"
+
+    def _lock_canonical(self, spec, step: PlanStep) -> tuple[str | None, str | None]:
+        """Canonical lock identity: (resource_kind, canonical resource).
+
+        Keyed by the canonical security-relevant resource - never an
+        arbitrary display string - so write/append (and any path spelling)
+        contend on the same underlying resource.
+        """
+        kind = getattr(spec, "resource_kind", None)
+        param = getattr(spec, "resource_param", None)
+        if not kind or not param:
+            return None, None
+        resource = step.params.get(param)
+        if not isinstance(resource, str) or not resource:
+            return kind, None
+        from arion.state.locks import canonical_resource
+
+        return kind, canonical_resource(kind, resource)
+
+    def _lock_is_active(self, resource_kind: str | None, resource: str | None) -> bool:
+        """True when a non-expired lock exists for the canonical resource."""
+        if self.mutation_lock_store is None or not resource_kind or not resource:
+            return False
+        now = self._lock_now()
+        try:
+            return any(
+                lock.resource_kind == resource_kind
+                and lock.resource == resource
+                and lock.expires_at > now
+                for lock in self.mutation_lock_store.list(resource_kind=resource_kind,
+                                                          resource=resource)
+            )
+        except Exception:
+            return True  # fail closed: cannot verify -> assume contended
+
+    def _lock_contention_resolver(self, blocker: dict) -> bool:
+        """GoalManager recheck hook: a lock_contention blocker clears when the
+        resource it names is no longer actively locked."""
+        kind = blocker.get("resource_kind")
+        resource = blocker.get("resource")
+        if not kind or not resource:
+            return False
+        return not self._lock_is_active(kind, resource)
+
+    def _acquire_mutation_lock(self, task: Task, step: PlanStep, spec) -> Any | None:
+        """Acquire the advisory mutation lock for a step's canonical resource.
+
+        Called ONLY after authorization succeeded (live policy + approval).
+        A lock is coordination, not permission: acquiring it never grants
+        anything, it only prevents a concurrent mutation of the same resource.
+        Returns the lock, or raises MutationLockError on contention.
+        """
+        from arion.state.locks import MutationLockError
+
+        kind, resource = self._lock_canonical(spec, step)
+        if kind is None or resource is None:
+            return None  # no lockable resource (e.g. non-resource mutation)
+        self._emit("mutation.lock.requested", task_id=task.id, step_id=_step_id(step), detail={
+            "resource_kind": kind,
+            "resource": resource,
+            "capability": step.capability,
+            "action": step.action,
+        })
+        owner = self._lock_owner()
+        now = self._lock_now()
+        # reclaim any already-expired rows for this resource (bounded, atomic
+        # inside the store's transaction) and emit the audit trail.
+        try:
+            reclaimed = self.mutation_lock_store.reclaim_expired(
+                now=now, resource_kind=kind, resource=resource)
+            for lock_id in reclaimed:
+                self._emit("mutation.lock.reclaimed", task_id=task.id,
+                           step_id=_step_id(step), detail={
+                               "lock_id": lock_id, "resource_kind": kind,
+                               "resource": resource, "reason": "stale lease expired",
+                           })
+            lock = self.mutation_lock_store.acquire(
+                kind, resource, step.capability, step.action, owner,
+                lease_seconds=self.mutation_lock_lease_seconds, now=now)
+        except MutationLockError:
+            raise
+        self._emit("mutation.lock.acquired", task_id=task.id, step_id=_step_id(step), detail={
+            "lock_id": lock.lock_id,
+            "resource_kind": kind,
+            "resource": resource,
+            "capability": step.capability,
+            "action": step.action,
+            "owner_id": owner,
+        })
+        return lock
+
+    def _release_mutation_lock(self, lock, task: Task, step: PlanStep) -> None:
+        """Release the advisory lock after the mutation window (idempotent).
+        Never fails the task: a stuck release must not mask the mutation's
+        own outcome, but it is audited loudly."""
+        if lock is None or self.mutation_lock_store is None:
+            return
+        try:
+            self.mutation_lock_store.release(lock.lock_id, lock.owner_id)
+            self._emit("mutation.lock.released", task_id=task.id, step_id=_step_id(step), detail={
+                "lock_id": lock.lock_id,
+                "resource_kind": lock.resource_kind,
+                "resource": lock.resource,
+                "capability": lock.capability,
+                "action": lock.action,
+                "owner_id": lock.owner_id,
+            })
+        except Exception as exc:
+            self._emit("error", task_id=task.id, step_id=_step_id(step), success=False,
+                       detail={"error": f"lock release failed: {exc}"})
+
+    def _set_lock_contention_blocker(self, task: Task, step: PlanStep, spec) -> None:
+        """Durably block the goal while the mutation resource is locked by
+        another owner (operational coordination, not authorization)."""
+        kind, resource = self._lock_canonical(spec, step)
+        if self.goal_manager is not None and task.goal_id:
+            try:
+                self.goal_manager.set_blocked(task.goal_id, {
+                    "type": "lock_contention",
+                    "task_id": task.id,
+                    "step_index": step.index,
+                    "capability": step.capability,
+                    "action": step.action,
+                    "resource_kind": kind,
+                    "resource": resource,
+                    "reason": "mutation resource is locked by another owner",
+                }, reason="lock_contention")
+            except Exception:
+                pass
+
+    def reclaim_stale_locks(self, now: str | None = None) -> list[str]:
+        """Explicitly reclaim all expired locks (leases elapsed). Returns the
+        reclaimed lock ids; emits a bounded audit event per lock. Active locks
+        are never touched. Deterministic with an injectable clock."""
+        if self.mutation_lock_store is None:
+            return []
+        now = now or self._lock_now()
+        ids = self.mutation_lock_store.reclaim_expired(now=now)
+        for lock_id in ids:
+            self._emit("mutation.lock.reclaimed", task_id=None, step_id=None, detail={
+                "lock_id": lock_id, "reason": "stale lease expired (explicit reclaim)",
+            })
+        return ids
+
+    def reclaim_lock(self, lock_id: str, now: str | None = None) -> dict:
+        """Reclaim ONE expired lock (administrative, CLI). Fail closed: an
+        unknown id or an ACTIVE lock raises a typed MutationLockError. The
+        reclaim only removes the stale coordination record - it NEVER grants
+        authorization to mutate."""
+        from arion.state.locks import MutationLockError
+
+        if self.mutation_lock_store is None:
+            raise MutationLockError("mutation lock store is not available on this engine")
+        now = now or self._lock_now()
+        lock = self.mutation_lock_store.get(lock_id)
+        if lock is None:
+            raise MutationLockError(f"unknown lock id: {lock_id}")
+        if lock.expires_at > now:
+            raise MutationLockError(f"lock {lock_id} is still active (expires {lock.expires_at}); "
+                                    "active locks cannot be reclaimed")
+        reclaimed = self.mutation_lock_store.reclaim_expired(
+            now=now, resource_kind=lock.resource_kind, resource=lock.resource)
+        if lock_id not in reclaimed:
+            raise MutationLockError(f"lock {lock_id} could not be reclaimed")
+        self._emit("mutation.lock.reclaimed", task_id=None, step_id=None, detail={
+            "lock_id": lock_id,
+            "resource_kind": lock.resource_kind,
+            "resource": lock.resource,
+            "capability": lock.capability,
+            "action": lock.action,
+            "reason": "stale lease expired (administrative reclaim)",
+        })
+        d = lock.to_dict()
+        d["status"] = "reclaimed"
+        return d
+
+    def _block_on_lock_contention(self, goal_id: str, gm) -> bool:
+        """Gate the goal before planning while a lock_contention blocker's
+        resource is still actively locked by another owner. Clears the blocker
+        (via the goal manager's recheck hook) once the lock is gone."""
+        goal = gm.get_goal(goal_id)
+        if goal is None:
+            return False
+        for b in (goal.blockers or []):
+            if (b.get("key") or b.get("type")) == "lock_contention":
+                if self._lock_is_active(b.get("resource_kind"), b.get("resource")):
+                    try:
+                        gm.set_blocked(goal_id, {
+                            "type": "lock_contention",
+                            "reason": "mutation resource is still locked by another owner",
+                            "resource_kind": b.get("resource_kind"),
+                            "resource": b.get("resource"),
+                        }, reason="lock_contention")
+                    except Exception:
+                        pass
+                    return True
+                try:
+                    gm.clear_blocker(goal_id, "lock_contention", reason="lock_contention_cleared")
+                except Exception:
+                    pass
+                return False
+        return False
 
     # ---------- approval expiry (ADR-019) ----------
 
@@ -433,6 +669,8 @@ class ArionEngine:
                     return gm.get_goal(goal_id)
                 if self._block_on_open_recovery(goal_id, gm):
                     return gm.get_goal(goal_id)
+                if self._block_on_lock_contention(goal_id, gm):
+                    return gm.get_goal(goal_id)
                 task = self._plan_for_goal(goal_id, replan_reason=result.evidence.get("reason"))
                 if task is not None:
                     task = self.run_task(task.id)
@@ -451,6 +689,8 @@ class ArionEngine:
             if self._block_on_missing_capability(goal_id, gm):
                 return gm.get_goal(goal_id)
             if self._block_on_open_recovery(goal_id, gm):
+                return gm.get_goal(goal_id)
+            if self._block_on_lock_contention(goal_id, gm):
                 return gm.get_goal(goal_id)
             task = self._plan_for_goal(goal_id, replan_reason=None)
             if task is not None:
@@ -1310,6 +1550,37 @@ class ArionEngine:
         verify_failed = False
         exec_error: str | None = None
         mutating = getattr(spec, "side_effects", "read_only") == "mutating"
+        lock: Any = None
+        if mutating:
+            # ORDERING (ADR-021): authorization (live policy + approval) has
+            # already succeeded in _execute_step BEFORE we reach this point.
+            # The advisory mutation lock is acquired NOW, immediately before
+            # the actual mutation, and released on EVERY terminal path. A
+            # lock is coordination - never permission.
+            from arion.state.locks import MutationLockError
+
+            try:
+                lock = self._acquire_mutation_lock(task, step, spec)
+            except MutationLockError as exc:
+                step.status = StepStatus.FAILED
+                step.error = f"mutation lock contention: {exc}"
+                self._emit("mutation.lock.contended", task_id=task.id,
+                           step_id=_step_id(step), success=False, detail={
+                               "error": step.error[:200],
+                               "capability": step.capability,
+                               "action": step.action,
+                           })
+                self._set_lock_contention_blocker(task, step, spec)
+                return  # capability NEVER executes; task fails durably
+        try:
+            self._execute_attempts(task, step, capability, spec, mutating,
+                                   verify_failed, exec_error)
+        finally:
+            if lock is not None:
+                self._release_mutation_lock(lock, task, step)
+
+    def _execute_attempts(self, task: Task, step: PlanStep, capability, spec,
+                          mutating: bool, verify_failed: bool, exec_error: str | None) -> None:
         while step.attempts < step.max_attempts:
             step.attempts += 1
             step.status = StepStatus.RUNNING
@@ -1409,7 +1680,13 @@ class ArionEngine:
             success=False,
             detail={"attempt": step.attempts, "error": step.error},
         )
-        if mutating and not spec.retry_safe and exec_error is not None:
+        # A mutating, non-retry-safe step that failed OR could not be verified
+        # leaves the world in an uncertain state: durable recovery-required
+        # (ADR-020). Verification failure of a mutation is a recovery case too
+        # (ADR-021 Phase D): the mutation happened, the postcondition is
+        # unconfirmed.
+        recovery_needed = mutating and not spec.retry_safe and (exec_error is not None or verify_failed)
+        if recovery_needed:
             self._emit("mutation.requires_recovery", task_id=task.id,
                        step_id=_step_id(step), success=False,
                        detail={"error": step.error, "attempt": step.attempts})

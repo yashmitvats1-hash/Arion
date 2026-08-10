@@ -167,6 +167,17 @@ def build_parser() -> argparse.ArgumentParser:
     recovery_ack.add_argument("recovery_id")
     recovery_ack.add_argument("--actor", default="cli-operator", help="who acknowledged (audit only; never authorizes)")
 
+    locks = sub.add_parser("locks", help="advisory mutation locks (ADR-021)")
+    locks.add_argument("--db", default=None, dest="db_locks", help=argparse.SUPPRESS)
+    locks_sub = locks.add_subparsers(dest="locks_command", required=True)
+
+    locks_list = locks_sub.add_parser("list", help="list mutation locks", parents=[common, common_memory])
+    locks_show = locks_sub.add_parser("show", help="show a mutation lock", parents=[common, common_memory])
+    locks_show.add_argument("lock_id")
+
+    locks_reclaim = locks_sub.add_parser("reclaim", help="reclaim an EXPIRED mutation lock (ADR-021; never authorizes)", parents=[common, common_memory])
+    locks_reclaim.add_argument("lock_id")
+
     return parser
 
 
@@ -176,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
     db_path = (args.db or args.db_global or getattr(args, "db_mem", None)
                or getattr(args, "db_cog", None) or getattr(args, "db_goals", None)
                or getattr(args, "db_approvals", None) or getattr(args, "db_recovery", None)
+               or getattr(args, "db_locks", None)
                or str(root / "arion_data" / "arion.db"))
 
     engine = build_engine(
@@ -234,9 +246,73 @@ def main(argv: list[str] | None = None) -> int:
         return _approvals_command(args, engine)
     elif args.command == "recovery":
         return _recovery_command(args, engine)
+    elif args.command == "locks":
+        return _locks_command(args, engine)
 
     storage.close()
     return 0
+
+
+def _locks_command(args, engine) -> int:
+    """arion locks list|show|reclaim (advisory mutation locks, ADR-021).
+
+    Uses the domain lock store / engine interfaces only - never raw SQLite.
+    Output is bounded and secret-free (lock/resource/owner identifiers and
+    timestamps). Reclaim only removes EXPIRED coordination records; it never
+    authorizes a mutation.
+    """
+    import json
+
+    store = getattr(engine, "mutation_lock_store", None)
+    if store is None:
+        print("mutation lock store is not available on this engine")
+        return 1
+
+    def _emit(obj):
+        if getattr(args, "json", False):
+            print(json.dumps(obj, indent=2, default=str))
+        else:
+            print(obj)
+
+    if args.locks_command == "list":
+        locks = store.list()
+        if args.json:
+            _emit([l.to_dict() for l in locks])
+            return 0
+        for l in locks:
+            print(f"{l.lock_id}  held  {l.resource_kind}/{l.resource}  "
+                  f"{l.capability}/{l.action}  owner={l.owner_id}  expires={l.expires_at}")
+        return 0
+
+    if args.locks_command == "show":
+        lock = store.get(args.lock_id)
+        if lock is None:
+            print(f"lock {args.lock_id} not found")
+            return 1
+        if args.json:
+            _emit(lock.to_dict())
+            return 0
+        print(f"lock {lock.lock_id}: held")
+        print(f"  {lock.capability}/{lock.action} on {lock.resource_kind} {lock.resource}")
+        print(f"  owner={lock.owner_id}")
+        print(f"  acquired_at={lock.acquired_at}  expires_at={lock.expires_at}")
+        return 0
+
+    if args.locks_command == "reclaim":
+        try:
+            reclaimed = engine.reclaim_lock(args.lock_id)
+        except Exception as exc:
+            print(f"lock reclaim rejected: {exc}")
+            return 1
+        if args.json:
+            _emit(reclaimed)
+            return 0
+        print(f"lock {reclaimed['lock_id']}: reclaimed "
+              f"({reclaimed['capability']}/{reclaimed['action']} on {reclaimed['resource']})")
+        return 0
+
+    print(f"unknown locks command: {args.locks_command}")
+    return 1
 
 
 def _recovery_command(args, engine) -> int:
