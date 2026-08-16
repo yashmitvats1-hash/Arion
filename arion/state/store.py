@@ -206,6 +206,13 @@ CREATE TABLE IF NOT EXISTS scheduler_goal_reservations (
     updated_at  TEXT NOT NULL,
     updated_by  TEXT
 );
+CREATE TABLE IF NOT EXISTS scheduler_goal_ceilings (
+    goal_id     TEXT PRIMARY KEY,
+    ceiling     INTEGER NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    updated_at  TEXT NOT NULL,
+    updated_by  TEXT
+);
 CREATE TABLE IF NOT EXISTS scheduler_events (
     id             TEXT PRIMARY KEY,
     ts             TEXT NOT NULL,
@@ -1534,6 +1541,18 @@ class SQLiteStorage:
                 gcfg = self.get_goal_weight_config(g)
                 if gcfg is not None and not gcfg["enabled"]:
                     continue
+                # ADR-031: a goal AT its enabled ceiling cannot spend
+                # credit, so it must not block refill rounds for peers
+                # (no stranded-credit behavior).
+                ccfg = self.get_goal_ceiling_config(g)
+                if ccfg is not None and ccfg["enabled"]:
+                    c = int(ccfg["ceiling"])
+                    rg = self._conn.execute(
+                        "SELECT COUNT(*) FROM scheduler_work WHERE status=? "
+                        "AND goal_id=?",
+                        (SchedulerWorkStatus.RUNNING.value, g)).fetchone()[0]
+                    if int(rg) >= c:
+                        continue
                 r2 = self._conn.execute(
                     "SELECT deficit FROM scheduler_goal_state WHERE goal_id=?",
                     (g,)).fetchone()
@@ -1666,6 +1685,29 @@ class SQLiteStorage:
             return "deny", tele
         return "pass", tele
 
+    def _sys_ceiling_denied_in_tx(self, goal_id: str, work_id: str,
+                                 scheduler_id: str | None, worker_id: str,
+                                 now: str, running: int, ceiling: int
+                                 ) -> bool:
+        """ADR-031 ceiling gate: True when the goal is at/above its
+        ENABLED ceiling (deny, row stays QUEUED; no DWRR credit consumed,
+        no refill). Runs BEFORE the DWRR gate in both claim paths, so the
+        floor path can never bypass the ceiling."""
+        cfg = self.get_goal_ceiling_config(goal_id)
+        if cfg is None or not cfg["enabled"]:
+            return False
+        c = int(cfg["ceiling"])
+        if running < c:
+            return False
+        self._sech_insert_in_tx(_audit_event(
+            kind="ceiling.denied", ts=now,
+            detail={"scheduler_id": scheduler_id, "worker_id": worker_id,
+                    "goal_id": goal_id, "work_id": work_id,
+                    "running": running, "ceiling": c,
+                    "reason": "goal_ceiling", "outcome": "denied",
+                    "ts": now}))
+        return True
+
     def _sys_establish_claim_in_tx(self, work_id: str, goal_id: str,
                                    worker_id: str, lease: float, now: str,
                                    scheduler_id: str | None,
@@ -1750,6 +1792,14 @@ class SQLiteStorage:
                     "reservation", work_id, goal_id, scheduler_id, worker_id,
                     now, extra=rtele)
                 return None  # reservation protected: row stays QUEUED
+            run_g = self._conn.execute(
+                "SELECT COUNT(*) FROM scheduler_work WHERE status=? "
+                "AND goal_id=?",
+                (SchedulerWorkStatus.RUNNING.value, goal_id)).fetchone()[0]
+            if self._sys_ceiling_denied_in_tx(
+                    goal_id, work_id, scheduler_id, worker_id, now,
+                    int(run_g), self.get_goal_ceiling(goal_id) or 0):
+                return None  # goal at its ceiling: row stays QUEUED
             granted, tele = self._sys_goal_admission_in_tx(goal_id)
             if decision == "floor" and not granted and not tele.get("disabled"):
                 # Floor override: below its reservation the goal is admitted
@@ -1786,6 +1836,14 @@ class SQLiteStorage:
                 "reservation", claimed_work_id, goal_id, scheduler_id,
                 worker_id, now, extra=rtele)
             return None  # reservation protected: row stays QUEUED
+        run_g = self._conn.execute(
+            "SELECT COUNT(*) FROM scheduler_work WHERE status=? "
+            "AND goal_id=?",
+            (SchedulerWorkStatus.RUNNING.value, goal_id)).fetchone()[0]
+        if self._sys_ceiling_denied_in_tx(
+                goal_id, claimed_work_id, scheduler_id, worker_id, now,
+                int(run_g), self.get_goal_ceiling(goal_id) or 0):
+            return None  # goal at its ceiling: row stays QUEUED
         granted, tele = self._sys_goal_admission_in_tx(goal_id)
         if decision == "floor" and not granted and not tele.get("disabled"):
             # Floor override (see the specific-work branch above).
@@ -1964,6 +2022,7 @@ class SQLiteStorage:
         "config", "position", "attempts", "deadline", "next_work_id",
         "disabled", "reservation", "reserved_capacity", "pressure",
         "satisfied", "running", "deficit", "reserved_goal_id",
+        "ceiling", "headroom",
     )
 
     @staticmethod
@@ -2237,6 +2296,12 @@ class SQLiteStorage:
             return "reserved_floor", True
         if share_limited:
             return "scheduler_share_limited", False
+        # ADR-031: the goal ceiling binds before DWRR credit at claim
+        # time, so it outranks the credit-based states here too.
+        ccfg = self.get_goal_ceiling_config(goal_id)
+        if ccfg is not None and ccfg["enabled"] \
+                and running_g >= int(ccfg["ceiling"]):
+            return "goal_ceiling_limited", False
         if credit >= 1:
             return "eligible", True
         # credit < 1: the gate would trigger a refill round iff NO other
@@ -2338,14 +2403,18 @@ class SQLiteStorage:
         above.sort()
         unreserved = (None if cap is None
                       else max(int(cap) - running_count - active_total, 0))
+        recent = self.recent_scheduler_events(limit=200)
 
         weights = self.list_goal_weights()
         weight_by_goal = {w["goal_id"]: w for w in weights}
+        ceilings = self.list_goal_ceilings()
+        ceiling_by_goal = {c["goal_id"]: c for c in ceilings}
 
         goal_ids = sorted(set(running_by_goal) | set(queued_by_goal)
                           | {r["goal_id"] for r in reservations}
-                          | set(weight_by_goal))
+                          | set(weight_by_goal) | set(ceiling_by_goal))
         per_goal: list[dict] = []
+        goals_at_ceiling: list[str] = []
         for g in goal_ids:
             wcfg = weight_by_goal.get(g)
             weight = int(wcfg["weight"]) if wcfg else 1
@@ -2353,12 +2422,19 @@ class SQLiteStorage:
             rcfg = next((r for r in reservations if r["goal_id"] == g), None)
             R = int(rcfg["reservation"]) if rcfg else 0
             res_enabled = bool(rcfg["enabled"]) if rcfg else True
+            ccfg = ceiling_by_goal.get(g)
+            C = int(ccfg["ceiling"]) if ccfg else None
+            c_enabled = bool(ccfg["enabled"]) if ccfg else True
             run_g = running_by_goal.get(g, 0)
             que_g = queued_by_goal.get(g, 0)
             deficit = max(R - run_g, 0)
             satisfied = R == 0 or run_g >= R
             pressure_g = deficit if que_g > 0 else 0
             credit = self._sys_credit_for_goal(g, cap)
+            headroom = (None if C is None
+                        else max(int(C) - run_g, 0))
+            if C is not None and c_enabled and run_g >= int(C):
+                goals_at_ceiling.append(g)
             queued_scheds = {r.scheduler_id for r in queued
                              if r.goal_id == g}
             state, eligible = self._sys_goal_state_projection(
@@ -2370,6 +2446,9 @@ class SQLiteStorage:
                 "weight_enabled": weight_enabled,
                 "reservation": R,
                 "reservation_enabled": res_enabled,
+                "ceiling": C,
+                "ceiling_enabled": c_enabled,
+                "ceiling_headroom": headroom,
                 "running": run_g,
                 "queued": que_g,
                 "reservation_deficit": deficit,
@@ -2379,6 +2458,7 @@ class SQLiteStorage:
                 "state": state,
                 "eligible": eligible,
             })
+        goals_at_ceiling.sort()
 
         return {
             "global_max_concurrency": cap,
@@ -2395,9 +2475,15 @@ class SQLiteStorage:
             "goals_below_reservation": below,
             "goals_at_reservation": at,
             "goals_above_reservation": above,
+            "ceiling_limited_goal_count": len(
+                [c for c in ceilings if c["enabled"]]),
+            "goals_at_ceiling": goals_at_ceiling,
+            "recent_ceiling_denials": sum(
+                1 for e in recent if e.kind == "ceiling.denied"),
             "goals": per_goal,
             "goal_weights": weights,
             "goal_reservations": reservations,
+            "goal_ceilings": ceilings,
             "now": now,
         }
 
@@ -2474,6 +2560,22 @@ class SQLiteStorage:
                         f"{self._RESERVATION_MAX}], got {v} (fail closed)")
                 total += int(v)
             affected = sorted(proposed)
+        # ADR-031: a proposed floor may never exceed the goal's ENABLED
+        # ceiling (durable); ceilings never participate in the cap sum.
+        for g in affected:
+            ccfg = self.get_goal_ceiling_config(g)
+            if ccfg is not None and ccfg["enabled"]:
+                rv = int(proposed[g]) if proposed is not None else                     self.get_goal_reservation(g)
+                if rv > int(ccfg["ceiling"]):
+                    return {
+                        "feasible": False,
+                        "global_max": cap,
+                        "configured_total": current_total,
+                        "proposed_total": total,
+                        "overflow": 0,
+                        "affected_goals": affected,
+                        "reason": "floor_exceeds_ceiling",
+                    }
         if cap is None:
             return {
                 "feasible": True,
@@ -2535,6 +2637,11 @@ class SQLiteStorage:
             delta = "decrease"
         else:
             delta = "unchanged"
+        # ADR-031: the proposed floor must not exceed an enabled ceiling
+        ccfg = self.get_goal_ceiling_config(goal_id)
+        floor_ceiling_valid = True
+        if ccfg is not None and ccfg["enabled"]                 and int(new_reservation) > int(ccfg["ceiling"]):
+            floor_ceiling_valid = False
         return {
             "goal_id": goal_id,
             "current_reservation": current,
@@ -2544,8 +2651,9 @@ class SQLiteStorage:
             "proposed_total": proposed_total,
             "global_max": cap,
             "remaining_capacity": remaining,
-            "feasible": feasible,
+            "feasible": feasible and floor_ceiling_valid,
             "overflow": overflow,
+            "floor_ceiling_valid": floor_ceiling_valid,
             "pressure_delta": delta,
             "reservation_pressure_now": pressure_now,
             "reservation_pressure_proposed": pressure_prop,
@@ -2553,6 +2661,144 @@ class SQLiteStorage:
                 {goal_id} | {g["goal_id"]
                              for g in self.list_goal_reservations()
                              if g["enabled"] and int(g["reservation"]) > 0}),
+            "note": "Dry-run only: nothing was persisted; admission is "
+                    "authoritative at claim time.",
+        }
+
+    @_threadsafe
+    def simulate_ceiling_change(self, goal_id: str,
+                                new_ceiling: int | None) -> dict:
+        """ADR-031 Phase I: read-only dry-run of changing ONE goal's
+        ceiling (None = unbounded). Never persists anything."""
+        if not isinstance(goal_id, str) or not goal_id:
+            raise SchedulerRegistryError(
+                "goal_id required (fail closed)")
+        if new_ceiling is not None and (
+                not isinstance(new_ceiling, int)
+                or isinstance(new_ceiling, bool)):
+            raise SchedulerRegistryError(
+                f"ceiling must be an integer or None, got "
+                f"{new_ceiling!r} (fail closed)")
+        if new_ceiling is not None and                 (new_ceiling < 1 or new_ceiling > self._CEILING_MAX):
+            raise SchedulerRegistryError(
+                f"ceiling must be in [1, {self._CEILING_MAX}] or None "
+                f"(fail closed)")
+        cap = self.get_scheduler_global_max()
+        cfg = self.get_goal_ceiling_config(goal_id)
+        current = int(cfg["ceiling"]) if cfg else None
+        current_enabled = bool(cfg["enabled"]) if cfg else True
+        rcfg = self.get_goal_reservation_config(goal_id)
+        floor = int(rcfg["reservation"]) if rcfg else 0
+        floor_enabled = bool(rcfg["enabled"]) if rcfg else True
+        # validity of the proposed ceiling against the ENABLED floor
+        valid = True
+        if new_ceiling is not None and floor_enabled                 and floor > int(new_ceiling):
+            valid = False
+        snap = self.capacity_snapshot()
+        goal = next((g for g in snap["goals"] if g["goal_id"] == goal_id),
+                    None)
+        running = goal["running"] if goal else 0
+        headroom_now = (None if current is None else max(current - running, 0))
+        headroom_prop = (None if new_ceiling is None
+                         else max(int(new_ceiling) - running, 0))
+        if headroom_now is None and headroom_prop is None:
+            hdelta = "unchanged"
+        elif headroom_now is None:
+            hdelta = "decrease"
+        elif headroom_prop is None:
+            hdelta = "increase"
+        elif headroom_prop > headroom_now:
+            hdelta = "increase"
+        elif headroom_prop < headroom_now:
+            hdelta = "decrease"
+        else:
+            hdelta = "unchanged"
+        return {
+            "goal_id": goal_id,
+            "current_ceiling": current,
+            "current_enabled": current_enabled,
+            "proposed_ceiling": new_ceiling,
+            "floor": floor if floor_enabled else None,
+            "floor_ceiling_valid": valid,
+            "global_max": cap,
+            "running": running,
+            "ceiling_headroom_now": headroom_now,
+            "ceiling_headroom_proposed": headroom_prop,
+            "headroom_delta": hdelta,
+            "affected_goals": [goal_id],
+            "note": "Dry-run only: nothing was persisted; admission is "
+                    "authoritative at claim time.",
+        }
+
+    @_threadsafe
+    def simulate_goal_policy(self, goal_id: str,
+                             reservation: int | None = None,
+                             ceiling: int | None = None,
+                             weight: int | None = None) -> dict:
+        """ADR-031 Phase I: general read-only policy dry-run for ONE goal.
+        Each supplied dimension is validated and compared to the durable
+        value; the resulting floor/ceiling pair and the global
+        feasibility are reported. Never persists anything."""
+        if not isinstance(goal_id, str) or not goal_id:
+            raise SchedulerRegistryError(
+                "goal_id required (fail closed)")
+        rcfg = self.get_goal_reservation_config(goal_id)
+        floor_now = int(rcfg["reservation"]) if rcfg else 0
+        floor_en = bool(rcfg["enabled"]) if rcfg else True
+        ccfg = self.get_goal_ceiling_config(goal_id)
+        ceiling_now = int(ccfg["ceiling"]) if ccfg else None
+        ceiling_en = bool(ccfg["enabled"]) if ccfg else True
+        wcfg = self.get_goal_weight_config(goal_id)
+        weight_now = int(wcfg["weight"]) if wcfg else 1
+        floor_prop = floor_now if reservation is None else reservation
+        ceiling_prop = ceiling_now if ceiling is None else ceiling
+        weight_prop = weight_now if weight is None else weight
+        # validate proposed values exactly like the config APIs
+        if not isinstance(floor_prop, int) or isinstance(floor_prop, bool) \
+                or floor_prop < 0 or floor_prop > self._RESERVATION_MAX:
+            raise SchedulerRegistryError(
+                f"reservation must be an integer in [0, "
+                f"{self._RESERVATION_MAX}] (fail closed)")
+        if ceiling_prop is not None and (
+                not isinstance(ceiling_prop, int)
+                or isinstance(ceiling_prop, bool)
+                or ceiling_prop < 1 or ceiling_prop > self._CEILING_MAX):
+            raise SchedulerRegistryError(
+                f"ceiling must be an integer in [1, "
+                f"{self._CEILING_MAX}] or None (fail closed)")
+        if not isinstance(weight_prop, int) or isinstance(weight_prop, bool) \
+                or weight_prop < 1 or weight_prop > self._WEIGHT_MAX:
+            raise SchedulerRegistryError(
+                f"weight must be an integer in [1, {self._WEIGHT_MAX}] "
+                f"(fail closed)")
+        pair_valid = (ceiling_prop is None or floor_prop <= ceiling_prop)
+        cap = self.get_scheduler_global_max()
+        feasibility = self.reservation_feasibility(
+            proposed={goal_id: floor_prop}) if pair_valid else None
+        snap = self.capacity_snapshot()
+        goal = next((g for g in snap["goals"] if g["goal_id"] == goal_id),
+                    None)
+        running = goal["running"] if goal else 0
+        headroom = (None if ceiling_prop is None
+                    else max(int(ceiling_prop) - running, 0))
+        return {
+            "goal_id": goal_id,
+            "current_floor": floor_now if floor_en else None,
+            "proposed_floor": floor_prop,
+            "current_ceiling": ceiling_now if ceiling_en else None,
+            "proposed_ceiling": ceiling_prop,
+            "current_weight": weight_now,
+            "proposed_weight": weight_prop,
+            "floor_ceiling_valid": pair_valid,
+            "global_max": cap,
+            "reservation_total": (feasibility["proposed_total"]
+                                  if feasibility else None),
+            "feasible": (pair_valid and feasibility["feasible"]
+                         if feasibility else False),
+            "reason": (None if pair_valid else "floor_exceeds_ceiling"),
+            "ceiling_headroom": headroom,
+            "reservation_pressure": snap["reservation_pressure"],
+            "affected_goals": [goal_id],
             "note": "Dry-run only: nothing was persisted; admission is "
                     "authoritative at claim time.",
         }
@@ -2577,6 +2823,7 @@ class SQLiteStorage:
             "reservation_pressure": snap["reservation_pressure"],
             "goals_below": snap["goals_below_reservation"],
             "idle_reserved_goals": idle,
+            "goals_at_ceiling": snap["goals_at_ceiling"],
             "unreserved_capacity": snap["unreserved_capacity"],
             "note": "Read-only check: admission is authoritative at "
                     "claim time.",
@@ -2782,6 +3029,16 @@ class SQLiteStorage:
                         f"reservation total {new_total} exceeds global max "
                         f"{global_max} (ADR-029 oversubscription, fail "
                         f"closed)")
+            if enabled:
+                ccfg = self._conn.execute(
+                    "SELECT ceiling FROM scheduler_goal_ceilings "
+                    "WHERE goal_id=? AND enabled=1", (goal_id,)).fetchone()
+                if ccfg is not None and int(reservation) > int(ccfg[0]):
+                    self._conn.rollback()
+                    raise SchedulerRegistryError(
+                        f"reservation {reservation} exceeds enabled ceiling "
+                        f"{ccfg[0]} for {goal_id} "
+                        f"(ADR-031 floor<=ceiling, fail closed)")
             self._conn.execute(
                 "INSERT OR REPLACE INTO scheduler_goal_reservations "
                 "(goal_id, reservation, enabled, updated_at, updated_by) "
@@ -2872,6 +3129,16 @@ class SQLiteStorage:
                             f"enabling reservation {cfg['reservation']} for "
                             f"{goal_id} would exceed global max {global_max} "
                             f"(ADR-029 oversubscription, fail closed)")
+                # ADR-031: floor <= ceiling when both are enabled
+                ccfg = self._conn.execute(
+                    "SELECT ceiling FROM scheduler_goal_ceilings "
+                    "WHERE goal_id=? AND enabled=1", (goal_id,)).fetchone()
+                if ccfg is not None and int(cfg["reservation"]) > int(ccfg[0]):
+                    self._conn.rollback()
+                    raise SchedulerRegistryError(
+                        f"reservation {cfg['reservation']} exceeds enabled "
+                        f"ceiling {ccfg[0]} for {goal_id} "
+                        f"(ADR-031 floor<=ceiling, fail closed)")
             cur = self._conn.execute(
                 "UPDATE scheduler_goal_reservations SET enabled=?, "
                 "updated_at=? WHERE goal_id=?",
@@ -2890,6 +3157,146 @@ class SQLiteStorage:
             self._conn.rollback()
             raise
         return self.get_goal_reservation_config(goal_id)
+
+    _CEILING_MAX = 10000
+
+    @_threadsafe
+    def set_goal_ceiling(self, goal_id: str, ceiling: int, *,
+                         enabled: bool = True, by: str = "operator",
+                         now: str | None = None) -> None:
+        """Set/update a goal's durable maximum concurrency ceiling
+        (ADR-031). Fail closed: goal_id required; ceiling must be an
+        integer in [1, _CEILING_MAX] (0 is NOT a ceiling - remove/
+        disable for unbounded); with an ENABLED reservation floor R the
+        pair must satisfy R <= ceiling. Emits goal_ceiling_changed
+        atomically."""
+        now = now or utcnow()
+        if not goal_id:
+            raise SchedulerRegistryError(
+                "goal_id required (fail closed)")
+        if not isinstance(ceiling, int) or isinstance(ceiling, bool):
+            raise SchedulerRegistryError(
+                f"ceiling must be an integer, got {ceiling!r} (fail closed)")
+        if ceiling < 1 or ceiling > self._CEILING_MAX:
+            raise SchedulerRegistryError(
+                f"ceiling must be in [1, {self._CEILING_MAX}], got "
+                f"{ceiling} (fail closed; remove/disable for unbounded)")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            if enabled:
+                rcfg = self._conn.execute(
+                    "SELECT reservation FROM scheduler_goal_reservations "
+                    "WHERE goal_id=? AND enabled=1", (goal_id,)).fetchone()
+                if rcfg is not None and int(rcfg[0]) > int(ceiling):
+                    self._conn.rollback()
+                    raise SchedulerRegistryError(
+                        f"ceiling {ceiling} below enabled reservation "
+                        f"{rcfg[0]} for {goal_id} "
+                        f"(ADR-031 floor<=ceiling, fail closed)")
+            self._conn.execute(
+                "INSERT OR REPLACE INTO scheduler_goal_ceilings "
+                "(goal_id, ceiling, enabled, updated_at, updated_by) "
+                "VALUES (?,?,?,?,?)",
+                (goal_id, int(ceiling), 1 if enabled else 0, now,
+                 str(by)[:100]))
+            self._sech_insert_in_tx(_audit_event(
+                kind="goal_ceiling_changed", ts=now,
+                detail={"goal_id": goal_id, "config": "goal_ceiling",
+                        "reason": f"ceiling={int(ceiling)} enabled={enabled}",
+                        "outcome": "set", "ts": now}))
+            self._conn.commit()
+        except SchedulerRegistryError:
+            raise
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_threadsafe
+    def get_goal_ceiling(self, goal_id: str) -> int | None:
+        row = self._conn.execute(
+            "SELECT ceiling FROM scheduler_goal_ceilings WHERE goal_id=?",
+            (goal_id,)).fetchone()
+        if row is None:
+            return None  # unbounded by any goal-specific ceiling
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return None
+
+    @_threadsafe
+    def get_goal_ceiling_config(self, goal_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT goal_id, ceiling, enabled, updated_at, updated_by "
+            "FROM scheduler_goal_ceilings WHERE goal_id=?",
+            (goal_id,)).fetchone()
+        if row is None:
+            return None
+        return {
+            "goal_id": row[0],
+            "ceiling": int(row[1]),
+            "enabled": bool(row[2]),
+            "updated_at": row[3],
+            "updated_by": row[4],
+        }
+
+    @_threadsafe
+    def list_goal_ceilings(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT goal_id, ceiling, enabled, updated_at, updated_by "
+            "FROM scheduler_goal_ceilings ORDER BY goal_id").fetchall()
+        return [{
+            "goal_id": r[0], "ceiling": int(r[1]),
+            "enabled": bool(r[2]), "updated_at": r[3], "updated_by": r[4],
+        } for r in rows]
+
+    @_threadsafe
+    def remove_goal_ceiling(self, goal_id: str) -> bool:
+        cur = self._conn.execute(
+            "DELETE FROM scheduler_goal_ceilings WHERE goal_id=?",
+            (goal_id,))
+        if cur.rowcount > 0:
+            self._sech_insert_in_tx(_audit_event(
+                kind="goal_ceiling_changed", ts=utcnow(),
+                detail={"goal_id": goal_id, "config": "goal_ceiling",
+                        "outcome": "removed", "ts": utcnow()}))
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    @_threadsafe
+    def set_goal_ceiling_enabled(self, goal_id: str,
+                                 enabled: bool) -> dict | None:
+        cfg = self.get_goal_ceiling_config(goal_id)
+        if cfg is None:
+            return None
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            if enabled:
+                rcfg = self._conn.execute(
+                    "SELECT reservation FROM scheduler_goal_reservations "
+                    "WHERE goal_id=? AND enabled=1", (goal_id,)).fetchone()
+                if rcfg is not None and int(rcfg[0]) > int(cfg["ceiling"]):
+                    self._conn.rollback()
+                    raise SchedulerRegistryError(
+                        f"enabling ceiling {cfg['ceiling']} for {goal_id} "
+                        f"would violate enabled reservation {rcfg[0]} "
+                        f"(ADR-031 floor<=ceiling, fail closed)")
+            cur = self._conn.execute(
+                "UPDATE scheduler_goal_ceilings SET enabled=?, "
+                "updated_at=? WHERE goal_id=?",
+                (1 if enabled else 0, utcnow(), goal_id))
+            if cur.rowcount > 0:
+                self._sech_insert_in_tx(_audit_event(
+                    kind="goal_ceiling_changed", ts=utcnow(),
+                    detail={"goal_id": goal_id, "config": "goal_ceiling",
+                            "reason": "enabled" if enabled else "disabled",
+                            "outcome": "set", "ts": utcnow()}))
+            self._conn.commit()
+        except SchedulerRegistryError:
+            raise
+        except Exception:
+            self._conn.rollback()
+            raise
+        return self.get_goal_ceiling_config(goal_id)
 
 
 _GOAL_COLS = ["id", "description", "source", "status", "version", "strategy", "blockers",

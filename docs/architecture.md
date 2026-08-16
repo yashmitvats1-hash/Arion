@@ -846,6 +846,79 @@ loop (ADR-016):
   increase/decrease simulation, status JSON, check JSON, no-mutation
   proof, forged telemetry, cross-process observation, restart.
 
+## Per-goal concurrency ceilings (ADR-031)
+
+- **Concept — three independent policy dimensions:** weight = relative
+  opportunity (DWRR); floor = minimum protected capacity while runnable
+  (ADR-029); **ceiling = maximum concurrent capacity for one goal**.
+  Ceilings never create ownership, never reserve capacity, never bypass
+  existing gates, never establish execution authority.
+- **Data:** `scheduler_goal_ceilings(goal_id, ceiling, enabled,
+  updated_at, updated_by)` — integer `[1, 10000]` when configured;
+  **default `None` = unbounded** (never an invented huge integer; `0` is
+  rejected — use remove/disable for unbounded). API mirrors the
+  reservation registry; config writes emit `goal_ceiling_changed`
+  atomically.
+- **Floor + ceiling compatibility:** when both are enabled, `R <= C`
+  (enforced atomically in ALL four write directions — set ceiling, set
+  floor, enable ceiling, enable floor; failed writes leave no partial
+  state or event). `sum(ceilings)` does NOT need to fit the global cap
+  (maximums, not reservations); ADR-029's floor oversubscription rule is
+  unchanged. Under valid config, a below-floor goal is never at its
+  ceiling (`running < R <= C`) — the impossible state is unconstructible.
+- **Admission gate (final order in `BEGIN IMMEDIATE`):** 1) stale
+  reclaim; 2) global capacity; 3) scheduler fair share; 4) reservation
+  floor/protection; 5) **goal ceiling** (`ceiling.denied`, row stays
+  QUEUED, NO DWRR credit consumed, NO refill); 6) DWRR weighted
+  admission; 7) ownership. Enforced in both the specific-row and
+  `claim_next` paths, so the floor path can never bypass it. Core
+  invariant: `running_G <= C` at every committed state — never bypassed
+  by floors, races, multiple processes, stale reclaim, restart, or
+  handoff.
+- **DWRR interaction (no stranded credit):** a goal AT its enabled
+  ceiling cannot spend credit, so the refill-round check skips it (like
+  weight-disabled goals) — peers keep getting refill rounds and
+  progress; the ceiling-limited goal's durable credit is never destroyed
+  and becomes spendable again below the ceiling.
+- **Dynamic changes:** increase permits new claims immediately; decrease
+  never cancels RUNNING work (binds future claims until running falls
+  below C); disable/remove = unbounded for future claims; values persist
+  across restart; pair changes validate atomically.
+- **Cross-process:** real-subprocess tests prove 2+ processes cannot
+  collectively exceed a ceiling, the final-slot race has exactly one
+  owner, stale reclaim frees a ceiling slot, restart preserves it, and
+  cap/floors/share/DWRR stay authoritative.
+- **Telemetry:** `goal_ceiling_changed`, `ceiling.denied` (goal, work,
+  running, ceiling, reason `goal_ceiling`); `scheduler watch` renders
+  them; forged ceiling events have zero effect.
+- **Status/planning (ADR-030 extension):** per-goal `ceiling`
+  (`None` = unbounded), `ceiling_enabled`, `ceiling_headroom =
+  max(C − running, 0)` (None when unbounded); aggregates
+  `ceiling_limited_goal_count`, `goals_at_ceiling`,
+  `recent_ceiling_denials`; explanation state `goal_ceiling_limited`
+  (outranks credit states, carries the claim-time disclaimer).
+  `reservation_feasibility` validates `floor <= ceiling` (reason
+  `floor_exceeds_ceiling`); `simulate_reservation_change` reports
+  `floor_ceiling_valid`; new `simulate_ceiling_change` and
+  `simulate_goal_policy(goal_id, reservation=, ceiling=, weight=)`
+  dry-runs — all provably mutation-free.
+- **CLI:** `arion scheduler ceilings`; `ceiling set|remove|enable|
+  disable <goal>` (human + `--json`, `--by`, fail-closed validation);
+  `ceiling plan <goal> <n>` (dry-run, never persists, invalid → exit 1);
+  `scheduler status` rows and `reservations --check` expose ceilings.
+- **Security boundary:** forged ceiling config/changed/denied events,
+  task metadata, planner/model output, fake goal ids, queue positions,
+  running counts, DWRR credit, heartbeat/reclaim events cannot change a
+  ceiling, exceed it, transfer it, or bypass it; global capacity remains
+  authoritative. Policy influences admission; policy never establishes
+  execution authority.
+- **Demo:** `scripts/demo_adr031_goal_ceilings.py` (32 checks,
+  deterministic, offline): unbounded default, set/get/remove,
+  enforcement + exact boundary, multiple goals, cross-process race,
+  high/low weight, increase/decrease/disable, restart, stale reclaim,
+  floor+ceiling valid/invalid, telemetry, status, planning, forged
+  events.
+
 ## Structured intelligence boundary (ADR-011)
 
 ```

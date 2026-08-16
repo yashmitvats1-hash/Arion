@@ -110,6 +110,8 @@ EVENT_KINDS = (
     "goal_reservation_changed",
     "reservation.denied",
     "reservation.satisfied",
+    "goal_ceiling_changed",
+    "ceiling.denied",
     "error",
 )
 

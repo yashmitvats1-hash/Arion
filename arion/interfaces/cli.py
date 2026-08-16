@@ -228,6 +228,24 @@ def build_parser() -> argparse.ArgumentParser:
     sched_reservation_plan.add_argument("goal_id")
     sched_reservation_plan.add_argument("capacity", type=int)
 
+    sched_ceilings = sched_sub.add_parser("ceilings", help="list durable per-goal concurrency ceilings (ADR-031)", parents=[common, common_memory])
+    sched_ceiling = sched_sub.add_parser("ceiling", help="manage a goal's durable concurrency ceiling (ADR-031)", parents=[common, common_memory])
+    sched_ceiling_sub = sched_ceiling.add_subparsers(dest="scheduler_ceiling_command", required=True)
+    sched_ceiling_set = sched_ceiling_sub.add_parser("set", help="set a goal's ceiling (>=1, bounded; scheduler POLICY, never authorization)", parents=[common, common_memory])
+    sched_ceiling_set.add_argument("goal_id")
+    sched_ceiling_set.add_argument("capacity", type=int)
+    sched_ceiling_set.add_argument("--disable", action="store_true", help="set the config disabled (unbounded)")
+    sched_ceiling_set.add_argument("--by", default="cli-operator", help="who configured (audit only)")
+    sched_ceiling_rm = sched_ceiling_sub.add_parser("remove", help="remove a goal's ceiling config (back to unbounded)", parents=[common, common_memory])
+    sched_ceiling_rm.add_argument("goal_id")
+    sched_ceiling_en = sched_ceiling_sub.add_parser("enable", help="enable a goal's ceiling config", parents=[common, common_memory])
+    sched_ceiling_en.add_argument("goal_id")
+    sched_ceiling_dis = sched_ceiling_sub.add_parser("disable", help="disable a goal's ceiling config (unbounded)", parents=[common, common_memory])
+    sched_ceiling_dis.add_argument("goal_id")
+    sched_ceiling_plan = sched_ceiling_sub.add_parser("plan", help="DRY-RUN: simulate setting a goal's ceiling WITHOUT persisting (ADR-031)", parents=[common, common_memory])
+    sched_ceiling_plan.add_argument("goal_id")
+    sched_ceiling_plan.add_argument("capacity", type=int)
+
     sched_watch = sched_sub.add_parser("watch", help="show scheduler telemetry events (ADR-028; observational only)", parents=[common, common_memory])
     sched_watch.add_argument("--goal", default=None, help="filter by goal id")
     sched_watch.add_argument("--scheduler", default=None, help="filter by scheduler id")
@@ -374,11 +392,14 @@ def _scheduler_command(args, engine) -> int:
                 "reservation_pressure", "unreserved_capacity",
                 "active_scheduler_count", "active_goal_count",
                 "reserved_goal_count", "goals_below_reservation",
-                "goals_at_reservation", "goals_above_reservation")}
+                "goals_at_reservation", "goals_above_reservation",
+                "ceiling_limited_goal_count", "goals_at_ceiling",
+                "recent_ceiling_denials")}
             out.update(planning)
             out["goals"] = snap["goals"]
             out["goal_weights"] = snap["goal_weights"]
             out["goal_reservations"] = snap["goal_reservations"]
+            out["goal_ceilings"] = snap.get("goal_ceilings", [])
         if args.json:
             _emit(out)
         elif planning:
@@ -394,9 +415,12 @@ def _scheduler_command(args, engine) -> int:
             for g in out["goals"]:
                 sat = "yes" if g["reservation_satisfied"] else "no"
                 state = g["state"]
+                ceiling = g.get("ceiling")
+                ceiling_s = ("-" if ceiling is None else str(ceiling))
                 print(f"  {g['goal_id']:<10} weight={g['weight']} "
-                      f"reservation={g['reservation']} running={g['running']} "
-                      f"queued={g['queued']} satisfied={sat} state={state}")
+                      f"reservation={g['reservation']} ceiling={ceiling_s} "
+                      f"running={g['running']} queued={g['queued']} "
+                      f"satisfied={sat} state={state}")
             if not out["goals"]:
                 print("  (no goals)")
         else:
@@ -533,6 +557,7 @@ def _scheduler_command(args, engine) -> int:
                   + (f" (overflow {data['overflow']})" if data["overflow"] else ""))
             print(f"Goals below floor:    {', '.join(data['goals_below']) or '-'}")
             print(f"Idle reserved goals:  {', '.join(data['idle_reserved_goals']) or '-'}")
+            print(f"Goals at ceiling:     {', '.join(data['goals_at_ceiling']) or '-'}")
         return 0 if data["feasible"] else 1
 
     if args.scheduler_command == "reservations":
@@ -620,6 +645,84 @@ def _scheduler_command(args, engine) -> int:
             return 0
         return 1
 
+    if args.scheduler_command == "ceilings":
+        rows = (store.list_goal_ceilings()
+                if hasattr(store, "list_goal_ceilings") else [])
+        if args.json:
+            _emit(rows)
+            return 0
+        if not rows:
+            print("(no goal ceilings configured - all goals are unbounded)")
+            return 0
+        for r in rows:
+            state = "enabled" if r["enabled"] else "disabled"
+            print(f"{r['goal_id']:<24} ceiling={r['ceiling']:<5} "
+                  f"{state:<9} by {r['updated_by']} @ {r['updated_at']}")
+        return 0
+
+    if args.scheduler_command == "ceiling":
+        from arion.state.scheduler_work import SchedulerRegistryError
+
+        if args.scheduler_ceiling_command == "plan":
+            if not hasattr(store, "simulate_ceiling_change"):
+                print("capacity planning is not available on this engine")
+                return 1
+            try:
+                sim = store.simulate_ceiling_change(args.goal_id,
+                                                    args.capacity)
+            except SchedulerRegistryError as exc:
+                print(f"invalid ceiling plan: {exc}")
+                return 1
+            if args.json:
+                _emit(sim)
+            else:
+                cur = sim["current_ceiling"]
+                print(f"goal={sim['goal_id']} ceiling "
+                      f"{cur if cur is not None else 'unbounded'} -> "
+                      f"{sim['proposed_ceiling']}")
+                print(f"floor={sim['floor']} "
+                      f"floor<=ceiling={'yes' if sim['floor_ceiling_valid'] else 'no'} "
+                      f"headroom {sim['ceiling_headroom_now']} -> "
+                      f"{sim['ceiling_headroom_proposed']} "
+                      f"({sim['headroom_delta']})")
+                print("dry-run only: nothing was persisted")
+            return 0
+        if args.scheduler_ceiling_command == "set":
+            try:
+                store.set_goal_ceiling(args.goal_id, args.capacity,
+                                       enabled=not args.disable,
+                                       by=args.by, now=engine._lock_now())
+            except SchedulerRegistryError as exc:
+                print(f"invalid ceiling config: {exc}")
+                return 1
+            cfg = store.get_goal_ceiling_config(args.goal_id)
+            if args.json:
+                _emit(cfg)
+            else:
+                print(f"{args.goal_id}: ceiling={cfg['ceiling']} "
+                      f"{'disabled' if not cfg['enabled'] else 'enabled'} "
+                      f"(by {cfg['updated_by']})")
+            return 0
+        if args.scheduler_ceiling_command == "remove":
+            removed = store.remove_goal_ceiling(args.goal_id)
+            if not removed:
+                print(f"{args.goal_id}: no ceiling config (unbounded)")
+                return 1
+            print(f"{args.goal_id}: ceiling removed (unbounded restored)")
+            return 0
+        if args.scheduler_ceiling_command in ("enable", "disable"):
+            enabled = args.scheduler_ceiling_command == "enable"
+            cfg = store.set_goal_ceiling_enabled(args.goal_id, enabled)
+            if cfg is None:
+                print(f"{args.goal_id}: no ceiling config to "
+                      f"{'enable' if enabled else 'disable'}")
+                return 1
+            print(f"{args.goal_id}: "
+                  f"{'enabled' if enabled else 'disabled'} "
+                  f"(ceiling={cfg['ceiling']})")
+            return 0
+        return 1
+
     if args.scheduler_command == "watch":
         if not hasattr(store, "scheduler_events"):
             print("scheduler telemetry is not available on this engine")
@@ -655,6 +758,12 @@ def _scheduler_command(args, engine) -> int:
                          f"running={d.get('running')}")
             if e.kind == "goal_reservation_changed":
                 extra = f" config={d.get('config')} ({d.get('outcome', '-')} {d.get('reason', '')})"
+            if e.kind == "goal_ceiling_changed":
+                extra = f" config={d.get('config')} ({d.get('outcome', '-')} {d.get('reason', '')})"
+            if e.kind == "ceiling.denied":
+                extra = (f" reason={d.get('reason', '-')} "
+                         f"running={d.get('running')} "
+                         f"ceiling={d.get('ceiling')}")
             print(f"{e.ts}  {e.kind:<24} who={who:<20} goal={goal:<12} "
                   f"work={work:<12}{extra}")
 
