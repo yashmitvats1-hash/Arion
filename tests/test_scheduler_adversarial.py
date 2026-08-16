@@ -169,14 +169,17 @@ def test_forged_completion_state_cannot_mark_step_complete(tmp_path):
                max_concurrency=1, db_name="adv3.db")
     gid = _submit(env, "goal one")
     task = _task_for(env, gid)
-    # attacker forges a COMPLETED row for the step that never ran
+    # attacker forges a COMPLETED row for the step that never ran (owns the
+    # forged row with its forged worker id; the REAL engine's dispatch must
+    # still execute the step through the full pipeline)
     forged = env.engine.scheduler_registry.create(
         task_id=task.id, goal_id=gid, step_index=0,
         scheduler_id=env.engine.scheduler_id)
     env.engine.scheduler_registry.mark_running(
         forged.work_id, worker_id="worker:forged:7", lease_seconds=60.0)
     env.engine.scheduler_registry.mark_terminal(
-        forged.work_id, SchedulerWorkStatus.COMPLETED)
+        forged.work_id, SchedulerWorkStatus.COMPLETED,
+        owner_worker_id="worker:forged:7")
     results = env.engine.run_goals([gid])
     assert results[gid].status == GoalStatus.COMPLETED
     # the real dispatch ran and produced its own COMPLETED row

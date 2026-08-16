@@ -84,7 +84,7 @@ def test_running_to_terminal_states(db_path: str):
                          now="2026-01-01T00:01:00+00:00")
         terminal = reg.mark_terminal(
             work.work_id, status, error="boom" if status == SchedulerWorkStatus.FAILED else None,
-            now="2026-01-01T00:02:00+00:00")
+            now="2026-01-01T00:02:00+00:00", owner_worker_id="w1")
         assert terminal.status == status
         assert terminal.completed_at == "2026-01-01T00:02:00+00:00"
         if status == SchedulerWorkStatus.FAILED:
@@ -128,7 +128,7 @@ def test_illegal_transitions_rejected(db_path: str, from_status, to_status):
         reg.mark_running(work.work_id, worker_id="w1", lease_seconds=60.0)
     elif from_status in (SchedulerWorkStatus.COMPLETED, SchedulerWorkStatus.FAILED):
         reg.mark_running(work.work_id, worker_id="w1", lease_seconds=60.0)
-        reg.mark_terminal(work.work_id, from_status)
+        reg.mark_terminal(work.work_id, from_status, owner_worker_id="w1")
     elif from_status in (SchedulerWorkStatus.CANCELLED, SchedulerWorkStatus.ABANDONED):
         # cancelled/abandoned rows come from QUEUED (pre-execution)
         reg.mark_terminal(work.work_id, from_status)
@@ -136,16 +136,16 @@ def test_illegal_transitions_rejected(db_path: str, from_status, to_status):
         if to_status == SchedulerWorkStatus.RUNNING:
             reg.mark_running(work.work_id, worker_id="w2", lease_seconds=60.0)
         else:
-            reg.mark_terminal(work.work_id, to_status)
+            reg.mark_terminal(work.work_id, to_status, owner_worker_id="w1")
 
 
 def test_terminal_states_are_final(db_path: str):
     reg = _reg(db_path)
     work = _mk(reg)
     reg.mark_running(work.work_id, worker_id="w1", lease_seconds=60.0)
-    reg.mark_terminal(work.work_id, SchedulerWorkStatus.COMPLETED)
+    reg.mark_terminal(work.work_id, SchedulerWorkStatus.COMPLETED, owner_worker_id="w1")
     with pytest.raises(SchedulerStateError):
-        reg.mark_terminal(work.work_id, SchedulerWorkStatus.FAILED)
+        reg.mark_terminal(work.work_id, SchedulerWorkStatus.FAILED, owner_worker_id="w1")
 
 
 def test_unknown_work_id_fails_closed(db_path: str):
@@ -161,7 +161,7 @@ def test_state_error_is_typed_and_carries_actual_state(db_path: str):
     reg = _reg(db_path)
     work = _mk(reg)
     reg.mark_running(work.work_id, worker_id="w1", lease_seconds=60.0)
-    reg.mark_terminal(work.work_id, SchedulerWorkStatus.COMPLETED)
+    reg.mark_terminal(work.work_id, SchedulerWorkStatus.COMPLETED, owner_worker_id="w1")
     with pytest.raises(SchedulerStateError) as exc:
         reg.mark_running(work.work_id, worker_id="w2", lease_seconds=60.0)
     assert "completed" in str(exc.value)
@@ -179,7 +179,7 @@ def test_registry_rows_never_hold_engine_objects(db_path: str):
     work = _mk(reg)
     reg.mark_running(work.work_id, worker_id="w1", lease_seconds=60.0)
     reg.mark_terminal(work.work_id, SchedulerWorkStatus.FAILED,
-                      error="x" * 5000)
+                      error="x" * 5000, owner_worker_id="w1")
     d = reg.get_work(work.work_id).to_dict()
     assert set(d.keys()) == {
         "work_id", "task_id", "goal_id", "step_index", "scheduler_id",
@@ -196,7 +196,7 @@ def test_created_row_is_durable_across_reopen(db_path: str):
     reg.mark_running(work.work_id, worker_id="w1", lease_seconds=10.0,
                      now="2026-01-01T00:01:00+00:00")
     reg.mark_terminal(work.work_id, SchedulerWorkStatus.COMPLETED,
-                      now="2026-01-01T00:02:00+00:00")
+                      now="2026-01-01T00:02:00+00:00", owner_worker_id="w1")
     again = _reg(db_path)
     loaded = again.get_work(work.work_id)
     assert loaded.status == SchedulerWorkStatus.COMPLETED

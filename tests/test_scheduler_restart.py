@@ -71,7 +71,13 @@ def test_death_while_queued_abandons_foreign_queue_and_reruns(tmp_path):
         task_id=task.id, goal_id=gid, step_index=0,
         scheduler_id=env.engine.scheduler_id)
     assert row.status == SchedulerWorkStatus.QUEUED
+    a_scheduler_id = env.engine.scheduler_id
     env.engine.storage.close()
+    # ADR-026: A's registration is still live; its queue is abandoned only
+    # once the registration lapses (crash detection). Model the lapse here.
+    probe = SQLiteStorage(db)
+    probe.unregister_scheduler(a_scheduler_id)
+    probe.close()
 
     # engine B (restart) on the same DB
     read_cap = SlowReadCapability(sleep=0.01)

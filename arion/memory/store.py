@@ -12,7 +12,9 @@ param VALUES (only param key names in plan_summary).
 from __future__ import annotations
 
 import json
+import functools
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -103,12 +105,26 @@ _REFLECTION_COLS = [
 ]
 
 
+def _threadsafe(method):
+    """Guard public methods with the connection's RLock (ADR-026:
+    cross-process engines may drive a store from different threads)."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._sql_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class SQLiteMemoryStore:
     """Durable SQLite episodic memory + reflections."""
 
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
-        self._conn = sqlite3.connect(self.db_path, timeout=10)
+        self._sql_lock = threading.RLock()
+        self._conn = sqlite3.connect(self.db_path, timeout=10,
+                                     check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._conn.executescript(SCHEMA)
@@ -116,6 +132,7 @@ class SQLiteMemoryStore:
 
     # ---- episodes ----
 
+    @_threadsafe
     def record_episode(self, episode: Episode) -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO episodic_memories "
@@ -142,6 +159,7 @@ class SQLiteMemoryStore:
         )
         self._conn.commit()
 
+    @_threadsafe
     def get_episode(self, episode_id: str) -> Episode | None:
         row = self._conn.execute(
             "SELECT " + ", ".join(_EPISODE_COLS) + " FROM episodic_memories WHERE episode_id=?",
@@ -149,6 +167,7 @@ class SQLiteMemoryStore:
         ).fetchone()
         return _episode_from_row(row) if row else None
 
+    @_threadsafe
     def search_episodes(self, filters: EpisodeFilter) -> list[Episode]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -175,6 +194,7 @@ class SQLiteMemoryStore:
         ).fetchall()
         return [_episode_from_row(r) for r in rows]
 
+    @_threadsafe
     def list_recent(self, limit: int = 10) -> list[Episode]:
         rows = self._conn.execute(
             f"SELECT {', '.join(_EPISODE_COLS)} FROM episodic_memories ORDER BY created_at DESC LIMIT ?",
@@ -184,6 +204,7 @@ class SQLiteMemoryStore:
 
     # ---- reflections ----
 
+    @_threadsafe
     def record_reflection(self, reflection: Reflection) -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO reflections "
@@ -204,6 +225,7 @@ class SQLiteMemoryStore:
         )
         self._conn.commit()
 
+    @_threadsafe
     def get_reflection(self, reflection_id: str) -> Reflection | None:
         row = self._conn.execute(
             "SELECT " + ", ".join(_REFLECTION_COLS) + " FROM reflections WHERE reflection_id=?",
@@ -211,6 +233,7 @@ class SQLiteMemoryStore:
         ).fetchone()
         return _reflection_from_row(row) if row else None
 
+    @_threadsafe
     def list_recent_reflections(self, limit: int = 10) -> list[Reflection]:
         rows = self._conn.execute(
             f"SELECT {', '.join(_REFLECTION_COLS)} FROM reflections ORDER BY created_at DESC LIMIT ?",
@@ -218,6 +241,7 @@ class SQLiteMemoryStore:
         ).fetchall()
         return [_reflection_from_row(r) for r in rows]
 
+    @_threadsafe
     def link_reflection(self, episode_id: str, reflection_id: str) -> None:
         self._conn.execute(
             "UPDATE episodic_memories SET reflection_id=?, updated_at=datetime('now') WHERE episode_id=?",
@@ -227,6 +251,7 @@ class SQLiteMemoryStore:
 
     # ---- consolidations ----
 
+    @_threadsafe
     def record_consolidation(self, record: ConsolidationRecord) -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO consolidations "
@@ -244,6 +269,7 @@ class SQLiteMemoryStore:
         )
         self._conn.commit()
 
+    @_threadsafe
     def list_consolidations(self, limit: int = 50) -> list[ConsolidationRecord]:
         rows = self._conn.execute(
             "SELECT consolidation_id, source_episode_ids, category, merged_lesson, count, importance, created_at "
@@ -258,6 +284,7 @@ class SQLiteMemoryStore:
             ))
         return out
 
+    @_threadsafe
     def prune(self, older_than: str | None = None, max_episodes: int | None = None) -> int:
         """Archival/pruning seam (ADR-014) - intentionally NOT implemented.
 
@@ -271,6 +298,7 @@ class SQLiteMemoryStore:
             "design the archival policy before enabling this"
         )
 
+    @_threadsafe
     def close(self) -> None:
         self._conn.close()
 

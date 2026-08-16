@@ -149,11 +149,15 @@ def new_work_id() -> str:
 
 
 class SchedulerRegistry(Protocol):
-    """Store protocol for the durable scheduler registry (ADR-025).
+    """Store protocol for the durable scheduler registry (ADR-025/026).
 
     The engine and CLI talk to this protocol only - never to SQLite
     directly. Implemented by SQLiteStorage (the default), exactly like the
     approval/recovery/lock stores.
+
+    ADR-026 adds real OWNERSHIP: claims are atomic (BEGIN IMMEDIATE),
+    leases are bounded + monotonic, heartbeats are ownership-checked, and
+    terminal transitions from RUNNING require the current owner.
     """
 
     def create(self, *, task_id: str, goal_id: str | None, step_index: int,
@@ -162,23 +166,29 @@ class SchedulerRegistry(Protocol):
         ...
 
     def mark_running(self, work_id: str, worker_id: str, lease_seconds: float,
-                     now: str | None = None) -> SchedulerWork:
-        """QUEUED -> RUNNING with a lease deadline. Typed error otherwise."""
+                     now: str | None = None,
+                     max_lease_seconds: float | None = None) -> SchedulerWork:
+        """QUEUED -> RUNNING with a lease deadline. Typed error otherwise.
+        The lease is capped at started_at + max_lease_seconds when given."""
         ...
 
     def mark_terminal(self, work_id: str, status: SchedulerWorkStatus,
-                      error: str | None = None, now: str | None = None) -> SchedulerWork:
+                      error: str | None = None, now: str | None = None,
+                      owner_worker_id: str | None = None) -> SchedulerWork:
         """Transition to a legal terminal state (COMPLETED/FAILED/CANCELLED/
-        ABANDONED). Typed error on illegal or unknown transitions."""
+        ABANDONED). RUNNING -> COMPLETED/FAILED REQUIRES owner_worker_id to
+        match the row's current owner (stale owners are rejected with a
+        typed error). Typed error on illegal or unknown transitions."""
         ...
 
     def get_work(self, work_id: str) -> SchedulerWork | None:
         ...
 
     def list_work(self, status: SchedulerWorkStatus | None = None,
-             scheduler_id: str | None = None,
-             task_id: str | None = None,
-             goal_id: str | None = None) -> list[SchedulerWork]:
+                  scheduler_id: str | None = None,
+                  task_id: str | None = None,
+                  goal_id: str | None = None,
+                  step_index: int | None = None) -> list[SchedulerWork]:
         ...
 
     def reclaim_stale(self, now: str | None = None) -> list[str]:
@@ -188,9 +198,78 @@ class SchedulerRegistry(Protocol):
 
     def abandon_foreign_queued(self, scheduler_id: str,
                                now: str | None = None) -> int:
-        """QUEUED rows owned by a DIFFERENT (presumed dead) scheduler ->
-        ABANDONED. This engine's own QUEUED rows are untouched. Returns the
-        number abandoned. Idempotent."""
+        """QUEUED rows whose scheduler has NO live registration (dead
+        process) -> ABANDONED. A LIVE peer's queue is never touched.
+        Idempotent."""
+        ...
+
+    # ---- ADR-026 ownership primitives ----
+
+    def register_scheduler(self, scheduler_id: str, pid: int,
+                           lease_seconds: float, now: str | None = None) -> None:
+        """Durable scheduler registration (unique id; process-lifetime)."""
+        ...
+
+    def heartbeat_scheduler(self, scheduler_id: str, lease_seconds: float,
+                            now: str | None = None,
+                            max_lease_seconds: float | None = None) -> bool:
+        """Extend a scheduler registration lease (bounded + monotonic).
+        Returns False for an unknown scheduler (never an error)."""
+        ...
+
+    def unregister_scheduler(self, scheduler_id: str) -> None:
+        """Remove a scheduler registration (clean shutdown). Idempotent."""
+        ...
+
+    def scheduler_registration_live(self, scheduler_id: str,
+                                    now: str | None = None) -> bool:
+        ...
+
+    def set_scheduler_global_max(self, n: int) -> None:
+        """Configure the durable cross-process capacity (>= 1)."""
+        ...
+
+    def get_scheduler_global_max(self) -> int | None:
+        ...
+
+    def claim(self, work_id: str, worker_id: str, lease_seconds: float,
+              now: str | None = None,
+              max_lease_seconds: float | None = None,
+              scheduler_id: str | None = None) -> SchedulerWork:
+        """Atomically claim ONE specific QUEUED row: expired RUNNING rows are
+        reclaimed, the cross-process capacity AND fair share (if configured)
+        are enforced, and the row transitions QUEUED -> RUNNING with this
+        owner + lease. Exactly one owner under any race. Typed error if not
+        claimable."""
+        ...
+
+    def claim_next(self, scheduler_id: str, worker_id: str,
+                   lease_seconds: float, now: str | None = None,
+                   max_lease_seconds: float | None = None) -> SchedulerWork | None:
+        """Atomically claim the oldest QUEUED row for this scheduler under
+        the same transaction rules as claim(). None when empty / capacity
+        full."""
+        ...
+
+    def heartbeat(self, work_id: str, worker_id: str, lease_seconds: float,
+                  now: str | None = None,
+                  max_lease_seconds: float | None = None) -> SchedulerWork:
+        """Ownership-checked lease extension: monotonic (never shrinks, now
+        >= started_at), bounded (expiry <= started_at + max_lease), and a
+        stale owner (lease already expired) can never resurrect the row."""
+        ...
+
+    def release_and_claim_next(self, work_id: str, owner_worker_id: str,
+                               status: SchedulerWorkStatus,
+                               error: str | None, scheduler_id: str,
+                               worker_id: str, lease_seconds: float,
+                               now: str | None = None,
+                               max_lease_seconds: float | None = None,
+                               ) -> tuple[SchedulerWork, SchedulerWork | None]:
+        """Atomic handoff: ownership-checked terminal transition of ONE row
+        AND claim of the next QUEUED row for this scheduler in ONE
+        transaction (release_and_select_next-style). Returns
+        (terminal_row, next_row_or_None)."""
         ...
 
 

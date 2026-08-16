@@ -109,6 +109,8 @@ class ArionEngine:
         scheduler_registry: Any | None = None,
         scheduler_lease_seconds: float = 300.0,
         scheduler_reclaim_on_start: bool = True,
+        scheduler_global_max_concurrency: int | None = None,
+        scheduler_max_lease_seconds: float | None = None,
     ):
         self.storage = storage
         self.registry = registry
@@ -187,17 +189,47 @@ class ArionEngine:
         if self.scheduler_registry is None and hasattr(storage, "create"):
             self.scheduler_registry = storage  # type: ignore[assignment]
         self.scheduler_lease_seconds = max(0.0, float(scheduler_lease_seconds))
+        self.scheduler_max_lease_seconds = (
+            max(0.0, float(scheduler_max_lease_seconds))
+            if scheduler_max_lease_seconds is not None
+            else self.scheduler_lease_seconds * 10.0)
+        # ADR-026: optional durable CROSS-PROCESS capacity. When configured
+        # (in the shared registry), every atomic claim enforces it, so N
+        # engine processes cannot turn the per-engine limit into N x limit.
+        if (scheduler_global_max_concurrency is not None
+                and self.scheduler_registry is not None
+                and hasattr(self.scheduler_registry, "set_scheduler_global_max")):
+            try:
+                self.scheduler_registry.set_scheduler_global_max(
+                    int(scheduler_global_max_concurrency))
+            except Exception:
+                pass
         # This engine's durable scheduler identity: on (re)start, QUEUED rows
-        # owned by a DIFFERENT (presumed dead) scheduler are abandoned and
-        # stale RUNNING leases are reclaimed, so no immortal RUNNING worker
-        # and no dead process's queue can ever be mistaken for live work.
+        # whose scheduler has NO live registration (presumed dead) are
+        # abandoned and stale RUNNING leases are reclaimed, so no immortal
+        # RUNNING worker and no dead process's queue can ever be mistaken
+        # for live work - while a LIVE peer's queue is never touched
+        # (ADR-026 registration liveness).
         self.scheduler_id = new_id("sched")
+        self._registered = False
         if self.scheduler_registry is not None and scheduler_reclaim_on_start:
             try:
                 self.scheduler_registry.reclaim_stale(now=self._lock_now())
                 self.scheduler_registry.abandon_foreign_queued(self.scheduler_id)
+                if hasattr(self.scheduler_registry, "register_scheduler"):
+                    self.scheduler_registry.register_scheduler(
+                        self.scheduler_id, pid=os.getpid(),
+                        lease_seconds=self.scheduler_lease_seconds,
+                        now=self._lock_now())
+                    self._registered = True
             except Exception:
                 pass
+        # In-flight claimed work of THIS engine (work_id -> (task_id,
+        # step_index)): lets _admit_step distinguish its own RUNNING rows
+        # from foreign/forged ones. Coordination only - never authorization.
+        self._claimed_work: dict[str, tuple[str, int]] = {}
+        # Round-progress flag for cross-process capacity clean stops.
+        self._last_run_progress = True
         # The goal manager's lock_contention recheck resolves via the engine's
         # live lock store (the lock store is the only lock authority).
         if self.goal_manager is not None:
@@ -926,7 +958,8 @@ class ArionEngine:
         marked CANCELLED (a cancelled row can never run). Rows already
         RUNNING were drained by the join and reach their terminal state via
         the worker's own mirror; stale rows are reclaimed on the next
-        engine construction."""
+        engine construction. The durable scheduler registration is removed
+        (ADR-026) so peers can abandon this process's leftover queue."""
         if getattr(self, "scheduler", None) is not None:
             self.scheduler.shutdown(timeout=timeout)
         if getattr(self, "scheduler_registry", None) is not None:
@@ -942,6 +975,13 @@ class ArionEngine:
                         pass  # already transitioned by a draining worker
             except Exception:
                 pass
+            if self._registered and hasattr(
+                    self.scheduler_registry, "unregister_scheduler"):
+                try:
+                    self.scheduler_registry.unregister_scheduler(self.scheduler_id)
+                    self._registered = False
+                except Exception:
+                    pass
 
     # ---------- approval expiry (ADR-019) ----------
 
@@ -1172,7 +1212,9 @@ class ArionEngine:
                 task = self._plan_for_goal(goal_id, replan_reason=result.evidence.get("reason"))
                 if task is not None:
                     task = self.run_task(task.id)
-                    if task.status in (TaskStatus.FAILED, TaskStatus.AWAITING_APPROVAL):
+                    if task.status in (TaskStatus.FAILED, TaskStatus.AWAITING_APPROVAL,
+                           TaskStatus.RUNNING):  # RUNNING = clean stop
+                           # (cross-process capacity exhausted)
                         return gm.get_goal(goal_id)  # caller decides next step
                 continue
 
@@ -1193,7 +1235,9 @@ class ArionEngine:
             task = self._plan_for_goal(goal_id, replan_reason=None)
             if task is not None:
                 task = self.run_task(task.id)
-                if task.status in (TaskStatus.FAILED, TaskStatus.AWAITING_APPROVAL):
+                if task.status in (TaskStatus.FAILED, TaskStatus.AWAITING_APPROVAL,
+                           TaskStatus.RUNNING):  # RUNNING = clean stop
+                           # (cross-process capacity exhausted)
                     return gm.get_goal(goal_id)
 
     def _block_on_open_recovery(self, goal_id: str, gm) -> bool:
@@ -1683,9 +1727,19 @@ class ArionEngine:
 
             dispatch = dispatch[: self.max_concurrency]
             task.status = TaskStatus.RUNNING
+            self._heartbeat_registration()
+            enqueued = 0
             for i in dispatch:
-                self._enqueue_step(task, task.steps[i])
-            self.scheduler.run_until_done()
+                if self._admit_step(task, task.steps[i]):
+                    enqueued += 1
+            self._last_run_progress = self._last_run_progress or enqueued > 0
+            if enqueued:
+                self.scheduler.run_until_done()
+            else:
+                # nothing dispatched this round (cross-process capacity
+                # exhausted): stop cleanly - the caller re-invokes later.
+                self.storage.save_task(task)
+                return task
 
             self.storage.save_task(task)
 
@@ -1752,11 +1806,13 @@ class ArionEngine:
             tasks[tid] = task
         results: dict[str, Task] = {}
         round_no = 0
+        self._last_run_progress = False
         while tasks:
             round_no += 1
             order = list(tasks.keys())
             order = order[round_no % len(order):] + order[:round_no % len(order)]
             per_task_cap = max(1, -(-self.max_concurrency // max(1, len(order))))
+            results_before_round = len(results)
             # ---------------- round: compute candidates / parks ----------------
             plan: dict[str, dict[str, Any]] = {}
             for tid in order:
@@ -1827,11 +1883,14 @@ class ArionEngine:
                 if not progressed:
                     break
             # ---------------- dispatch + drain --------------------------------
+            self._heartbeat_registration()
+            enqueued = 0
             for tid, i in admitted:
                 task = plan[tid]["task"]
                 step = task.steps[i]
-                self._enqueue_step(task, step)
-            if admitted:
+                if self._admit_step(task, step):
+                    enqueued += 1
+            if enqueued:
                 self.scheduler.run_until_done()
             # ---------------- post-round per task -----------------------------
             for tid, info in plan.items():
@@ -1859,15 +1918,19 @@ class ArionEngine:
                     continue
                 if info["candidates"]:
                     self._checkpoint(task, reason="step completed")
+            self._last_run_progress = (self._last_run_progress
+                                        or enqueued > 0
+                                        or len(results) > results_before_round)
             for tid in list(results):
                 tasks.pop(tid, None)
             if not tasks:
                 break
-            if not admitted:
-                # every remaining task is parked on a foreign lock (or the
-                # cursor was approval-gated and nothing else is ready):
+            if not admitted or not enqueued:
+                # every remaining task is parked on a foreign lock, the
+                # cursor was approval-gated with nothing else ready, or the
+                # cross-process capacity is exhausted (nothing was claimed):
                 # return cleanly - the caller re-checks the live lock store /
-                # approval state and re-invokes. No spin, no busy loop.
+                # approval state / capacity and re-invokes. No spin.
                 for tid, task in tasks.items():
                     results[tid] = task
                 break
@@ -2014,25 +2077,103 @@ class ArionEngine:
                                         task.id, task.goal_id, attempts,
                                         deadline, next_retry)
 
-    def _enqueue_step(self, task: Task, step: PlanStep) -> None:
+    def _admit_step(self, task: Task, step: PlanStep) -> bool:
         """Admit one step to the shared scheduler + durable registry
-        (ADR-025): a QUEUED registry row is created (bounded metadata) and
-        the work item carries the row's id so the worker can mirror
-        RUNNING/terminal transitions."""
-        work_id = None
-        if self.scheduler_registry is not None:
+        (ADR-025/026). Returns True when the step was dispatched.
+
+        ADR-026 ownership flow:
+
+        1. find-or-reuse the step's QUEUED row (a row left QUEUED by a
+           capacity-limited round is retried, never duplicated);
+        2. atomically CLAIM it (BEGIN IMMEDIATE in the store: lazy stale
+           reclaim + cross-process capacity + QUEUED->RUNNING with a fresh
+           worker id + bounded lease). A claim failure due to cross-process
+           capacity leaves the row QUEUED for the next round - no worker is
+           consumed;
+        3. a RUNNING row for this step that this engine did not claim is
+           stale/foreign/forged: it is reclaimed (ABANDONED) and the step is
+           re-admitted fresh - persisted state can never stall or fake
+           execution;
+        4. only a claimed row is enqueued to the in-process worker pool; the
+           worker heartbeats (ownership check) and reports terminal WITH
+           its worker id."""
+        if self.scheduler_registry is None:
+            # no durable registry: plain in-process dispatch (legacy path)
+            self.scheduler.enqueue(
+                f"{task.id}:{step.index}", task.id, step.index,
+                (lambda s=step: self._run_step_worker(task, s)))
+            return True
+        reg = self.scheduler_registry
+        now = self._lock_now()
+        worker_id = f"worker:{os.getpid()}:{new_id('w')}"
+        try:
+            existing = [
+                r for r in reg.list_work(task_id=task.id, step_index=step.index)
+                if r.status in (SchedulerWorkStatus.QUEUED,
+                                SchedulerWorkStatus.RUNNING)]
+        except Exception:
+            existing = []
+        row = None
+        for r in existing:
+            if r.status == SchedulerWorkStatus.QUEUED:
+                row = r
+                break
+            if r.status == SchedulerWorkStatus.RUNNING:
+                with self._inflight_lock:
+                    mine = r.work_id in self._claimed_work
+                if mine:
+                    return False  # already dispatched by this engine
+                # stale/foreign/forged RUNNING row: reclaim and re-admit fresh
+                try:
+                    reg.mark_terminal(r.work_id, SchedulerWorkStatus.ABANDONED,
+                                      error="reclaimed: stale/foreign owner",
+                                      now=now)
+                except Exception:
+                    pass
+        if row is None:
             try:
-                work = self.scheduler_registry.create(
-                    task_id=task.id, goal_id=task.goal_id, step_index=step.index,
-                    scheduler_id=self.scheduler_id, now=self._lock_now())
-                work_id = work.work_id
+                row = reg.create(task_id=task.id, goal_id=task.goal_id,
+                                 step_index=step.index,
+                                 scheduler_id=self.scheduler_id, now=now)
             except Exception as exc:
                 step.status = StepStatus.FAILED
                 step.error = f"scheduler registry failed closed: {exc}"
-                return
+                return False
+        try:
+            claimed = reg.claim(row.work_id, worker_id=worker_id,
+                                lease_seconds=self.scheduler_lease_seconds,
+                                now=now,
+                                max_lease_seconds=self.scheduler_max_lease_seconds,
+                                scheduler_id=self.scheduler_id)
+        except Exception as exc:
+            step.status = StepStatus.FAILED
+            step.error = f"scheduler registry failed closed: {exc}"
+            return False
+        if claimed is None:
+            return False  # cross-process capacity full: retry next round
+        with self._inflight_lock:
+            self._claimed_work[claimed.work_id] = (task.id, step.index)
         self.scheduler.enqueue(
             f"{task.id}:{step.index}", task.id, step.index,
-            (lambda s=step, w=work_id: self._run_step_worker(task, s, w)))
+            (lambda s=step, w=claimed.work_id, wk=worker_id:
+             self._run_step_worker(task, s, w, wk)))
+        return True
+
+    def _heartbeat_registration(self) -> None:
+        """Lazily extend THIS engine's durable scheduler registration
+        (ADR-026): keeps a live engine's QUEUED rows abandonable-never while
+        peers start up. Best-effort, bounded + monotonic in the store."""
+        if (self.scheduler_registry is None or not self._registered
+                or not hasattr(self.scheduler_registry, "heartbeat_scheduler")):
+            return
+        try:
+            self.scheduler_registry.heartbeat_scheduler(
+                self.scheduler_id,
+                lease_seconds=self.scheduler_lease_seconds,
+                now=self._lock_now(),
+                max_lease_seconds=self.scheduler_max_lease_seconds)
+        except Exception:
+            pass
 
     def _complete_task_shared(self, task: Task) -> None:
         """Terminal COMPLETED handling shared by the multi-task driver."""
@@ -2138,7 +2279,13 @@ class ArionEngine:
                 if not progressed:
                     break
                 continue
+            before = set(results)
             self.run_tasks(tasks_to_run)
+            if not self._last_run_progress and not (set(results) - before):
+                # a full cycle claimed nothing and no goal reached a
+                # decision point (e.g. cross-process capacity exhausted):
+                # stop cleanly - the caller re-invokes once capacity frees.
+                break
             # goals whose task stopped at a decision point stay active; the
             # next cycle evaluates them (replan/fail/complete/await).
         for gid in goal_ids:
@@ -2283,8 +2430,11 @@ class ArionEngine:
         except Exception:
             return False
 
-    def _run_step_worker(self, task: Task, step: PlanStep, work_id: str | None = None) -> None:
-        """Execute one step on a scheduler worker (ADR-024 Phase D / ADR-025).
+    def _run_step_worker(self, task: Task, step: PlanStep,
+                         work_id: str | None = None,
+                         worker_id: str | None = None) -> None:
+        """Execute one step on a scheduler worker (ADR-024 Phase D /
+        ADR-025/026).
 
         Terminal per-step status is persisted IMMEDIATELY after the step
         finishes, so a crash mid-round (or process kill) never replays a
@@ -2294,21 +2444,22 @@ class ArionEngine:
         timestamps); no thread objects, stack traces, capability outputs or
         model output are ever persisted.
 
-        When a durable registry row exists for this dispatch (ADR-025), the
-        worker mirrors its lifecycle: QUEUED -> RUNNING (with a lease)
-        BEFORE the capability pipeline starts, and RUNNING -> COMPLETED /
-        FAILED afterwards. If the mirror fails (row was abandoned/reclaimed
-        or is unknown), the step FAILS CLOSED and never executes."""
+        ADR-026 ownership: the row was atomically CLAIMED at admission (it
+        is already RUNNING with `worker_id`). The worker first HEARTBEATS -
+        an ownership-checked lease refresh that fails closed if the row was
+        reclaimed (stale lease) or reassigned - and afterwards reports
+        terminal WITH its worker id (a stale owner can never complete a
+        row it no longer owns)."""
         if work_id is not None and self.scheduler_registry is not None:
             try:
-                self.scheduler_registry.mark_running(
-                    work_id,
-                    worker_id=f"worker:{_threading.get_ident()}:{new_id('w')}",
+                self.scheduler_registry.heartbeat(
+                    work_id, worker_id,
                     lease_seconds=self.scheduler_lease_seconds,
-                    now=self._lock_now())
+                    now=self._lock_now(),
+                    max_lease_seconds=self.scheduler_max_lease_seconds)
             except Exception as exc:
                 step.status = StepStatus.FAILED
-                step.error = f"scheduler registry failed closed: {exc}"
+                step.error = f"scheduler lease failed closed: {exc}"
                 self.storage.save_task(task)
                 self._emit("error", task_id=task.id, step_id=_step_id(step), success=False,
                            detail={"error": step.error[:300]})
@@ -2327,10 +2478,13 @@ class ArionEngine:
                 try:
                     self.scheduler_registry.mark_terminal(
                         work_id, terminal, error=step.error,
-                        now=self._lock_now())
+                        now=self._lock_now(), owner_worker_id=worker_id)
                 except Exception:
                     pass  # the durable step/task state is the authority
-        if step.status in (StepStatus.SUCCEEDED, StepStatus.FAILED, StepStatus.SKIPPED):
+                with self._inflight_lock:
+                    self._claimed_work.pop(work_id, None)
+        if step.status in (StepStatus.SUCCEEDED, StepStatus.FAILED,
+                           StepStatus.SKIPPED):
             self.storage.save_task(task)
 
     def _execute_step(self, task: Task, step: PlanStep) -> None:

@@ -10,8 +10,10 @@ INFORMATIONAL ONLY: no authorization influence.
 
 from __future__ import annotations
 
+import functools
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -75,18 +77,33 @@ _FACT_COLS = ["fact_id", "key", "value", "source", "version", "observed_at", "cr
 _GOAL_PLAN_COLS = ["goal_id", "plan_version", "strategy", "plan_summary", "reason", "created_at"]
 
 
+def _threadsafe(method):
+    """Guard public methods with the connection's RLock (ADR-026:
+    cross-process engines may drive a store from different threads)."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._sql_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class SQLiteCognitiveStore:
     """Durable SQLite cognitive state (beliefs, preferences, environment facts)."""
 
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
-        self._conn = sqlite3.connect(self.db_path, timeout=10)
+        self._sql_lock = threading.RLock()
+        self._conn = sqlite3.connect(self.db_path, timeout=10,
+                                     check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._conn.executescript(SCHEMA)
         self._migrate()
         self._conn.commit()
 
+    @_threadsafe
     def _migrate(self) -> None:
         """Lightweight additive migration for pre-versioning schemas."""
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(beliefs)").fetchall()}
@@ -108,6 +125,7 @@ class SQLiteCognitiveStore:
 
     # ---- beliefs (append-only + versioned) ----
 
+    @_threadsafe
     def record_belief(self, belief: Belief) -> None:
         # Append-only: INSERT OR REPLACE is keyed by belief_id, and derivation
         # always creates NEW ids for revisions; superseded rows are retained.
@@ -130,6 +148,7 @@ class SQLiteCognitiveStore:
         )
         self._conn.commit()
 
+    @_threadsafe
     def supersede_belief(self, belief_id: str, superseded_at: str | None = None) -> None:
         """Mark a belief as superseded (history preserved, excluded from
         active listing)."""
@@ -141,6 +160,7 @@ class SQLiteCognitiveStore:
         )
         self._conn.commit()
 
+    @_threadsafe
     def get_belief(self, belief_id: str) -> Belief | None:
         row = self._conn.execute(
             "SELECT " + ", ".join(_BELIEF_COLS) + " FROM beliefs WHERE belief_id=?",
@@ -148,6 +168,7 @@ class SQLiteCognitiveStore:
         ).fetchone()
         return _belief_from_row(row) if row else None
 
+    @_threadsafe
     def list_beliefs(self, category: str | None = None, limit: int = 100, include_superseded: bool = False) -> list[Belief]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -163,11 +184,13 @@ class SQLiteCognitiveStore:
         ).fetchall()
         return [_belief_from_row(r) for r in rows]
 
+    @_threadsafe
     def count_beliefs(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM beliefs WHERE superseded_at IS NULL").fetchone()[0]
 
     # ---- preferences ----
 
+    @_threadsafe
     def record_preference(self, preference: Preference) -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO preferences "
@@ -185,6 +208,7 @@ class SQLiteCognitiveStore:
         )
         self._conn.commit()
 
+    @_threadsafe
     def get_preference(self, key: str, user: str = "default") -> Preference | None:
         row = self._conn.execute(
             "SELECT " + ", ".join(_PREF_COLS) + " FROM preferences WHERE key=? AND user=?",
@@ -192,6 +216,7 @@ class SQLiteCognitiveStore:
         ).fetchone()
         return _pref_from_row(row) if row else None
 
+    @_threadsafe
     def list_preferences(self, limit: int = 100) -> list[Preference]:
         rows = self._conn.execute(
             f"SELECT {', '.join(_PREF_COLS)} FROM preferences ORDER BY created_at DESC LIMIT ?",
@@ -201,6 +226,7 @@ class SQLiteCognitiveStore:
 
     # ---- environment facts (versioned per key) ----
 
+    @_threadsafe
     def record_environment_fact(self, fact: EnvironmentFact) -> None:
         existing = self.get_environment_fact(fact.key)
         if existing is not None:
@@ -247,6 +273,7 @@ class SQLiteCognitiveStore:
         )
         self._conn.commit()
 
+    @_threadsafe
     def get_environment_fact(self, key: str) -> EnvironmentFact | None:
         row = self._conn.execute(
             "SELECT " + ", ".join(_FACT_COLS) + " FROM environment_facts WHERE key=?",
@@ -254,6 +281,7 @@ class SQLiteCognitiveStore:
         ).fetchone()
         return _fact_from_row(row) if row else None
 
+    @_threadsafe
     def list_environment_facts(self, limit: int = 100) -> list[EnvironmentFact]:
         rows = self._conn.execute(
             f"SELECT {', '.join(_FACT_COLS)} FROM environment_facts ORDER BY updated_at DESC LIMIT ?",
@@ -263,6 +291,7 @@ class SQLiteCognitiveStore:
 
     # ---- long-horizon goal plans ----
 
+    @_threadsafe
     def record_goal_plan(self, goal_id: str, plan_version: int, strategy: str,
                          plan_summary: list[dict], reason: str = "") -> None:
         self._conn.execute(
@@ -272,6 +301,7 @@ class SQLiteCognitiveStore:
         )
         self._conn.commit()
 
+    @_threadsafe
     def list_goal_plans(self, goal_id: str) -> list[dict[str, Any]]:
         rows = self._conn.execute(
             "SELECT " + ", ".join(_GOAL_PLAN_COLS) + " FROM goal_plans WHERE goal_id=? ORDER BY plan_version",
@@ -279,6 +309,7 @@ class SQLiteCognitiveStore:
         ).fetchall()
         return [_goal_plan_from_row(r) for r in rows]
 
+    @_threadsafe
     def latest_goal_plan(self, goal_id: str) -> dict[str, Any] | None:
         rows = self._conn.execute(
             "SELECT " + ", ".join(_GOAL_PLAN_COLS) + " FROM goal_plans WHERE goal_id=? "
@@ -289,6 +320,7 @@ class SQLiteCognitiveStore:
 
     # ---- aggregate ----
 
+    @_threadsafe
     def snapshot(self, limit_beliefs: int = 50) -> dict[str, Any]:
         from arion.cognition.models import CognitiveSnapshot
 
@@ -304,6 +336,7 @@ class SQLiteCognitiveStore:
         )
         return snap.to_dict(limit_beliefs=limit_beliefs)
 
+    @_threadsafe
     def close(self) -> None:
         self._conn.close()
 

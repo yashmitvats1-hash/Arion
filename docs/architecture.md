@@ -587,6 +587,41 @@ loop (ADR-016):
   approval-pending/recovery-gated goals not stalling others, multi-goal
   restart without duplicate mutations, fairness.
 
+## Cross-Process Shared Scheduler (ADR-026)
+
+- **Scope:** multiple Arion engine processes share ONE scheduler/work
+  registry database. Every process gets a unique durable scheduler
+  REGISTRATION (lease + lazy heartbeat); `abandon_foreign_queued` now keys
+  on registration liveness, so a live peer's queue is never abandoned.
+- **Lease-based ownership:** every dispatched work item is atomically
+  CLAIMED (`BEGIN IMMEDIATE`: lazy stale reclaim + cross-process capacity +
+  QUEUED→RUNNING with a bounded worker lease). Heartbeats are
+  ownership-checked, monotonic (`now >= started_at`), bounded
+  (`expiry <= started_at + max_lease`) and stale-rejected; `mark_terminal`
+  from RUNNING requires the current owner (a stale owner can never
+  complete/fail work after expiry or reassignment).
+- **Atomic handoff:** `release_and_claim_next` completes one row and claims
+  the next in ONE transaction (release_and_select_next-style); racing
+  processes produce exactly one owner.
+- **Cross-process capacity + fair share:** optional durable
+  `global_max_concurrency` enforced inside every claim across ALL processes
+  (lazy in-transaction reclaim means a crashed process never permanently
+  consumes capacity). Fair-share admission (ceil(cap/active) per scheduler)
+  prevents a hot claimer from monopolizing capacity; unset cap preserves
+  ADR-025 behavior exactly.
+- **Crash recovery:** dead registrations → QUEUED rows abandoned; expired
+  leases → RUNNING rows reclaimed (no immortal RUNNING); stale mutation
+  locks reclaimed via the existing lock store; completed mutations never
+  replay; approval/recovery gates unchanged.
+- **Thread safety:** `SQLiteCognitiveStore`/`SQLiteMemoryStore` gained the
+  same RLock + `check_same_thread=False` guard as `SQLiteStorage`.
+- **Demo:** `scripts/demo_adr026_cross_process_scheduler.py` (33 checks,
+  deterministic, offline): registration/claim/heartbeat primitives,
+  two-process claim race, global capacity across engines, stopped-heartbeat
+  reclaim, stale-owner rejection, atomic handoff, crash recovery, multi-
+  goal restart without duplicate mutations. Real subprocess coverage in
+  `tests/test_multi_process_scheduler.py`.
+
 ## Structured intelligence boundary (ADR-011)
 
 ```
