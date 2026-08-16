@@ -199,6 +199,13 @@ CREATE TABLE IF NOT EXISTS scheduler_goal_state (
     deficit    INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS scheduler_goal_reservations (
+    goal_id     TEXT PRIMARY KEY,
+    reservation INTEGER NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    updated_at  TEXT NOT NULL,
+    updated_by  TEXT
+);
 CREATE TABLE IF NOT EXISTS scheduler_events (
     id             TEXT PRIMARY KEY,
     ts             TEXT NOT NULL,
@@ -1382,11 +1389,20 @@ class SQLiteStorage:
 
     @_threadsafe
     def set_scheduler_global_max(self, n: int) -> None:
-        """Configure the durable cross-process capacity (>= 1)."""
+        """Configure the durable cross-process capacity (>= 1). ADR-029:
+        the cap may never drop below the sum of ENABLED goal reservations
+        (an impossible guarantee is rejected, never silently accepted)."""
         n = int(n)
         if n < 1:
             raise SchedulerRegistryError(
                 "global max concurrency must be >= 1 (fail closed)")
+        reserved = self._conn.execute(
+            "SELECT COALESCE(SUM(reservation), 0) FROM "
+            "scheduler_goal_reservations WHERE enabled=1").fetchone()[0]
+        if n < int(reserved):
+            raise SchedulerRegistryError(
+                f"global max {n} is below the enabled reservation total "
+                f"{reserved} (ADR-029 oversubscription, fail closed)")
         self._conn.execute(
             "INSERT OR REPLACE INTO scheduler_config (key, value) VALUES (?, ?)",
             ("global_max_concurrency", str(n)))
@@ -1574,6 +1590,8 @@ class SQLiteStorage:
             kind = "scheduler_share.denied"
         elif reason == "goal_weight":
             kind = "goal_weight.denied"
+        elif reason == "reservation":
+            kind = "reservation.denied"
         d = {"scheduler_id": scheduler_id, "worker_id": worker_id,
              "goal_id": goal_id, "work_id": work_id,
              "reason": reason, "outcome": "denied",
@@ -1582,14 +1600,122 @@ class SQLiteStorage:
             d.update(extra)
         self._sech_insert_in_tx(_audit_event(kind=kind, ts=now, detail=d))
 
+    def _sys_reservation_gate_in_tx(self, goal_id: str) -> tuple[str, dict]:
+        """ADR-029 reservation gate. Caller holds BEGIN IMMEDIATE and has
+        already passed the global-cap and scheduler fair-share gates.
+        Returns (decision, telemetry) where decision is one of:
+
+        - "floor": the claiming goal is BELOW its reservation floor with
+          runnable work - grant the claim WITHOUT consulting the DWRR
+          gate (the floor is a guarantee, not an opportunity). The goal
+          is still subject to gates 1-3 (cap, fair share) and to the
+          ADR-027 weight-disabled hard gate (checked by the caller).
+        - "deny": this claim would consume a free slot that a runnable
+          reserved goal still needs to reach its floor - deny with
+          reservation.denied; the row stays QUEUED.
+        - "pass": no reservation constraint applies; proceed to DWRR.
+
+        With no global cap configured there is no capacity scope, so the
+        gate is a no-op (exactly like the DWRR gate, ADR-026 behavior).
+        Idle reserved goals (no QUEUED work) reserve nothing.
+        """
+        tele: dict = {}
+        global_max = self.get_scheduler_global_max()
+        if global_max is None:
+            return "pass", tele
+        cfg = self.get_goal_reservation_config(goal_id)
+        reservation = int(cfg["reservation"]) if cfg is not None else 0
+        enabled = bool(cfg["enabled"]) if cfg is not None else False
+        running_h = self._conn.execute(
+            "SELECT COUNT(*) FROM scheduler_work WHERE status=? AND goal_id=?",
+            (SchedulerWorkStatus.RUNNING.value, goal_id)).fetchone()[0]
+        if enabled and reservation >= 1 and running_h < reservation:
+            tele["floor"] = True
+            tele["reservation"] = reservation
+            tele["running"] = running_h
+            return "floor", tele
+        # Protection: this claim consumes one free slot; deny it when the
+        # slots that would remain free cannot cover the outstanding
+        # reservation deficits of OTHER runnable reserved goals (the
+        # claiming goal's own deficit is 0 here by definition).
+        total_running = self._conn.execute(
+            "SELECT COUNT(*) FROM scheduler_work WHERE status=?",
+            (SchedulerWorkStatus.RUNNING.value,)).fetchone()[0]
+        free = int(global_max) - int(total_running)
+        outstanding = 0
+        for r in self._conn.execute(
+                "SELECT goal_id, reservation FROM scheduler_goal_reservations "
+                "WHERE enabled=1 AND reservation>=1").fetchall():
+            g, rv = r[0], int(r[1])
+            if g == goal_id:
+                continue
+            queued = self._conn.execute(
+                "SELECT COUNT(*) FROM scheduler_work WHERE status=? AND goal_id=?",
+                (SchedulerWorkStatus.QUEUED.value, g)).fetchone()[0]
+            if queued == 0:
+                continue  # idle goals reserve nothing
+            run_g = self._conn.execute(
+                "SELECT COUNT(*) FROM scheduler_work WHERE status=? AND goal_id=?",
+                (SchedulerWorkStatus.RUNNING.value, g)).fetchone()[0]
+            if run_g < rv:
+                outstanding += rv - run_g
+        if free - 1 < outstanding:
+            tele["reservation"] = reservation
+            tele["pressure"] = outstanding
+            tele["reserved_capacity"] = self._reservation_total_enabled_in_tx()
+            return "deny", tele
+        return "pass", tele
+
+    def _sys_establish_claim_in_tx(self, work_id: str, goal_id: str,
+                                   worker_id: str, lease: float, now: str,
+                                   scheduler_id: str | None,
+                                   floor_tele: dict | None = None
+                                   ) -> SchedulerWork:
+        """Ownership establishment (inside BEGIN IMMEDIATE): QUEUED ->
+        RUNNING + work.claimed atomically; emits reservation.satisfied when
+        a floor claim brings the goal exactly to its reservation."""
+        self._conn.execute(
+            "UPDATE scheduler_work SET status=?, worker_id=?, started_at=?, "
+            "lease_expires_at=? WHERE work_id=? AND status=?",
+            (SchedulerWorkStatus.RUNNING.value, worker_id, now,
+             _iso_plus(now, lease), work_id, SchedulerWorkStatus.QUEUED.value))
+        self._sech_insert_in_tx(_audit_event(
+            kind="work.claimed", ts=now,
+            detail={"scheduler_id": scheduler_id, "worker_id": worker_id,
+                    "goal_id": goal_id, "work_id": work_id,
+                    "step_index": self._sys_row(work_id).step_index,
+                    "lease_expires_at": _iso_plus(now, lease),
+                    "outcome": "claimed", "ts": now}))
+        if floor_tele:
+            rv = int(floor_tele.get("reservation") or 0)
+            if rv >= 1:
+                new_running = self._conn.execute(
+                    "SELECT COUNT(*) FROM scheduler_work WHERE status=? "
+                    "AND goal_id=?",
+                    (SchedulerWorkStatus.RUNNING.value, goal_id)).fetchone()[0]
+                if new_running == rv:
+                    self._sech_insert_in_tx(_audit_event(
+                        kind="reservation.satisfied", ts=now,
+                        detail={"goal_id": goal_id, "work_id": work_id,
+                                "reservation": rv, "running": new_running,
+                                "satisfied": True, "outcome": "satisfied",
+                                "ts": now}))
+        return self._sys_row(work_id)
+
     def _sys_claim_in_tx(self, worker_id: str, lease_seconds: float, now: str,
                          max_lease_seconds: float | None,
                          work_id: str | None = None,
                          scheduler_id: str | None = None) -> SchedulerWork | None:
         """Claim inside an open BEGIN IMMEDIATE transaction. Returns the
-        claimed row, or None when the capacity/fair share/goal-weight gate
-        denies (row stays QUEUED). Raises SchedulerStateError when a
-        SPECIFIC row is not claimable (raced / terminal)."""
+        claimed row, or None when the capacity/fair share/reservation/
+        goal-weight gate denies (row stays QUEUED). Raises
+        SchedulerStateError when a SPECIFIC row is not claimable (raced /
+        terminal).
+
+        Admission order (ADR-029, documented in architecture.md):
+        1 reclaim stale; 2 global capacity; 3 scheduler fair share;
+        4 reservation floor/protection; 5 DWRR goal-weight; 6 ownership.
+        """
         self._sys_reclaim_stale_in_tx(now)
         cap_ok, cap_reason = self._sys_capacity_ok_in_tx(
             claiming_scheduler_id=scheduler_id)
@@ -1618,8 +1744,21 @@ class SQLiteStorage:
                     work_id, SchedulerWorkStatus.RUNNING,
                     SchedulerWorkStatus(row[2]))
             goal_id = row[1]
+            decision, rtele = self._sys_reservation_gate_in_tx(goal_id)
+            if decision == "deny":
+                self._sech_claim_denied_event(
+                    "reservation", work_id, goal_id, scheduler_id, worker_id,
+                    now, extra=rtele)
+                return None  # reservation protected: row stays QUEUED
             granted, tele = self._sys_goal_admission_in_tx(goal_id)
-            if not granted:
+            if decision == "floor" and not granted and not tele.get("disabled"):
+                # Floor override: below its reservation the goal is admitted
+                # even when the DWRR credit gate would deny (the floor is a
+                # guarantee, not an opportunity). No credit is debited and
+                # no refill is triggered here. The weight-DISABLED hard gate
+                # (ADR-027) is never overridden.
+                tele = {}
+            elif not granted:
                 self._sech_claim_denied_event(
                     "goal_weight", work_id, goal_id, scheduler_id, worker_id,
                     now, extra=tele)
@@ -1631,19 +1770,9 @@ class SQLiteStorage:
                           ("weight", "credit_before", "credit_after", "refill")})
                 self._sech_insert_in_tx(_audit_event(
                     kind="goal_weight.refill", ts=now, detail=d))
-            self._conn.execute(
-                "UPDATE scheduler_work SET status=?, worker_id=?, started_at=?, "
-                "lease_expires_at=? WHERE work_id=? AND status=?",
-                (SchedulerWorkStatus.RUNNING.value, worker_id, now,
-                 _iso_plus(now, lease), work_id, SchedulerWorkStatus.QUEUED.value))
-            self._sech_insert_in_tx(_audit_event(
-                kind="work.claimed", ts=now,
-                detail={"scheduler_id": scheduler_id, "worker_id": worker_id,
-                        "goal_id": goal_id, "work_id": work_id,
-                        "step_index": self._sys_row(work_id).step_index,
-                        "lease_expires_at": _iso_plus(now, lease),
-                        "outcome": "claimed", "ts": now}))
-            return self._sys_row(work_id)
+            return self._sys_establish_claim_in_tx(
+                work_id, goal_id, worker_id, lease, now, scheduler_id,
+                floor_tele=rtele if decision == "floor" else None)
         row = self._conn.execute(
             "SELECT work_id, goal_id FROM scheduler_work "
             "WHERE status=? AND scheduler_id=? ORDER BY created_at, work_id LIMIT 1",
@@ -1651,8 +1780,17 @@ class SQLiteStorage:
         if row is None:
             return None
         claimed_work_id, goal_id = row[0], row[1]
+        decision, rtele = self._sys_reservation_gate_in_tx(goal_id)
+        if decision == "deny":
+            self._sech_claim_denied_event(
+                "reservation", claimed_work_id, goal_id, scheduler_id,
+                worker_id, now, extra=rtele)
+            return None  # reservation protected: row stays QUEUED
         granted, tele = self._sys_goal_admission_in_tx(goal_id)
-        if not granted:
+        if decision == "floor" and not granted and not tele.get("disabled"):
+            # Floor override (see the specific-work branch above).
+            tele = {}
+        elif not granted:
             self._sech_claim_denied_event(
                 "goal_weight", claimed_work_id, goal_id, scheduler_id,
                 worker_id, now, extra=tele)
@@ -1664,19 +1802,9 @@ class SQLiteStorage:
                       ("weight", "credit_before", "credit_after", "refill")})
             self._sech_insert_in_tx(_audit_event(
                 kind="goal_weight.refill", ts=now, detail=d))
-        self._conn.execute(
-            "UPDATE scheduler_work SET status=?, worker_id=?, started_at=?, "
-            "lease_expires_at=? WHERE work_id=? AND status=?",
-            (SchedulerWorkStatus.RUNNING.value, worker_id, now,
-             _iso_plus(now, lease), claimed_work_id, SchedulerWorkStatus.QUEUED.value))
-        self._sech_insert_in_tx(_audit_event(
-            kind="work.claimed", ts=now,
-            detail={"scheduler_id": scheduler_id, "worker_id": worker_id,
-                    "goal_id": goal_id, "work_id": claimed_work_id,
-                    "step_index": self._sys_row(claimed_work_id).step_index,
-                    "lease_expires_at": _iso_plus(now, lease),
-                    "outcome": "claimed", "ts": now}))
-        return self._sys_row(claimed_work_id)
+        return self._sys_establish_claim_in_tx(
+            claimed_work_id, goal_id, worker_id, lease, now, scheduler_id,
+            floor_tele=rtele if decision == "floor" else None)
 
     @_threadsafe
     def claim(self, work_id: str, worker_id: str, lease_seconds: float,
@@ -1834,7 +1962,8 @@ class SQLiteStorage:
         "step_index", "lease_expires_at", "started_at", "pid", "reason",
         "weight", "credit_before", "credit_after", "refill", "outcome",
         "config", "position", "attempts", "deadline", "next_work_id",
-        "disabled",
+        "disabled", "reservation", "reserved_capacity", "pressure",
+        "satisfied", "running", "deficit", "reserved_goal_id",
     )
 
     @staticmethod
@@ -1999,6 +2128,23 @@ class SQLiteStorage:
         recent = self.recent_scheduler_events(limit=200)
         recent_reclaim = sum(1 for e in recent if e.kind == "work.reclaimed")
         recent_failure = sum(1 for e in recent if e.kind == "work.failed")
+        # ADR-029 reservation observation (computed from durable rows):
+        # enabled configs, total protected capacity, per-goal satisfaction
+        # (running >= reservation), and the outstanding pressure (sum of
+        # deficits over runnable reserved goals; deterministic).
+        reservations = self.list_goal_reservations()
+        enabled = [r for r in reservations if r["enabled"]]
+        running_by_goal_r = dict(running_by_goal)
+        queued_by_goal_r = dict(queued_by_goal)
+        reserved_capacity = sum(int(r["reservation"]) for r in enabled)
+        satisfaction = {}
+        pressure = 0
+        for r in enabled:
+            rv = int(r["reservation"])
+            run_g = running_by_goal_r.get(r["goal_id"], 0)
+            satisfaction[r["goal_id"]] = run_g >= rv
+            if run_g < rv and queued_by_goal_r.get(r["goal_id"], 0) > 0:
+                pressure += rv - run_g
         return {
             "global_max_concurrency": self.get_scheduler_global_max(),
             "running_count": len(running),
@@ -2010,6 +2156,10 @@ class SQLiteStorage:
             "queued_by_goal": queued_by_goal,
             "goal_weights": self.list_goal_weights(),
             "dwr_credit": credit,
+            "goal_reservations": reservations,
+            "reserved_capacity": reserved_capacity,
+            "reservation_satisfied": satisfaction,
+            "reservation_pressure": pressure,
             "recent_reclaim_count": recent_reclaim,
             "recent_failure_count": recent_failure,
             "now": now,
@@ -2139,6 +2289,160 @@ class SQLiteStorage:
         if cur.rowcount == 0:
             return None
         return self.get_goal_weight_config(goal_id)
+
+    _RESERVATION_MAX = 10000
+
+    def _reservation_total_enabled_in_tx(self) -> int:
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(reservation), 0) FROM "
+            "scheduler_goal_reservations WHERE enabled=1").fetchone()
+        return int(row[0]) if row else 0
+
+    @_threadsafe
+    def set_goal_reservation(self, goal_id: str, reservation: int, *,
+                             enabled: bool = True, by: str = "operator",
+                             now: str | None = None) -> None:
+        """Set/update a goal's durable minimum capacity reservation
+        (ADR-029). Fail closed: goal_id required; reservation must be an
+        integer in [0, _RESERVATION_MAX]; with a global cap configured the
+        TOTAL of enabled reservations may never exceed the cap (REJECT,
+        never normalize - an impossible guarantee is not silently
+        accepted). Emits goal_reservation_changed atomically."""
+        now = now or utcnow()
+        if not goal_id:
+            raise SchedulerRegistryError(
+                "goal_id required (fail closed)")
+        if not isinstance(reservation, int) or isinstance(reservation, bool):
+            raise SchedulerRegistryError(
+                f"reservation must be an integer, got {reservation!r} "
+                f"(fail closed)")
+        if reservation < 0 or reservation > self._RESERVATION_MAX:
+            raise SchedulerRegistryError(
+                f"reservation must be in [0, {self._RESERVATION_MAX}], "
+                f"got {reservation} (fail closed)")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            global_max = self.get_scheduler_global_max()
+            if global_max is not None:
+                current = self._conn.execute(
+                    "SELECT COALESCE(SUM(reservation), 0) FROM "
+                    "scheduler_goal_reservations WHERE enabled=1 AND "
+                    "goal_id<>?", (goal_id,)).fetchone()[0]
+                new_total = int(current) + (int(reservation) if enabled else 0)
+                if new_total > int(global_max):
+                    self._conn.rollback()
+                    raise SchedulerRegistryError(
+                        f"reservation total {new_total} exceeds global max "
+                        f"{global_max} (ADR-029 oversubscription, fail "
+                        f"closed)")
+            self._conn.execute(
+                "INSERT OR REPLACE INTO scheduler_goal_reservations "
+                "(goal_id, reservation, enabled, updated_at, updated_by) "
+                "VALUES (?,?,?,?,?)",
+                (goal_id, int(reservation), 1 if enabled else 0, now,
+                 str(by)[:100]))
+            self._sech_insert_in_tx(_audit_event(
+                kind="goal_reservation_changed", ts=now,
+                detail={"goal_id": goal_id,
+                        "config": "goal_reservation",
+                        "reason": f"reservation={int(reservation)} "
+                                  f"enabled={enabled}",
+                        "outcome": "set", "ts": now}))
+            self._conn.commit()
+        except SchedulerRegistryError:
+            raise
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_threadsafe
+    def get_goal_reservation(self, goal_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT reservation FROM scheduler_goal_reservations "
+            "WHERE goal_id=?", (goal_id,)).fetchone()
+        if row is None:
+            return 0  # deterministic default
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return 0
+
+    @_threadsafe
+    def get_goal_reservation_config(self, goal_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT goal_id, reservation, enabled, updated_at, updated_by "
+            "FROM scheduler_goal_reservations WHERE goal_id=?",
+            (goal_id,)).fetchone()
+        if row is None:
+            return None
+        return {
+            "goal_id": row[0],
+            "reservation": int(row[1]),
+            "enabled": bool(row[2]),
+            "updated_at": row[3],
+            "updated_by": row[4],
+        }
+
+    @_threadsafe
+    def list_goal_reservations(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT goal_id, reservation, enabled, updated_at, updated_by "
+            "FROM scheduler_goal_reservations ORDER BY goal_id").fetchall()
+        return [{
+            "goal_id": r[0], "reservation": int(r[1]),
+            "enabled": bool(r[2]), "updated_at": r[3], "updated_by": r[4],
+        } for r in rows]
+
+    @_threadsafe
+    def remove_goal_reservation(self, goal_id: str) -> bool:
+        cur = self._conn.execute(
+            "DELETE FROM scheduler_goal_reservations WHERE goal_id=?",
+            (goal_id,))
+        if cur.rowcount > 0:
+            self._sech_insert_in_tx(_audit_event(
+                kind="goal_reservation_changed", ts=utcnow(),
+                detail={"goal_id": goal_id,
+                        "config": "goal_reservation",
+                        "outcome": "removed", "ts": utcnow()}))
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    @_threadsafe
+    def set_goal_reservation_enabled(self, goal_id: str,
+                                     enabled: bool) -> dict | None:
+        cfg = self.get_goal_reservation_config(goal_id)
+        if cfg is None:
+            return None
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            if enabled:
+                global_max = self.get_scheduler_global_max()
+                if global_max is not None:
+                    total = self._reservation_total_enabled_in_tx()
+                    if total + int(cfg["reservation"]) > int(global_max):
+                        self._conn.rollback()
+                        raise SchedulerRegistryError(
+                            f"enabling reservation {cfg['reservation']} for "
+                            f"{goal_id} would exceed global max {global_max} "
+                            f"(ADR-029 oversubscription, fail closed)")
+            cur = self._conn.execute(
+                "UPDATE scheduler_goal_reservations SET enabled=?, "
+                "updated_at=? WHERE goal_id=?",
+                (1 if enabled else 0, utcnow(), goal_id))
+            if cur.rowcount > 0:
+                self._sech_insert_in_tx(_audit_event(
+                    kind="goal_reservation_changed", ts=utcnow(),
+                    detail={"goal_id": goal_id,
+                            "config": "goal_reservation",
+                            "reason": "enabled" if enabled else "disabled",
+                            "outcome": "set", "ts": utcnow()}))
+            self._conn.commit()
+        except SchedulerRegistryError:
+            raise
+        except Exception:
+            self._conn.rollback()
+            raise
+        return self.get_goal_reservation_config(goal_id)
 
 
 _GOAL_COLS = ["id", "description", "source", "status", "version", "strategy", "blockers",

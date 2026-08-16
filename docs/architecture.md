@@ -717,6 +717,69 @@ loop (ADR-016):
   handoff, abandonment, restart history, rollback-no-phantom, forged
   telemetry powerless, retention, CLI JSON.
 
+## Per-goal weighted capacity reservation (ADR-029)
+
+- **Concept — weight ≠ reservation:** a weight is relative scheduling
+  opportunity among contending goals (DWRR); a reservation is a minimum
+  guarantee — the goal may reserve a bounded floor of concurrent RUNNING
+  slots **while it has runnable work** (idle goals reserve nothing).
+  Unit: `reservation = minimum number of concurrent runnable execution
+  slots for that goal`. Weights keep their exact ADR-027 semantics.
+- **Data:** `scheduler_goal_reservations(goal_id, reservation, enabled,
+  updated_at, updated_by)` — integer `[0, 10000]`, default 0 for
+  unconfigured goals, fail-closed validation, mirroring the weight-config
+  conventions. Config API: `set/get/list/remove_goal_reservation`,
+  `set_goal_reservation_enabled` (all transactional, event-emitting).
+- **Oversubscription policy — REJECT, never normalize:** with a global
+  cap configured, the sum of ENABLED reservations may never exceed the
+  cap; `set_goal_reservation` / `set_goal_reservation_enabled(True)` /
+  `set_scheduler_global_max` fail closed with a typed error on any change
+  that would make the policy impossible. With no cap configured,
+  reservations are accepted (unbounded capacity) and the admission gate
+  is a no-op, exactly like the DWRR gate.
+- **Admission order (inside `BEGIN IMMEDIATE`):** 1) reclaim stale;
+  2) global capacity; 3) scheduler fair share; 4) **reservation gate**
+  (floor path: the claiming goal is below its floor → grant, with DWRR
+  accounting kept honest — the claim flows through the DWRR gate and the
+  floor overrides only a credit denial, never the weight-disabled hard
+  gate, never gates 1–3; protection path: the claim would consume a free
+  slot needed by another runnable reserved goal → `reservation.denied`,
+  row stays QUEUED); 5) DWRR weighted admission; 6) ownership.
+- **Guarantee (exact, durable):** for an enabled reserved goal G with
+  runnable work, global capacity ≥ R and the claiming scheduler eligible
+  under fair share, no other goal can consume a free slot while G is
+  below R and the remaining free slots cannot cover G's deficit
+  (`free − 1 < outstanding` denies). RUNNING work is never cancelled to
+  satisfy a floor. After all floors are satisfied, remaining capacity
+  follows ADR-027 weighted fairness exactly (proven 5:1 with a reserved
+  floor in place).
+- **Dynamic semantics:** config changes apply to future claims only;
+  RUNNING work is never retroactively cancelled/re-owned; oversubscribing
+  changes fail closed; reservations + DWRR deficit survive restart.
+- **Cross-process:** all gates read only durable rows inside
+  `BEGIN IMMEDIATE`; real-subprocess tests prove the floor holds across
+  processes, racing processes cannot bypass the protection, stale
+  scheduler reclaim does not permanently consume reserved capacity, and
+  reservations never exceed the global cap.
+- **Observability (ADR-028 extension):** new kinds
+  `goal_reservation_changed`, `reservation.denied`, `reservation.satisfied`
+  (atomic with their transitions; observational only). `scheduler_status()`
+  adds `goal_reservations`, `reserved_capacity`, `reservation_satisfied`,
+  `reservation_pressure` (deterministic from durable rows). CLI:
+  `arion scheduler reservations`, `reservation set|remove|enable|disable`
+  (human + `--json`, bounded validation, persistence).
+- **Security boundary:** reservations are scheduler POLICY only — no
+  planner/model/task metadata path exists; forged reservation events,
+  forged satisfied/denied telemetry, forged capacity counts / DWRR
+  deficits / queue positions / stale ownership have zero effect (the
+  gates read authority tables only); one goal can never use another
+  goal's reservation; reservations never establish execution authority.
+- **Demo:** `scripts/demo_adr029_reserved_capacity.py` (32 checks,
+  deterministic, offline): default 0, single/multiple floors, protection,
+  high-weight vs reserved, DWRR interaction, idle/runnable-again,
+  cross-process, dynamic changes, restart/reclaim, telemetry, forged
+  attempts, CLI/status/watch.
+
 ## Structured intelligence boundary (ADR-011)
 
 ```

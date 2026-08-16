@@ -107,6 +107,9 @@ EVENT_KINDS = (
     "scheduler_share.denied",
     "goal_weight.denied",
     "goal_weight.refill",
+    "goal_reservation_changed",
+    "reservation.denied",
+    "reservation.satisfied",
     "error",
 )
 

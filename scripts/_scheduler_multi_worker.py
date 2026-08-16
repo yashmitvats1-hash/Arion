@@ -51,7 +51,8 @@ def main() -> int:
     parser.add_argument("mode", choices=["race-claim", "claim-run",
                                          "claim-stop-heartbeat",
                                          "crash-claimed", "claim-lock-crash",
-                                         "weighted-claim-run"])
+                                         "weighted-claim-run",
+                                         "claim-once-hold"])
     parser.add_argument("--db", required=True)
     parser.add_argument("--scheduler-id", default=None)
     parser.add_argument("--work-id", default=None)
@@ -105,6 +106,22 @@ def main() -> int:
         print(json.dumps({"work_id": got.work_id, "worker": worker,
                           "status": "running"}), flush=True)
         os._exit(1)  # noqa: PLR1722 - deliberate crash while RUNNING
+
+    if args.mode == "claim-once-hold":
+        # claim a SPECIFIC row once; report claimed True/False; when
+        # claimed, hold the lease for `sleep` seconds and exit WITHOUT a
+        # terminal transition (the row stays RUNNING - used by ADR-029
+        # rapid-claim tests where the hot goal must hold capacity).
+        got = store.claim(args.work_id, worker_id=worker,
+                          lease_seconds=args.lease,
+                          max_lease_seconds=args.max_lease)
+        print(json.dumps({"work_id": args.work_id,
+                          "claimed": got is not None, "worker": worker}),
+              flush=True)
+        if got is not None:
+            time.sleep(args.sleep)
+        store.close()
+        return 0
 
     if args.mode == "weighted-claim-run":
         from arion.state.scheduler_work import SchedulerStateError

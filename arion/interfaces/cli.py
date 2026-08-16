@@ -209,6 +209,21 @@ def build_parser() -> argparse.ArgumentParser:
     sched_weight_dis = sched_weight_sub.add_parser("disable", help="disable a goal's weight config (never admitted)", parents=[common, common_memory])
     sched_weight_dis.add_argument("goal_id")
 
+    sched_reservations = sched_sub.add_parser("reservations", help="list durable per-goal capacity reservations (ADR-029)", parents=[common, common_memory])
+    sched_reservation = sched_sub.add_parser("reservation", help="manage a goal's durable capacity reservation (ADR-029)", parents=[common, common_memory])
+    sched_reservation_sub = sched_reservation.add_subparsers(dest="scheduler_reservation_command", required=True)
+    sched_reservation_set = sched_reservation_sub.add_parser("set", help="set a goal's reservation (>=0, bounded; scheduler POLICY, never authorization)", parents=[common, common_memory])
+    sched_reservation_set.add_argument("goal_id")
+    sched_reservation_set.add_argument("capacity", type=int)
+    sched_reservation_set.add_argument("--disable", action="store_true", help="set the config disabled (no floor)")
+    sched_reservation_set.add_argument("--by", default="cli-operator", help="who configured (audit only)")
+    sched_reservation_rm = sched_reservation_sub.add_parser("remove", help="remove a goal's reservation config (back to 0)", parents=[common, common_memory])
+    sched_reservation_rm.add_argument("goal_id")
+    sched_reservation_en = sched_reservation_sub.add_parser("enable", help="enable a goal's reservation config", parents=[common, common_memory])
+    sched_reservation_en.add_argument("goal_id")
+    sched_reservation_dis = sched_reservation_sub.add_parser("disable", help="disable a goal's reservation config (no floor)", parents=[common, common_memory])
+    sched_reservation_dis.add_argument("goal_id")
+
     sched_watch = sched_sub.add_parser("watch", help="show scheduler telemetry events (ADR-028; observational only)", parents=[common, common_memory])
     sched_watch.add_argument("--goal", default=None, help="filter by goal id")
     sched_watch.add_argument("--scheduler", default=None, help="filter by scheduler id")
@@ -463,6 +478,62 @@ def _scheduler_command(args, engine) -> int:
             return 0
         return 1
 
+    if args.scheduler_command == "reservations":
+        rows = (store.list_goal_reservations()
+                if hasattr(store, "list_goal_reservations") else [])
+        if args.json:
+            _emit(rows)
+            return 0
+        if not rows:
+            print("(no goal reservations configured - all goals have floor 0)")
+            return 0
+        total = sum(int(r["reservation"]) for r in rows if r["enabled"])
+        for r in rows:
+            state = "enabled" if r["enabled"] else "disabled"
+            print(f"{r['goal_id']:<24} reservation={r['reservation']:<5} "
+                  f"{state:<9} by {r['updated_by']} @ {r['updated_at']}")
+        print(f"(reserved_capacity={total})")
+        return 0
+
+    if args.scheduler_command == "reservation":
+        from arion.state.scheduler_work import SchedulerRegistryError
+
+        if args.scheduler_reservation_command == "set":
+            try:
+                store.set_goal_reservation(args.goal_id, args.capacity,
+                                           enabled=not args.disable,
+                                           by=args.by, now=engine._lock_now())
+            except SchedulerRegistryError as exc:
+                print(f"invalid reservation config: {exc}")
+                return 1
+            cfg = store.get_goal_reservation_config(args.goal_id)
+            if args.json:
+                _emit(cfg)
+            else:
+                print(f"{args.goal_id}: reservation={cfg['reservation']} "
+                      f"{'disabled' if not cfg['enabled'] else 'enabled'} "
+                      f"(by {cfg['updated_by']})")
+            return 0
+        if args.scheduler_reservation_command == "remove":
+            removed = store.remove_goal_reservation(args.goal_id)
+            if not removed:
+                print(f"{args.goal_id}: no reservation config (floor 0)")
+                return 1
+            print(f"{args.goal_id}: reservation removed (floor 0 restored)")
+            return 0
+        if args.scheduler_reservation_command in ("enable", "disable"):
+            enabled = args.scheduler_reservation_command == "enable"
+            cfg = store.set_goal_reservation_enabled(args.goal_id, enabled)
+            if cfg is None:
+                print(f"{args.goal_id}: no reservation config to "
+                      f"{'enable' if enabled else 'disable'}")
+                return 1
+            print(f"{args.goal_id}: "
+                  f"{'enabled' if enabled else 'disabled'} "
+                  f"(reservation={cfg['reservation']})")
+            return 0
+        return 1
+
     if args.scheduler_command == "watch":
         if not hasattr(store, "scheduler_events"):
             print("scheduler telemetry is not available on this engine")
@@ -482,13 +553,22 @@ def _scheduler_command(args, engine) -> int:
             if e.kind in ("work.claimed", "work.heartbeat", "work.reclaimed"):
                 extra = f" lease={d.get('lease_expires_at', '-')}"
             if e.kind in ("work.claim_denied", "capacity.denied",
-                          "scheduler_share.denied", "goal_weight.denied"):
+                          "scheduler_share.denied", "goal_weight.denied",
+                          "reservation.denied"):
                 extra = f" reason={d.get('reason', '-')}"
+                if e.kind == "reservation.denied":
+                    extra += (f" pressure={d.get('pressure', '-')} "
+                              f"reserved={d.get('reserved_capacity', '-')}")
             if e.kind == "goal_weight.refill":
                 extra = (f" weight={d.get('weight')} "
                          f"credit={d.get('credit_before')}->{d.get('credit_after')}")
             if e.kind == "scheduler.config_changed":
                 extra = f" config={d.get('config')} ({d.get('reason', '-')})"
+            if e.kind == "reservation.satisfied":
+                extra = (f" reservation={d.get('reservation')} "
+                         f"running={d.get('running')}")
+            if e.kind == "goal_reservation_changed":
+                extra = f" config={d.get('config')} ({d.get('outcome', '-')} {d.get('reason', '')})"
             print(f"{e.ts}  {e.kind:<24} who={who:<20} goal={goal:<12} "
                   f"work={work:<12}{extra}")
 
