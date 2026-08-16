@@ -210,6 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
     sched_weight_dis.add_argument("goal_id")
 
     sched_reservations = sched_sub.add_parser("reservations", help="list durable per-goal capacity reservations (ADR-029)", parents=[common, common_memory])
+    sched_reservations.add_argument("--check", action="store_true", help="read-only feasibility check of the current reservation config (ADR-030; exit 0 feasible / 1 infeasible)")
     sched_reservation = sched_sub.add_parser("reservation", help="manage a goal's durable capacity reservation (ADR-029)", parents=[common, common_memory])
     sched_reservation_sub = sched_reservation.add_subparsers(dest="scheduler_reservation_command", required=True)
     sched_reservation_set = sched_reservation_sub.add_parser("set", help="set a goal's reservation (>=0, bounded; scheduler POLICY, never authorization)", parents=[common, common_memory])
@@ -223,6 +224,9 @@ def build_parser() -> argparse.ArgumentParser:
     sched_reservation_en.add_argument("goal_id")
     sched_reservation_dis = sched_reservation_sub.add_parser("disable", help="disable a goal's reservation config (no floor)", parents=[common, common_memory])
     sched_reservation_dis.add_argument("goal_id")
+    sched_reservation_plan = sched_reservation_sub.add_parser("plan", help="DRY-RUN: simulate setting a goal's reservation WITHOUT persisting (ADR-030)", parents=[common, common_memory])
+    sched_reservation_plan.add_argument("goal_id")
+    sched_reservation_plan.add_argument("capacity", type=int)
 
     sched_watch = sched_sub.add_parser("watch", help="show scheduler telemetry events (ADR-028; observational only)", parents=[common, common_memory])
     sched_watch.add_argument("--goal", default=None, help="filter by goal id")
@@ -360,8 +364,41 @@ def _scheduler_command(args, engine) -> int:
             "abandoned": counts["abandoned"],
             "stale_running_leases": len(stale),
         }
+        # ADR-030: additive read-only capacity-planning block
+        planning = {}
+        if hasattr(store, "capacity_snapshot"):
+            snap = store.capacity_snapshot(now=engine._lock_now())
+            planning = {k: snap[k] for k in (
+                "global_max_concurrency", "available_capacity",
+                "reserved_capacity", "active_reserved_capacity",
+                "reservation_pressure", "unreserved_capacity",
+                "active_scheduler_count", "active_goal_count",
+                "reserved_goal_count", "goals_below_reservation",
+                "goals_at_reservation", "goals_above_reservation")}
+            out.update(planning)
+            out["goals"] = snap["goals"]
+            out["goal_weights"] = snap["goal_weights"]
+            out["goal_reservations"] = snap["goal_reservations"]
         if args.json:
             _emit(out)
+        elif planning:
+            cap = planning["global_max_concurrency"]
+            print(f"Global capacity:      {cap if cap is not None else 'unbounded'}")
+            print(f"Running:              {out['running']}")
+            print(f"Available:            {planning['available_capacity'] if planning['available_capacity'] is not None else 'unbounded'}")
+            print(f"Configured reserved:  {planning['reserved_capacity']}")
+            print(f"Active reservation:   {planning['active_reserved_capacity']}")
+            print(f"Unreserved capacity:  {planning['unreserved_capacity'] if planning['unreserved_capacity'] is not None else 'unbounded'}")
+            print()
+            print("Goals:")
+            for g in out["goals"]:
+                sat = "yes" if g["reservation_satisfied"] else "no"
+                state = g["state"]
+                print(f"  {g['goal_id']:<10} weight={g['weight']} "
+                      f"reservation={g['reservation']} running={g['running']} "
+                      f"queued={g['queued']} satisfied={sat} state={state}")
+            if not out["goals"]:
+                print("  (no goals)")
         else:
             for k, v in out.items():
                 print(f"{k:<22} {v}")
@@ -478,6 +515,26 @@ def _scheduler_command(args, engine) -> int:
             return 0
         return 1
 
+    if args.scheduler_command == "reservations" and getattr(args, "check", False):
+        if not hasattr(store, "reservation_check"):
+            print("capacity planning is not available on this engine")
+            return 1
+        data = store.reservation_check()
+        if args.json:
+            _emit(data)
+        else:
+            cap = data["global_max"]
+            print(f"Global capacity:      {cap if cap is not None else 'unbounded'}")
+            print(f"Configured total:     {data['configured_total']}")
+            print(f"Active reservation:   {data['active_reservation']}")
+            print(f"Reservation pressure: {data['reservation_pressure']}")
+            print(f"Unreserved capacity:  {data['unreserved_capacity'] if data['unreserved_capacity'] is not None else 'unbounded'}")
+            print(f"Feasible:             {'yes' if data['feasible'] else 'no'}"
+                  + (f" (overflow {data['overflow']})" if data["overflow"] else ""))
+            print(f"Goals below floor:    {', '.join(data['goals_below']) or '-'}")
+            print(f"Idle reserved goals:  {', '.join(data['idle_reserved_goals']) or '-'}")
+        return 0 if data["feasible"] else 1
+
     if args.scheduler_command == "reservations":
         rows = (store.list_goal_reservations()
                 if hasattr(store, "list_goal_reservations") else [])
@@ -498,6 +555,35 @@ def _scheduler_command(args, engine) -> int:
     if args.scheduler_command == "reservation":
         from arion.state.scheduler_work import SchedulerRegistryError
 
+        if args.scheduler_reservation_command == "plan":
+            if not hasattr(store, "simulate_reservation_change"):
+                print("capacity planning is not available on this engine")
+                return 1
+            try:
+                sim = store.simulate_reservation_change(
+                    args.goal_id, args.capacity)
+            except SchedulerRegistryError as exc:
+                print(f"invalid reservation plan: {exc}")
+                return 1
+            if args.json:
+                _emit(sim)
+            else:
+                cap = sim["global_max"]
+                print(f"goal={sim['goal_id']} reservation "
+                      f"{sim['current_reservation']} -> "
+                      f"{sim['proposed_reservation']} "
+                      f"(enabled={sim['current_enabled']})")
+                print(f"totals: {sim['current_total']} -> "
+                      f"{sim['proposed_total']} "
+                      f"(global cap {cap if cap is not None else 'unbounded'})")
+                print(f"feasible={'yes' if sim['feasible'] else 'no'} "
+                      f"overflow={sim['overflow']} "
+                      f"remaining={sim['remaining_capacity']}")
+                print(f"pressure: {sim['pressure_delta']} "
+                      f"({sim['reservation_pressure_now']} -> "
+                      f"{sim['reservation_pressure_proposed']})")
+                print("dry-run only: nothing was persisted")
+            return 0
         if args.scheduler_reservation_command == "set":
             try:
                 store.set_goal_reservation(args.goal_id, args.capacity,

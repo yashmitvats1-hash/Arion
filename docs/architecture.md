@@ -780,6 +780,72 @@ loop (ADR-016):
   cross-process, dynamic changes, restart/reclaim, telemetry, forged
   attempts, CLI/status/watch.
 
+## Reservation-aware capacity planning & scheduler status (ADR-030)
+
+- **Nature:** a READ-ONLY projection over durable scheduler state —
+  observability/planning only. It never claims, heartbeats, registers,
+  writes reservations/weights/capacity/DWRR credit, establishes
+  ownership, completes work, reclaims leases, or bypasses approvals. A
+  forged planning result has zero execution effect; the authoritative
+  claim transaction always wins; the ADR-029 claim path is unchanged.
+- **Capacity arithmetic:** `available = max(cap − running, 0)`; with NO
+  global cap, `available`/`unreserved` are explicit `None` (unbounded)
+  sentinels — never an invented finite capacity.
+- **Configured vs active reservations:** `reserved_capacity` = sum of
+  ENABLED reservations over all configured goals (configuration view);
+  `active_reserved_capacity` = sum over enabled reserved goals WITH
+  queued work (idle floors consume nothing — identical to the claim
+  gate's idle-goal rule); `reservation_pressure` = Σ max(0, R − running)
+  over runnable reserved goals; `unreserved = max(cap − running −
+  active_reserved, 0)`.
+- **Feasibility (read-only):** `reservation_feasibility(proposed=None)`
+  evaluates the current or a full proposed configuration:
+  feasible iff no cap OR `proposed_total ≤ cap`; returns totals, exact
+  `overflow`, `affected_goals`, `reason ∈ {ok, no_global_cap,
+  oversubscribed}`; never mutates config.
+- **Simulation (dry-run):** `simulate_reservation_change(goal_id, new)`
+  and `simulate_reservation_config(proposed)` compute current/proposed
+  totals, remaining capacity, feasibility, overflow, and a deterministic
+  `pressure_delta` (increase/decrease/unchanged vs the ADR-029 pressure
+  formula). Repeated runs leave reservations, weights, DWRR credit,
+  events, and ownership byte-identical.
+- **Admission explanations (projection, not a gate):** per-goal
+  `state ∈ {idle, weight_disabled, reserved_floor, reservation_waiting,
+  global_capacity_exhausted, scheduler_share_limited, eligible,
+  goal_weight_limited, unknown}` — derived from the same durable tables
+  and constants as the claim path (incl. the DWRR refill-round rule and
+  the ceil(cap/active) fair share), computed WITHOUT running the gates
+  (which mutate credit). Every explanation carries: "Eligible based on
+  current snapshot; admission is still authoritative at claim time."
+- **Store API:** `capacity_snapshot()` (typed snapshot: scalars,
+  below/at/above lists, per-goal projections, config views),
+  `explain_goal_eligibility()`, `reservation_feasibility()`,
+  `simulate_reservation_change()`, `simulate_reservation_config()`,
+  `reservation_check()`.
+- **CLI:** `arion scheduler status` upgraded to the planning layout
+  (human) + additive JSON (old keys preserved); `scheduler reservations
+  --check [--json]` (exit 0 feasible / 1 infeasible, read-only);
+  `scheduler reservation plan <goal> <n> [--json]` (dry-run, never
+  persists, invalid input exits 1).
+- **JSON schema:** semantic field names, no SQLite internals; `null`
+  for unbounded (no cap), `0`/`[]` for zero/empty, deterministic
+  ordering (goals sorted by id); bounded (ids/counts/enums only).
+- **Cross-process:** snapshots/plans are plain reads over the shared
+  registry — they may be stale the instant they return, and they can
+  never mutate authority even while subprocess workers claim, heartbeat,
+  complete, or reclaim.
+- **Security boundary:** planning reads authority tables only — forged
+  telemetry (reservation/satisfied/denied/refill/queue/capacity events),
+  fake goal ids, and planner/model/task metadata cannot alter planning
+  inputs, create reservations, change DWRR, establish ownership, or make
+  an infeasible config executable; malformed/oversized inputs fail
+  closed.
+- **Demo:** `scripts/demo_adr030_capacity_planning.py` (35 checks,
+  deterministic, offline): empty/cap/running snapshots, configured vs
+  active reservations, idle/below/satisfied goals, feasibility,
+  increase/decrease simulation, status JSON, check JSON, no-mutation
+  proof, forged telemetry, cross-process observation, restart.
+
 ## Structured intelligence boundary (ADR-011)
 
 ```

@@ -2165,6 +2165,453 @@ class SQLiteStorage:
             "now": now,
         }
 
+    # ------------------------------------------------------------------ #
+    # ADR-030: read-only capacity planning / status projection.          #
+    # NEVER an authority: no claims, no heartbeats, no config writes,    #
+    # no DWRR mutation, no ownership, no reclaims.                       #
+    # ------------------------------------------------------------------ #
+
+    def _sys_credit_for_goal(self, goal_id: str, cap: int | None) -> int:
+        """Durable DWRR deficit, clamped exactly like the admission gate
+        (ADR-027: min(deficit, max(weight, 2*cap)) when a cap exists)."""
+        row = self._conn.execute(
+            "SELECT deficit FROM scheduler_goal_state WHERE goal_id=?",
+            (goal_id,)).fetchone()
+        raw = int(row[0]) if row else 0
+        if cap is None:
+            return raw
+        weight = self.get_goal_weight(goal_id)
+        return min(raw, max(weight, 2 * int(cap)))
+
+    def _sys_share_projection(self, cap: int,
+                              active_schedulers: int) -> int:
+        """The ADR-026 fair-share constant used by the claim path:
+        ceil(cap / active) with a single active scheduler getting the
+        full cap."""
+        if active_schedulers <= 1:
+            return int(cap)
+        return max(1, -(-int(cap) // active_schedulers))
+
+    def _sys_goal_state_projection(self, goal_id: str, cap: int | None,
+                                   running_count: int,
+                                   queued_count_g: int, running_g: int,
+                                   reservation: int, res_enabled: bool,
+                                   weight_enabled: bool, credit: int,
+                                   queued_schedulers: set[str],
+                                   active_schedulers: int
+                                   ) -> tuple[str, bool]:
+        """Per-goal eligibility STATE projection (ADR-030 Phase E).
+
+        A READ-ONLY replica of the claim path's decision structure using
+        the same durable tables and constants - it never runs the gates
+        (which mutate DWRR credit) and never claims anything. Exact
+        admission is still authoritative at claim time; another process
+        may change state between this snapshot and the claim.
+        """
+        if queued_count_g == 0:
+            return "idle", False
+        if not weight_enabled:
+            return "weight_disabled", False  # ADR-027 hard gate
+        below_floor = (res_enabled and reservation >= 1
+                       and running_g < reservation)
+        if cap is not None and running_count >= int(cap):
+            if below_floor:
+                return "reservation_waiting", False
+            return "global_capacity_exhausted", False
+        # fair-share projection: are ALL of this goal's queued rows owned
+        # by schedulers already at/above their share?
+        share_limited = False
+        if cap is not None and active_schedulers > 1:
+            share = self._sys_share_projection(int(cap), active_schedulers)
+            for sid in queued_schedulers:
+                mine = self._conn.execute(
+                    "SELECT COUNT(*) FROM scheduler_work WHERE status=? "
+                    "AND scheduler_id=?",
+                    (SchedulerWorkStatus.RUNNING.value, sid)).fetchone()[0]
+                if int(mine) >= share:
+                    share_limited = True
+                    break
+        if below_floor:
+            if share_limited:
+                return "reservation_waiting", False
+            return "reserved_floor", True
+        if share_limited:
+            return "scheduler_share_limited", False
+        if credit >= 1:
+            return "eligible", True
+        # credit < 1: the gate would trigger a refill round iff NO other
+        # contending ENABLED goal still holds credit; mirror that rule
+        # (disabled goals are skipped, exactly like the gate).
+        if cap is not None:
+            contending = [r[0] for r in self._conn.execute(
+                "SELECT DISTINCT goal_id FROM scheduler_work "
+                "WHERE status IN (?, ?)",
+                (SchedulerWorkStatus.QUEUED.value,
+                 SchedulerWorkStatus.RUNNING.value)).fetchall()]
+            for g in contending:
+                if g == goal_id:
+                    continue
+                gcfg = self.get_goal_weight_config(g)
+                if gcfg is not None and not gcfg["enabled"]:
+                    continue
+                if self._sys_credit_for_goal(g, cap) >= 1:
+                    return "goal_weight_limited", False
+        return "eligible", True  # a refill round would fire at claim time
+
+    def _reservation_pressure_projection(self,
+                                         override: dict[str, int] | None
+                                         = None) -> int:
+        """ADR-029 pressure formula: sum of max(0, R - running) over
+        enabled reserved goals WITH queued work; optional per-goal
+        reservation override (used by the simulator)."""
+        override = override or {}
+        running_by_goal: dict[str, int] = {}
+        queued_by_goal: dict[str, int] = {}
+        for r in self.list_work(status=SchedulerWorkStatus.RUNNING):
+            running_by_goal[r.goal_id] = running_by_goal.get(r.goal_id, 0) + 1
+        for r in self.list_work(status=SchedulerWorkStatus.QUEUED):
+            queued_by_goal[r.goal_id] = queued_by_goal.get(r.goal_id, 0) + 1
+        pressure = 0
+        for cfg in self.list_goal_reservations():
+            if not cfg["enabled"]:
+                continue
+            g = cfg["goal_id"]
+            R = int(override.get(g, int(cfg["reservation"])))
+            if R < 1:
+                continue
+            if queued_by_goal.get(g, 0) == 0:
+                continue  # idle goals reserve nothing
+            pressure += max(R - running_by_goal.get(g, 0), 0)
+        return pressure
+
+    @_threadsafe
+    def capacity_snapshot(self, now: str | None = None) -> dict:
+        """ADR-030 read-only capacity-planning snapshot. Computed from
+        durable scheduler state only; NEVER mutates anything; may be stale
+        the instant it returns (admission is authoritative at claim time).
+        Bounded fields: ids/counts/enums, no payloads or secrets."""
+        now = now or utcnow()
+        cap = self.get_scheduler_global_max()
+        running = self.list_work(status=SchedulerWorkStatus.RUNNING)
+        queued = self.list_work(status=SchedulerWorkStatus.QUEUED)
+        running_count = len(running)
+        queued_count = len(queued)
+        available = None if cap is None else max(int(cap) - running_count, 0)
+
+        running_by_goal: dict[str, int] = {}
+        queued_by_goal: dict[str, int] = {}
+        scheds: set[str] = set()
+        for r in running:
+            running_by_goal[r.goal_id] = running_by_goal.get(r.goal_id, 0) + 1
+            scheds.add(r.scheduler_id)
+        for r in queued:
+            queued_by_goal[r.goal_id] = queued_by_goal.get(r.goal_id, 0) + 1
+            scheds.add(r.scheduler_id)
+        active_schedulers = len(scheds)
+
+        reservations = self.list_goal_reservations()
+        enabled_res = [r for r in reservations if r["enabled"]]
+        configured_total = sum(int(r["reservation"]) for r in enabled_res)
+
+        active_total = 0
+        pressure = 0
+        below: list[str] = []
+        at: list[str] = []
+        above: list[str] = []
+        for r in enabled_res:
+            R = int(r["reservation"])
+            if R < 1:
+                continue
+            g = r["goal_id"]
+            run_g = running_by_goal.get(g, 0)
+            if queued_by_goal.get(g, 0) > 0:
+                active_total += R
+                pressure += max(R - run_g, 0)
+            if run_g < R:
+                below.append(g)
+            elif run_g == R:
+                at.append(g)
+            else:
+                above.append(g)
+        below.sort()
+        at.sort()
+        above.sort()
+        unreserved = (None if cap is None
+                      else max(int(cap) - running_count - active_total, 0))
+
+        weights = self.list_goal_weights()
+        weight_by_goal = {w["goal_id"]: w for w in weights}
+
+        goal_ids = sorted(set(running_by_goal) | set(queued_by_goal)
+                          | {r["goal_id"] for r in reservations}
+                          | set(weight_by_goal))
+        per_goal: list[dict] = []
+        for g in goal_ids:
+            wcfg = weight_by_goal.get(g)
+            weight = int(wcfg["weight"]) if wcfg else 1
+            weight_enabled = bool(wcfg["enabled"]) if wcfg else True
+            rcfg = next((r for r in reservations if r["goal_id"] == g), None)
+            R = int(rcfg["reservation"]) if rcfg else 0
+            res_enabled = bool(rcfg["enabled"]) if rcfg else True
+            run_g = running_by_goal.get(g, 0)
+            que_g = queued_by_goal.get(g, 0)
+            deficit = max(R - run_g, 0)
+            satisfied = R == 0 or run_g >= R
+            pressure_g = deficit if que_g > 0 else 0
+            credit = self._sys_credit_for_goal(g, cap)
+            queued_scheds = {r.scheduler_id for r in queued
+                             if r.goal_id == g}
+            state, eligible = self._sys_goal_state_projection(
+                g, cap, running_count, que_g, run_g, R, res_enabled,
+                weight_enabled, credit, queued_scheds, active_schedulers)
+            per_goal.append({
+                "goal_id": g,
+                "weight": weight,
+                "weight_enabled": weight_enabled,
+                "reservation": R,
+                "reservation_enabled": res_enabled,
+                "running": run_g,
+                "queued": que_g,
+                "reservation_deficit": deficit,
+                "reservation_satisfied": satisfied,
+                "reservation_pressure": pressure_g,
+                "dwr_credit": credit,
+                "state": state,
+                "eligible": eligible,
+            })
+
+        return {
+            "global_max_concurrency": cap,
+            "running_count": running_count,
+            "queued_count": queued_count,
+            "available_capacity": available,
+            "reserved_capacity": configured_total,
+            "active_reserved_capacity": active_total,
+            "reservation_pressure": pressure,
+            "unreserved_capacity": unreserved,
+            "active_scheduler_count": active_schedulers,
+            "active_goal_count": len(goal_ids),
+            "reserved_goal_count": len(enabled_res),
+            "goals_below_reservation": below,
+            "goals_at_reservation": at,
+            "goals_above_reservation": above,
+            "goals": per_goal,
+            "goal_weights": weights,
+            "goal_reservations": reservations,
+            "now": now,
+        }
+
+    @_threadsafe
+    def explain_goal_eligibility(self, goal_id: str) -> dict:
+        """ADR-030 Phase E: read-only explanation of one goal's current
+        admission state. A projection - never a gate; admission is still
+        authoritative at claim time."""
+        snap = self.capacity_snapshot()
+        for g in snap["goals"]:
+            if g["goal_id"] == goal_id:
+                return {
+                    "goal_id": goal_id,
+                    "state": g["state"],
+                    "eligible": g["eligible"],
+                    "reservation": g["reservation"],
+                    "reservation_satisfied": g["reservation_satisfied"],
+                    "running": g["running"],
+                    "queued": g["queued"],
+                    "dwr_credit": g["dwr_credit"],
+                    "note": "Eligible based on current snapshot; "
+                            "admission is still authoritative at claim "
+                            "time.",
+                }
+        return {
+            "goal_id": goal_id,
+            "state": "unknown",
+            "eligible": False,
+            "reservation": 0,
+            "reservation_satisfied": True,
+            "running": 0,
+            "queued": 0,
+            "dwr_credit": 0,
+            "note": "Goal is not configured and has no scheduler rows; "
+                    "admission is still authoritative at claim time.",
+        }
+
+    @_threadsafe
+    def reservation_feasibility(self,
+                                proposed: dict[str, int] | None = None
+                                ) -> dict:
+        """ADR-030 Phase C: deterministic read-only feasibility of a
+        reservation configuration. `proposed=None` evaluates the CURRENT
+        enabled configuration; `proposed={goal_id: reservation}` evaluates
+        a FULL proposed configuration (values treated as enabled).
+        Never mutates configuration."""
+        cap = self.get_scheduler_global_max()
+        current_total = sum(
+            int(r["reservation"]) for r in self.list_goal_reservations()
+            if r["enabled"])
+        if proposed is None:
+            total = current_total
+            affected = sorted(
+                r["goal_id"] for r in self.list_goal_reservations()
+                if int(r["reservation"]) > 0)
+        else:
+            if not isinstance(proposed, dict) or not proposed:
+                raise SchedulerRegistryError(
+                    "proposed reservation config must be a non-empty "
+                    "dict of goal_id -> int (fail closed)")
+            total = 0
+            for g, v in proposed.items():
+                if not isinstance(g, str) or not g:
+                    raise SchedulerRegistryError(
+                        f"invalid goal id {g!r} in proposed config "
+                        f"(fail closed)")
+                if not isinstance(v, int) or isinstance(v, bool):
+                    raise SchedulerRegistryError(
+                        f"reservation for {g} must be an integer, got "
+                        f"{v!r} (fail closed)")
+                if v < 0 or v > self._RESERVATION_MAX:
+                    raise SchedulerRegistryError(
+                        f"reservation for {g} must be in [0, "
+                        f"{self._RESERVATION_MAX}], got {v} (fail closed)")
+                total += int(v)
+            affected = sorted(proposed)
+        if cap is None:
+            return {
+                "feasible": True,
+                "global_max": None,
+                "configured_total": current_total,
+                "proposed_total": total,
+                "overflow": 0,
+                "affected_goals": affected,
+                "reason": "no_global_cap",
+            }
+        overflow = max(total - int(cap), 0)
+        return {
+            "feasible": overflow == 0,
+            "global_max": int(cap),
+            "configured_total": current_total,
+            "proposed_total": total,
+            "overflow": overflow,
+            "affected_goals": affected,
+            "reason": "ok" if overflow == 0 else "oversubscribed",
+        }
+
+    @_threadsafe
+    def simulate_reservation_change(self, goal_id: str,
+                                    new_reservation: int) -> dict:
+        """ADR-030 Phase D: read-only dry-run of replacing ONE goal's
+        reservation. Never persists anything; never touches DWRR credit,
+        events, or work rows."""
+        if not isinstance(goal_id, str) or not goal_id:
+            raise SchedulerRegistryError(
+                "goal_id required (fail closed)")
+        if not isinstance(new_reservation, int) or                 isinstance(new_reservation, bool):
+            raise SchedulerRegistryError(
+                f"reservation must be an integer, got {new_reservation!r} "
+                f"(fail closed)")
+        if new_reservation < 0 or new_reservation > self._RESERVATION_MAX:
+            raise SchedulerRegistryError(
+                f"reservation must be in [0, {self._RESERVATION_MAX}], "
+                f"got {new_reservation} (fail closed)")
+        cap = self.get_scheduler_global_max()
+        cfg = self.get_goal_reservation_config(goal_id)
+        current = int(cfg["reservation"]) if cfg else 0
+        current_enabled = bool(cfg["enabled"]) if cfg else True
+        enabled_total = sum(
+            int(r["reservation"]) for r in self.list_goal_reservations()
+            if r["enabled"])
+        contribution = current if current_enabled else 0
+        proposed_total = enabled_total - contribution + int(new_reservation)
+        feasible = cap is None or proposed_total <= int(cap)
+        overflow = (0 if cap is None
+                    else max(proposed_total - int(cap), 0))
+        remaining = (None if cap is None
+                     else max(int(cap) - proposed_total, 0))
+        pressure_now = self._reservation_pressure_projection()
+        pressure_prop = self._reservation_pressure_projection(
+            override={goal_id: int(new_reservation)})
+        if pressure_prop > pressure_now:
+            delta = "increase"
+        elif pressure_prop < pressure_now:
+            delta = "decrease"
+        else:
+            delta = "unchanged"
+        return {
+            "goal_id": goal_id,
+            "current_reservation": current,
+            "current_enabled": current_enabled,
+            "proposed_reservation": int(new_reservation),
+            "current_total": enabled_total,
+            "proposed_total": proposed_total,
+            "global_max": cap,
+            "remaining_capacity": remaining,
+            "feasible": feasible,
+            "overflow": overflow,
+            "pressure_delta": delta,
+            "reservation_pressure_now": pressure_now,
+            "reservation_pressure_proposed": pressure_prop,
+            "affected_goals": sorted(
+                {goal_id} | {g["goal_id"]
+                             for g in self.list_goal_reservations()
+                             if g["enabled"] and int(g["reservation"]) > 0}),
+            "note": "Dry-run only: nothing was persisted; admission is "
+                    "authoritative at claim time.",
+        }
+
+    @_threadsafe
+    def reservation_check(self) -> dict:
+        """ADR-030 Phase G: read-only check of the CURRENT reservation
+        configuration. Composed from the snapshot + feasibility; never
+        mutates anything."""
+        snap = self.capacity_snapshot()
+        feas = self.reservation_feasibility()
+        idle = sorted(
+            g["goal_id"] for g in snap["goals"]
+            if g["reservation"] >= 1 and g["queued"] == 0)
+        return {
+            "global_max": feas["global_max"],
+            "configured_total": feas["configured_total"],
+            "feasible": feas["feasible"],
+            "overflow": feas["overflow"],
+            "reason": feas["reason"],
+            "active_reservation": snap["active_reserved_capacity"],
+            "reservation_pressure": snap["reservation_pressure"],
+            "goals_below": snap["goals_below_reservation"],
+            "idle_reserved_goals": idle,
+            "unreserved_capacity": snap["unreserved_capacity"],
+            "note": "Read-only check: admission is authoritative at "
+                    "claim time.",
+        }
+
+    @_threadsafe
+    def simulate_reservation_config(self,
+                                    proposed: dict[str, int]) -> dict:
+        """ADR-030 Phase D: read-only dry-run of a FULL proposed
+        reservation configuration. Never persists anything."""
+        feasibility = self.reservation_feasibility(proposed=proposed)
+        pressure_now = self._reservation_pressure_projection()
+        pressure_prop = self._reservation_pressure_projection(
+            override=dict(proposed))
+        if pressure_prop > pressure_now:
+            delta = "increase"
+        elif pressure_prop < pressure_now:
+            delta = "decrease"
+        else:
+            delta = "unchanged"
+        return {
+            "feasible": feasibility["feasible"],
+            "global_max": feasibility["global_max"],
+            "current_total": feasibility["configured_total"],
+            "proposed_total": feasibility["proposed_total"],
+            "overflow": feasibility["overflow"],
+            "affected_goals": feasibility["affected_goals"],
+            "reason": feasibility["reason"],
+            "pressure_delta": delta,
+            "reservation_pressure_now": pressure_now,
+            "reservation_pressure_proposed": pressure_prop,
+            "note": "Dry-run only: nothing was persisted; admission is "
+                    "authoritative at claim time.",
+        }
+
     @_threadsafe
     def prune_scheduler_events(self, cutoff: str, batch_size: int = 500) -> int:
         """Explicit retention: delete events older than `cutoff` in bounded
