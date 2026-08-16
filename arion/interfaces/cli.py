@@ -209,6 +209,15 @@ def build_parser() -> argparse.ArgumentParser:
     sched_weight_dis = sched_weight_sub.add_parser("disable", help="disable a goal's weight config (never admitted)", parents=[common, common_memory])
     sched_weight_dis.add_argument("goal_id")
 
+    sched_watch = sched_sub.add_parser("watch", help="show scheduler telemetry events (ADR-028; observational only)", parents=[common, common_memory])
+    sched_watch.add_argument("--goal", default=None, help="filter by goal id")
+    sched_watch.add_argument("--scheduler", default=None, help="filter by scheduler id")
+    sched_watch.add_argument("--work", default=None, help="filter by work id")
+    sched_watch.add_argument("--type", default=None, help="filter by event type")
+    sched_watch.add_argument("--since", default=None, help="only events at/after this ISO timestamp")
+    sched_watch.add_argument("--limit", type=int, default=50, help="max events to show (bounded; default 50)")
+    sched_watch.add_argument("--follow", action="store_true", help="bounded polling mode (Ctrl-C to stop); read-only, no registration/heartbeat")
+
     return parser
 
 
@@ -454,7 +463,84 @@ def _scheduler_command(args, engine) -> int:
             return 0
         return 1
 
+    if args.scheduler_command == "watch":
+        if not hasattr(store, "scheduler_events"):
+            print("scheduler telemetry is not available on this engine")
+            return 1
+        if args.limit < 1 or args.limit > 1000:
+            print("watch --limit must be in [1, 1000] (bounded; fail closed)")
+            return 1
+        if args.follow:
+            return _scheduler_watch_follow(args, store, engine)
+
+        def _human(e):
+            d = e.detail
+            who = (d.get("worker_id") or d.get("scheduler_id") or "-")
+            goal = d.get("goal_id") or "-"
+            work = d.get("work_id") or "-"
+            extra = ""
+            if e.kind in ("work.claimed", "work.heartbeat", "work.reclaimed"):
+                extra = f" lease={d.get('lease_expires_at', '-')}"
+            if e.kind in ("work.claim_denied", "capacity.denied",
+                          "scheduler_share.denied", "goal_weight.denied"):
+                extra = f" reason={d.get('reason', '-')}"
+            if e.kind == "goal_weight.refill":
+                extra = (f" weight={d.get('weight')} "
+                         f"credit={d.get('credit_before')}->{d.get('credit_after')}")
+            if e.kind == "scheduler.config_changed":
+                extra = f" config={d.get('config')} ({d.get('reason', '-')})"
+            print(f"{e.ts}  {e.kind:<24} who={who:<20} goal={goal:<12} "
+                  f"work={work:<12}{extra}")
+
+        events = store.scheduler_events(
+            scheduler_id=args.scheduler, goal_id=args.goal, work_id=args.work,
+            event_type=args.type, since=args.since, limit=args.limit)
+        if args.json:
+            _emit([{"id": e.id, "ts": e.ts, "kind": e.kind,
+                    "detail": e.detail, "success": e.success}
+                   for e in events])
+        else:
+            for e in events:
+                _human(e)
+        return 0
+
     return 1
+
+
+def _scheduler_watch_follow(args, store, engine) -> int:
+    """Bounded polling watch mode (ADR-028 Phase F): prints NEW events each
+    poll. READ-ONLY: no mutation, no registration, no heartbeat, no claims.
+    Ctrl-C (KeyboardInterrupt) exits cleanly; the in-memory cursor is the
+    only state, so memory growth is bounded."""
+    import time as _time
+
+    if not hasattr(store, "oldest_scheduler_event"):
+        print("scheduler telemetry is not available on this engine")
+        return 1
+    # start from the newest event so the first poll prints only new ones
+    recent = store.recent_scheduler_events(limit=1)
+    last_id = recent[0].id if recent else None
+    interval = max(0.5, float(getattr(args, "follow_interval", 2.0)))
+    print("watching scheduler events (Ctrl-C to stop)...", flush=True)
+    try:
+        while True:
+            rows = store.scheduler_events(
+                scheduler_id=args.scheduler, goal_id=args.goal,
+                work_id=args.work, event_type=args.type, since=args.since,
+                limit=args.limit)
+            for e in rows:
+                if last_id is None or e.id != last_id:
+                    print(f"{e.ts}  {e.kind:<24} "
+                          f"who={(e.detail.get('worker_id') or e.detail.get('scheduler_id') or '-'):<20} "
+                          f"goal={e.detail.get('goal_id', '-'):<12} "
+                          f"work={e.detail.get('work_id', '-'):<12}",
+                          flush=True)
+            if rows:
+                last_id = rows[-1].id
+            _time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nwatch stopped (no mutation performed)", flush=True)
+        return 0
 
 
 def _locks_command(args, engine) -> int:

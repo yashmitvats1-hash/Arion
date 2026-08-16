@@ -26,7 +26,6 @@ def _threadsafe(method):
     return wrapper
 
 from arion.state.models import Checkpoint, Goal, Task, TaskStatus, new_id, utcnow
-from arion.observability.events import AuditEvent
 from arion.state.recovery import MutationRecovery
 from arion.state.locks import LockWaiter, LockWaiterStatus, MutationLock, MutationLockError
 from arion.state.scheduler_work import (
@@ -36,6 +35,14 @@ from arion.state.scheduler_work import (
     SchedulerWorkStatus,
     legal_transition,
 )
+
+
+def _audit_event(*args, **kwargs):
+    """Cycle-safe lazy import of AuditEvent (events.py imports this
+    package's models)."""
+    from arion.observability.events import AuditEvent
+
+    return AuditEvent(*args, **kwargs)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS goals (
@@ -192,6 +199,26 @@ CREATE TABLE IF NOT EXISTS scheduler_goal_state (
     deficit    INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS scheduler_events (
+    id             TEXT PRIMARY KEY,
+    ts             TEXT NOT NULL,
+    scheduler_id   TEXT,
+    worker_id      TEXT,
+    goal_id        TEXT,
+    task_id        TEXT,
+    work_id        TEXT,
+    step_index     INTEGER,
+    event_type     TEXT NOT NULL,
+    reason         TEXT,
+    success        INTEGER NOT NULL DEFAULT 1,
+    detail         TEXT NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_sched_events_ts ON scheduler_events(ts);
+CREATE INDEX IF NOT EXISTS idx_sched_events_type ON scheduler_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_sched_events_work ON scheduler_events(work_id);
+CREATE INDEX IF NOT EXISTS idx_sched_events_goal ON scheduler_events(goal_id);
+CREATE INDEX IF NOT EXISTS idx_sched_events_sched ON scheduler_events(scheduler_id);
 """
 
 
@@ -391,6 +418,7 @@ class SQLiteStorage:
             rows = self._conn.execute(
                 "SELECT id, ts, task_id, step_id, kind, actor, success, detail FROM audit_events ORDER BY rowid"
             ).fetchall()
+        from arion.observability.events import AuditEvent  # noqa: F401 (cycle-safe)
         return [AuditEvent.from_row(r) for r in rows]
 
     # ---- EventSink protocol (observability -> storage) ----
@@ -1032,6 +1060,13 @@ class SQLiteStorage:
              work.error, work.created_at, work.started_at, work.completed_at,
              work.lease_expires_at),
         )
+        # ADR-028: queue admission event commits ATOMICALLY with the row.
+        self._sech_insert_in_tx(_audit_event(
+            kind="work.queued", ts=created,
+            detail={"scheduler_id": scheduler_id, "goal_id": goal_id,
+                    "task_id": task_id, "work_id": work.work_id,
+                    "step_index": step_index, "outcome": "queued",
+                    "ts": created}))
         self._conn.commit()
         return work
 
@@ -1080,6 +1115,14 @@ class SQLiteStorage:
                 (status.value, (error or "")[:500], now or utcnow(),
                  work_id, SchedulerWorkStatus.RUNNING.value, owner_worker_id),
             )
+            if cur.rowcount > 0:
+                self._sech_insert_in_tx(_audit_event(
+                    kind=("work.completed" if status == SchedulerWorkStatus.COMPLETED
+                          else "work.failed"),
+                    ts=now or utcnow(),
+                    detail={"work_id": work_id, "worker_id": owner_worker_id,
+                            "outcome": status.value,
+                            "reason": (error or "")[:200], "ts": now or utcnow()}))
             self._conn.commit()
             if cur.rowcount == 0:
                 row = self._conn.execute(
@@ -1164,23 +1207,38 @@ class SQLiteStorage:
     @_threadsafe
     def reclaim_stale(self, now: str | None = None) -> list[str]:
         """Expired RUNNING leases -> ABANDONED. Idempotent: a terminal or
-        still-valid row is never touched. Returns reclaimed work ids."""
+        still-valid row is never touched. Returns reclaimed work ids.
+        Emits an atomic `work.reclaimed` event per row (same transaction)."""
         now = now or utcnow()
-        rows = self._conn.execute(
-            "SELECT work_id FROM scheduler_work WHERE status=? AND lease_expires_at IS NOT NULL "
-            "AND lease_expires_at <= ?",
-            (SchedulerWorkStatus.RUNNING.value, now)).fetchall()
-        ids = [r[0] for r in rows]
-        if ids:
-            self._conn.execute(
-                "UPDATE scheduler_work SET status=?, completed_at=?, lease_expires_at=NULL "
-                "WHERE work_id IN (%s) AND status=?"
-                % ",".join("?" * len(ids)),
-                [SchedulerWorkStatus.ABANDONED.value, now, *ids,
-                 SchedulerWorkStatus.RUNNING.value],
-            )
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            rows = self._conn.execute(
+                "SELECT work_id, goal_id, worker_id, scheduler_id FROM scheduler_work "
+                "WHERE status=? AND lease_expires_at IS NOT NULL "
+                "AND lease_expires_at <= ?",
+                (SchedulerWorkStatus.RUNNING.value, now)).fetchall()
+            ids = [r[0] for r in rows]
+            if ids:
+                self._conn.execute(
+                    "UPDATE scheduler_work SET status=?, completed_at=?, "
+                    "lease_expires_at=NULL "
+                    "WHERE work_id IN (%s) AND status=?"
+                    % ",".join("?" * len(ids)),
+                    [SchedulerWorkStatus.ABANDONED.value, now, *ids,
+                     SchedulerWorkStatus.RUNNING.value],
+                )
+                for wid, gid, worker, sid in rows:
+                    self._sech_insert_in_tx(_audit_event(
+                        kind="work.reclaimed", ts=now,
+                        detail={"work_id": wid, "goal_id": gid,
+                                "worker_id": worker, "scheduler_id": sid,
+                                "reason": "lease_expired",
+                                "outcome": "reclaimed", "ts": now}))
             self._conn.commit()
-        return ids
+            return ids
+        except Exception:
+            self._conn.rollback()
+            raise
 
     @_threadsafe
     def abandon_foreign_queued(self, scheduler_id: str,
@@ -1191,17 +1249,37 @@ class SQLiteStorage:
         share one registry without abandoning each other's work. This
         engine's own QUEUED rows are always untouched. Idempotent."""
         now = now or utcnow()
-        cur = self._conn.execute(
-            "UPDATE scheduler_work SET status=?, completed_at=?, "
-            "lease_expires_at=NULL "
-            "WHERE status=? AND scheduler_id<>? AND scheduler_id NOT IN "
-            "(SELECT scheduler_id FROM scheduler_instances "
-            " WHERE lease_expires_at > ?)",
-            (SchedulerWorkStatus.ABANDONED.value, now,
-             SchedulerWorkStatus.QUEUED.value, scheduler_id, now),
-        )
-        self._conn.commit()
-        return cur.rowcount
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            rows = self._conn.execute(
+                "SELECT work_id, goal_id, scheduler_id FROM scheduler_work "
+                "WHERE status=? AND scheduler_id<>? AND scheduler_id NOT IN "
+                "(SELECT scheduler_id FROM scheduler_instances "
+                " WHERE lease_expires_at > ?)",
+                (SchedulerWorkStatus.QUEUED.value, scheduler_id, now)).fetchall()
+            ids = [r[0] for r in rows]
+            if ids:
+                self._conn.execute(
+                    "UPDATE scheduler_work SET status=?, completed_at=?, "
+                    "lease_expires_at=NULL "
+                    "WHERE status=? AND scheduler_id<>? AND scheduler_id NOT IN "
+                    "(SELECT scheduler_id FROM scheduler_instances "
+                    " WHERE lease_expires_at > ?)",
+                    (SchedulerWorkStatus.ABANDONED.value, now,
+                     SchedulerWorkStatus.QUEUED.value, scheduler_id, now),
+                )
+                for wid, gid, sid in rows:
+                    self._sech_insert_in_tx(_audit_event(
+                        kind="scheduler.abandoned", ts=now,
+                        detail={"work_id": wid, "goal_id": gid,
+                                "scheduler_id": sid,
+                                "reason": "dead_registration",
+                                "outcome": "abandoned", "ts": now}))
+            self._conn.commit()
+            return len(ids)
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def _sys_row(self, work_id: str) -> SchedulerWork:
         work = self.get_work(work_id)
@@ -1227,6 +1305,11 @@ class SQLiteStorage:
             (scheduler_id, int(pid), now, now,
              _iso_plus(now, max(0.0, float(lease_seconds)))),
         )
+        self._sech_insert_in_tx(_audit_event(
+            kind="scheduler.registered", ts=now,
+            detail={"scheduler_id": scheduler_id, "pid": int(pid),
+                    "lease_expires_at": _iso_plus(now, max(0.0, float(lease_seconds))),
+                    "outcome": "registered", "ts": now}))
         self._conn.commit()
 
     @_threadsafe
@@ -1266,6 +1349,11 @@ class SQLiteStorage:
                 "UPDATE scheduler_instances SET heartbeat_at=?, lease_expires_at=? "
                 "WHERE scheduler_id=?",
                 (now, new_expiry, scheduler_id))
+            self._sech_insert_in_tx(_audit_event(
+                kind="scheduler.heartbeat", ts=now,
+                detail={"scheduler_id": scheduler_id,
+                        "lease_expires_at": new_expiry,
+                        "outcome": "heartbeat", "ts": now}))
             self._conn.commit()
             return True
         except Exception:
@@ -1277,6 +1365,10 @@ class SQLiteStorage:
         """Remove a scheduler registration (clean shutdown). Idempotent."""
         self._conn.execute("DELETE FROM scheduler_instances WHERE scheduler_id=?",
                            (scheduler_id,))
+        self._sech_insert_in_tx(_audit_event(
+            kind="scheduler.shutdown", ts=utcnow(),
+            detail={"scheduler_id": scheduler_id, "outcome": "shutdown",
+                    "ts": utcnow()}))
         self._conn.commit()
 
     @_threadsafe
@@ -1298,6 +1390,10 @@ class SQLiteStorage:
         self._conn.execute(
             "INSERT OR REPLACE INTO scheduler_config (key, value) VALUES (?, ?)",
             ("global_max_concurrency", str(n)))
+        self._sech_insert_in_tx(_audit_event(
+            kind="scheduler.config_changed", ts=utcnow(),
+            detail={"scheduler_id": None, "config": "global_max_concurrency",
+                    "reason": str(n), "outcome": "set", "ts": utcnow()}))
         self._conn.commit()
 
     @_threadsafe
@@ -1326,11 +1422,14 @@ class SQLiteStorage:
              SchedulerWorkStatus.RUNNING.value, now))
 
     def _sys_capacity_ok_in_tx(self,
-                               claiming_scheduler_id: str | None = None) -> bool:
-        """Cross-process capacity (ADR-026): when global_max_concurrency is
-        configured, grant only below the cap (counts live RUNNING rows
+                               claiming_scheduler_id: str | None = None,
+                               ) -> tuple[bool, str | None]:
+        """Cross-process capacity (ADR-026/028): when global_max_concurrency
+        is configured, grant only below the cap (counts live RUNNING rows
         across ALL schedulers) AND below the fair share for the claiming
-        scheduler.
+        scheduler. Returns (ok, reason) where reason is None on grant,
+        "capacity" when the global cap is the binding constraint, or
+        "scheduler_share" when the scheduler fair share is.
 
         Fair share: with `active` schedulers holding queued or running work,
         no single scheduler may hold more than ceil(global_max / active)
@@ -1339,40 +1438,43 @@ class SQLiteStorage:
         the full cap is available (ADR-025 behavior preserved)."""
         global_max = self.get_scheduler_global_max()
         if global_max is None:
-            return True
+            return True, None
         count = self._conn.execute(
             "SELECT COUNT(*) FROM scheduler_work WHERE status=?",
             (SchedulerWorkStatus.RUNNING.value,)).fetchone()[0]
         if count >= global_max:
-            return False
+            return False, "capacity"
         if claiming_scheduler_id is None:
-            return True
+            return True, None
         active = self._conn.execute(
             "SELECT COUNT(DISTINCT scheduler_id) FROM scheduler_work "
             "WHERE status IN (?, ?)",
             (SchedulerWorkStatus.QUEUED.value,
              SchedulerWorkStatus.RUNNING.value)).fetchone()[0]
         if active <= 1:
-            return True
+            return True, None
         share = max(1, -(-global_max // active))  # ceil(global_max / active)
         mine = self._conn.execute(
             "SELECT COUNT(*) FROM scheduler_work WHERE status=? AND scheduler_id=?",
             (SchedulerWorkStatus.RUNNING.value, claiming_scheduler_id)).fetchone()[0]
-        return mine < share
+        if mine >= share:
+            return False, "scheduler_share"
+        return True, None
 
-    def _sys_goal_admission_in_tx(self, goal_id: str) -> bool:
+    def _sys_goal_admission_in_tx(self, goal_id: str) -> tuple[bool, dict]:
         """DWRR goal-weight gate (ADR-027). Caller holds BEGIN IMMEDIATE.
 
-        Deterministic weighted fair admission:
+        Returns (granted, telemetry) where telemetry carries bounded
+        observability info (weight, refill, credit before/after). The gate
+        itself is authoritative; telemetry is observational ONLY.
 
         - contending goals = goals with QUEUED or RUNNING rows (an idle
           goal never reserves capacity);
         - every contending goal keeps a durable bounded deficit; when the
-          attempting goal's deficit is below 1, ALL contending goals are
-          refilled by their weight (disabled goals excluded) - the deficit
-          is capped at max(weight, 2 * global_max) so it stays bounded;
-        - a claim is granted iff the goal's deficit >= 1 (debited 1) and
-          the global-cap + scheduler fair-share gates passed;
+          attempting goal's deficit is below 1 AND no other contending
+          goal holds credit, ALL contending enabled goals are refilled by
+          their weight (deficit capped at max(weight, 2 * global_max));
+        - a claim is granted iff the goal's deficit >= 1 (debited 1);
         - disabled goals are never admitted (fail closed);
         - no global_max configured => the gate is a no-op (ADR-026
           behavior exactly); unconfigured goals use the default weight 1.
@@ -1380,20 +1482,22 @@ class SQLiteStorage:
         The entire decision derives from durable rows, so a restart
         reconstructs exactly the same policy (no in-memory counter).
         """
+        telemetry: dict = {}
         global_max = self.get_scheduler_global_max()
         if global_max is None:
-            return True  # no cross-process policy scope: default behavior
+            return True, telemetry  # no cross-process policy scope
         cfg = self.get_goal_weight_config(goal_id)
         if cfg is not None and not cfg["enabled"]:
-            return False  # disabled goal: never admitted
+            return False, {"weight": int(cfg["weight"]), "disabled": True}
         weight = int(cfg["weight"]) if cfg is not None else 1
+        telemetry["weight"] = weight
         contending = [
             r[0] for r in self._conn.execute(
                 "SELECT DISTINCT goal_id FROM scheduler_work WHERE status IN (?, ?)",
                 (SchedulerWorkStatus.QUEUED.value,
                  SchedulerWorkStatus.RUNNING.value)).fetchall()]
         if goal_id not in contending:
-            return False  # defensive: no work for this goal
+            return False, telemetry  # defensive: no work for this goal
         cap = max(1, int(global_max))
         row = self._conn.execute(
             "SELECT deficit FROM scheduler_goal_state WHERE goal_id=?",
@@ -1403,6 +1507,7 @@ class SQLiteStorage:
         # number of admissions and can never exceed cap/share gates
         deficit = min(int(row[0]) if row else 0,
                       max(weight, 2 * cap))
+        telemetry["credit_before"] = deficit
         if deficit < 1:
             # A refill round starts ONLY when NO contending enabled goal
             # still holds credit (a true round boundary): a hot goal cannot
@@ -1420,7 +1525,9 @@ class SQLiteStorage:
                     others_have_credit = True
                     break
             if others_have_credit:
-                return False  # this goal's credit is spent; wait for its round
+                telemetry["refill"] = False
+                telemetry["credit_after"] = deficit
+                return False, telemetry  # credit spent; wait for its round
             now = utcnow()
             for g in contending:
                 gcfg = self.get_goal_weight_config(g)
@@ -1443,13 +1550,37 @@ class SQLiteStorage:
                         "WHERE goal_id=?",
                         (nd, now, g))
             deficit = min(deficit + weight, max(weight, 2 * cap))
+            telemetry["refill"] = True
         if deficit >= 1:
             self._conn.execute(
                 "UPDATE scheduler_goal_state SET deficit=?, updated_at=? "
                 "WHERE goal_id=?",
                 (deficit - 1, utcnow(), goal_id))
-            return True
-        return False
+            telemetry["credit_after"] = deficit - 1
+            return True, telemetry
+        telemetry["credit_after"] = deficit
+        return False, telemetry
+
+    def _sech_claim_denied_event(self, reason: str, work_id: str,
+                                 goal_id: str | None, scheduler_id: str | None,
+                                 worker_id: str, now: str,
+                                 extra: dict | None = None) -> None:
+        """Emit an atomic `work.claim_denied` (or specific) event inside the
+        open transaction. OBSERVATIONAL ONLY."""
+        kind = "work.claim_denied"
+        if reason == "capacity":
+            kind = "capacity.denied"
+        elif reason == "scheduler_share":
+            kind = "scheduler_share.denied"
+        elif reason == "goal_weight":
+            kind = "goal_weight.denied"
+        d = {"scheduler_id": scheduler_id, "worker_id": worker_id,
+             "goal_id": goal_id, "work_id": work_id,
+             "reason": reason, "outcome": "denied",
+             "ts": now}
+        if extra:
+            d.update(extra)
+        self._sech_insert_in_tx(_audit_event(kind=kind, ts=now, detail=d))
 
     def _sys_claim_in_tx(self, worker_id: str, lease_seconds: float, now: str,
                          max_lease_seconds: float | None,
@@ -1460,7 +1591,17 @@ class SQLiteStorage:
         denies (row stays QUEUED). Raises SchedulerStateError when a
         SPECIFIC row is not claimable (raced / terminal)."""
         self._sys_reclaim_stale_in_tx(now)
-        if not self._sys_capacity_ok_in_tx(claiming_scheduler_id=scheduler_id):
+        cap_ok, cap_reason = self._sys_capacity_ok_in_tx(
+            claiming_scheduler_id=scheduler_id)
+        if not cap_ok:
+            if work_id is not None:
+                g0 = self._conn.execute(
+                    "SELECT goal_id FROM scheduler_work WHERE work_id=?",
+                    (work_id,)).fetchone()
+                reason = cap_reason or "capacity"
+                self._sech_claim_denied_event(
+                    reason, work_id, g0[0] if g0 else None,
+                    scheduler_id, worker_id, now)
             return None
         lease = float(lease_seconds)
         if max_lease_seconds is not None:
@@ -1477,13 +1618,31 @@ class SQLiteStorage:
                     work_id, SchedulerWorkStatus.RUNNING,
                     SchedulerWorkStatus(row[2]))
             goal_id = row[1]
-            if not self._sys_goal_admission_in_tx(goal_id):
+            granted, tele = self._sys_goal_admission_in_tx(goal_id)
+            if not granted:
+                self._sech_claim_denied_event(
+                    "goal_weight", work_id, goal_id, scheduler_id, worker_id,
+                    now, extra=tele)
                 return None  # weighted gate denied: row stays QUEUED
+            if tele.get("refill"):
+                d = {"scheduler_id": scheduler_id, "worker_id": worker_id,
+                     "goal_id": goal_id, "work_id": work_id, "ts": now}
+                d.update({k: v for k, v in tele.items() if k in
+                          ("weight", "credit_before", "credit_after", "refill")})
+                self._sech_insert_in_tx(_audit_event(
+                    kind="goal_weight.refill", ts=now, detail=d))
             self._conn.execute(
                 "UPDATE scheduler_work SET status=?, worker_id=?, started_at=?, "
                 "lease_expires_at=? WHERE work_id=? AND status=?",
                 (SchedulerWorkStatus.RUNNING.value, worker_id, now,
                  _iso_plus(now, lease), work_id, SchedulerWorkStatus.QUEUED.value))
+            self._sech_insert_in_tx(_audit_event(
+                kind="work.claimed", ts=now,
+                detail={"scheduler_id": scheduler_id, "worker_id": worker_id,
+                        "goal_id": goal_id, "work_id": work_id,
+                        "step_index": self._sys_row(work_id).step_index,
+                        "lease_expires_at": _iso_plus(now, lease),
+                        "outcome": "claimed", "ts": now}))
             return self._sys_row(work_id)
         row = self._conn.execute(
             "SELECT work_id, goal_id FROM scheduler_work "
@@ -1492,13 +1651,31 @@ class SQLiteStorage:
         if row is None:
             return None
         claimed_work_id, goal_id = row[0], row[1]
-        if not self._sys_goal_admission_in_tx(goal_id):
+        granted, tele = self._sys_goal_admission_in_tx(goal_id)
+        if not granted:
+            self._sech_claim_denied_event(
+                "goal_weight", claimed_work_id, goal_id, scheduler_id,
+                worker_id, now, extra=tele)
             return None  # weighted gate denied: row stays QUEUED
+        if tele.get("refill"):
+            d = {"scheduler_id": scheduler_id, "worker_id": worker_id,
+                 "goal_id": goal_id, "work_id": claimed_work_id, "ts": now}
+            d.update({k: v for k, v in tele.items() if k in
+                      ("weight", "credit_before", "credit_after", "refill")})
+            self._sech_insert_in_tx(_audit_event(
+                kind="goal_weight.refill", ts=now, detail=d))
         self._conn.execute(
             "UPDATE scheduler_work SET status=?, worker_id=?, started_at=?, "
             "lease_expires_at=? WHERE work_id=? AND status=?",
             (SchedulerWorkStatus.RUNNING.value, worker_id, now,
              _iso_plus(now, lease), claimed_work_id, SchedulerWorkStatus.QUEUED.value))
+        self._sech_insert_in_tx(_audit_event(
+            kind="work.claimed", ts=now,
+            detail={"scheduler_id": scheduler_id, "worker_id": worker_id,
+                    "goal_id": goal_id, "work_id": claimed_work_id,
+                    "step_index": self._sys_row(claimed_work_id).step_index,
+                    "lease_expires_at": _iso_plus(now, lease),
+                    "outcome": "claimed", "ts": now}))
         return self._sys_row(claimed_work_id)
 
     @_threadsafe
@@ -1584,6 +1761,11 @@ class SQLiteStorage:
             self._conn.execute(
                 "UPDATE scheduler_work SET lease_expires_at=? WHERE work_id=?",
                 (new_expiry, work_id))
+            self._sech_insert_in_tx(_audit_event(
+                kind="work.heartbeat", ts=now,
+                detail={"work_id": work_id, "worker_id": worker_id,
+                        "lease_expires_at": new_expiry,
+                        "outcome": "heartbeat", "ts": now}))
             self._conn.commit()
             return self._sys_row(work_id)
         except Exception:
@@ -1629,11 +1811,232 @@ class SQLiteStorage:
                 self._sys_assert_transition(work_id, status, actual)
             nxt = self._sys_claim_in_tx(worker_id, lease_seconds, now,
                                         max_lease_seconds, scheduler_id=scheduler_id)
+            self._sech_insert_in_tx(_audit_event(
+                kind="work.handoff", ts=now,
+                detail={"work_id": work_id, "worker_id": worker_id,
+                        "scheduler_id": scheduler_id,
+                        "next_work_id": nxt.work_id if nxt else None,
+                        "outcome": status.value, "ts": now}))
             self._conn.commit()
             return self._sys_row(work_id), nxt
         except Exception:
             self._conn.rollback()
             raise
+
+    # ------------------------------------------------------------------ #
+    # ADR-028: scheduler telemetry (OBSERVATIONAL ONLY - never authority)
+    # ------------------------------------------------------------------ #
+
+    _SECH_MAX_LIMIT = 1000
+    _SECH_DEFAULT_LIMIT = 100
+    _SECH_DETAIL_KEYS = (
+        "scheduler_id", "worker_id", "goal_id", "task_id", "work_id",
+        "step_index", "lease_expires_at", "started_at", "pid", "reason",
+        "weight", "credit_before", "credit_after", "refill", "outcome",
+        "config", "position", "attempts", "deadline", "next_work_id",
+        "disabled",
+    )
+
+    @staticmethod
+    def _sech_sanitize_detail(detail: dict) -> dict:
+        """Bounded metadata only: allow a fixed set of small keys, truncate
+        values; NEVER secrets/prompts/payloads/contents."""
+        out = {"schema_version": 1}
+        for k, v in (detail or {}).items():
+            if k not in SQLiteStorage._SECH_DETAIL_KEYS:
+                continue
+            if isinstance(v, str):
+                v = v[:200]
+            elif not isinstance(v, (int, float, bool, type(None))):
+                continue
+            out[k] = v
+        return out
+
+    def _sech_insert_in_tx(self, event) -> None:
+        """Insert a scheduler telemetry event inside the CURRENT open
+        transaction (caller holds BEGIN IMMEDIATE): the event commits
+        atomically with the state transition, so a rolled-back transition
+        leaves no phantom event. OBSERVATIONAL ONLY."""
+        from arion.observability.events import AuditEvent  # noqa: F401 (cycle-safe)
+        d = self._sech_sanitize_detail(event.detail)
+        self._conn.execute(
+            "INSERT INTO scheduler_events (id, ts, scheduler_id, worker_id, "
+            "goal_id, task_id, work_id, step_index, event_type, reason, "
+            "success, detail, schema_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)",
+            (event.id, event.ts,
+             d.get("scheduler_id"), d.get("worker_id"), d.get("goal_id"),
+             d.get("task_id"), d.get("work_id"),
+             int(d["step_index"]) if d.get("step_index") is not None else None,
+             event.kind, d.get("reason"), int(event.success),
+             json.dumps(d)),
+        )
+
+    @_threadsafe
+    def append_scheduler_event(self, event: "AuditEvent") -> None:
+        """Durably persist one scheduler telemetry event (bounded detail).
+        OBSERVATIONAL ONLY - never consulted by any admission/ownership
+        path. Callers inside a transaction use `_sech_insert_in_tx`;
+        standalone appends are sanitized here."""
+        d = self._sech_sanitize_detail(event.detail)
+        self._conn.execute(
+            "INSERT OR IGNORE INTO scheduler_events (id, ts, scheduler_id, "
+            "worker_id, goal_id, task_id, work_id, step_index, event_type, "
+            "reason, success, detail, schema_version) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)",
+            (event.id, event.ts,
+             d.get("scheduler_id"), d.get("worker_id"), d.get("goal_id"),
+             d.get("task_id"), d.get("work_id"),
+             int(d["step_index"]) if d.get("step_index") is not None else None,
+             event.kind, d.get("reason"), int(event.success),
+             json.dumps(d)),
+        )
+        self._conn.commit()
+
+    def _sech_events_sql(self) -> str:
+        return ("SELECT id, ts, scheduler_id, worker_id, goal_id, task_id, "
+                "work_id, step_index, event_type, reason, success, detail, "
+                "schema_version FROM scheduler_events")
+
+    @staticmethod
+    def _sech_from_row(row) -> "AuditEvent":
+        return _audit_event(
+            id=row[0], ts=row[1],
+            detail={**json.loads(row[11]),
+                    **({"scheduler_id": row[2]} if row[2] else {}),
+                    **({"worker_id": row[3]} if row[3] else {}),
+                    **({"goal_id": row[4]} if row[4] else {}),
+                    **({"task_id": row[5]} if row[5] else {}),
+                    **({"work_id": row[6]} if row[6] else {}),
+                    **({"step_index": row[7]} if row[7] is not None else {})},
+            kind=row[8], success=bool(row[10]), work_id=row[6],
+        )
+
+    @_threadsafe
+    def recent_scheduler_events(self, limit: int = 100) -> list["AuditEvent"]:
+        limit = int(limit)
+        if limit < 1 or limit > self._SECH_MAX_LIMIT:
+            raise ValueError(
+                f"scheduler event limit must be in [1, {self._SECH_MAX_LIMIT}] "
+                f"(bounded; fail closed)")
+        rows = self._conn.execute(
+            self._sech_events_sql() + " ORDER BY rowid DESC LIMIT ?",
+            (limit,)).fetchall()
+        return [self._sech_from_row(r) for r in reversed(rows)]
+
+    @_threadsafe
+    def scheduler_events(self, *, scheduler_id: str | None = None,
+                         goal_id: str | None = None,
+                         work_id: str | None = None,
+                         event_type: str | None = None,
+                         since: str | None = None,
+                         limit: int = 100) -> list["AuditEvent"]:
+        limit = int(limit)
+        if limit < 1 or limit > self._SECH_MAX_LIMIT:
+            raise ValueError(
+                f"scheduler event limit must be in [1, {self._SECH_MAX_LIMIT}] "
+                f"(bounded; fail closed)")
+        where, params = [], []
+        if scheduler_id is not None:
+            where.append("scheduler_id=?")
+            params.append(scheduler_id)
+        if goal_id is not None:
+            where.append("goal_id=?")
+            params.append(goal_id)
+        if work_id is not None:
+            where.append("work_id=?")
+            params.append(work_id)
+        if event_type is not None:
+            where.append("event_type=?")
+            params.append(event_type)
+        if since is not None:
+            where.append("ts>=?")
+            params.append(since)
+        sql = self._sech_events_sql()
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY rowid DESC LIMIT ?"
+        rows = self._conn.execute(sql, (*params, limit)).fetchall()
+        return [self._sech_from_row(r) for r in reversed(rows)]
+
+    @_threadsafe
+    def scheduler_event_count(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM scheduler_events").fetchone()
+        return int(row[0])
+
+    @_threadsafe
+    def oldest_scheduler_event(self) -> "AuditEvent | None":
+        row = self._conn.execute(
+            self._sech_events_sql() + " ORDER BY rowid ASC LIMIT 1").fetchone()
+        return self._sech_from_row(row) if row else None
+
+    @_threadsafe
+    def scheduler_status(self, now: str | None = None) -> dict:
+        """Read-only status snapshot computed from durable state (ADR-028
+        Phase D). An OBSERVATION - never a cached authority; calling it
+        never mutates anything. Bounded fields only."""
+        now = now or utcnow()
+        running = [r for r in self.list_work(status=SchedulerWorkStatus.RUNNING)]
+        queued = [r for r in self.list_work(status=SchedulerWorkStatus.QUEUED)]
+        instances = self._conn.execute(
+            "SELECT scheduler_id, lease_expires_at FROM scheduler_instances"
+        ).fetchall()
+        active = [i[0] for i in instances if i[1] is not None and i[1] > now]
+        stale = [i[0] for i in instances if i[1] is None or i[1] <= now]
+        running_by_scheduler: dict[str, int] = {}
+        running_by_goal: dict[str, int] = {}
+        queued_by_goal: dict[str, int] = {}
+        for r in running:
+            running_by_scheduler[r.scheduler_id] = \
+                running_by_scheduler.get(r.scheduler_id, 0) + 1
+            running_by_goal[r.goal_id] = running_by_goal.get(r.goal_id, 0) + 1
+        for r in queued:
+            queued_by_goal[r.goal_id] = queued_by_goal.get(r.goal_id, 0) + 1
+        credit: dict[str, int] = {}
+        for row in self._conn.execute(
+                "SELECT goal_id, deficit FROM scheduler_goal_state").fetchall():
+            credit[row[0]] = int(row[1])
+        recent = self.recent_scheduler_events(limit=200)
+        recent_reclaim = sum(1 for e in recent if e.kind == "work.reclaimed")
+        recent_failure = sum(1 for e in recent if e.kind == "work.failed")
+        return {
+            "global_max_concurrency": self.get_scheduler_global_max(),
+            "running_count": len(running),
+            "queued_count": len(queued),
+            "active_schedulers": len(active),
+            "stale_schedulers": len(stale),
+            "running_by_scheduler": running_by_scheduler,
+            "running_by_goal": running_by_goal,
+            "queued_by_goal": queued_by_goal,
+            "goal_weights": self.list_goal_weights(),
+            "dwr_credit": credit,
+            "recent_reclaim_count": recent_reclaim,
+            "recent_failure_count": recent_failure,
+            "now": now,
+        }
+
+    @_threadsafe
+    def prune_scheduler_events(self, cutoff: str, batch_size: int = 500) -> int:
+        """Explicit retention: delete events older than `cutoff` in bounded
+        batches. NEVER touches scheduler authority tables; pruning cannot
+        affect execution. Returns the number of events removed."""
+        batch_size = int(batch_size)
+        if batch_size < 1 or batch_size > 5000:
+            raise ValueError("prune batch size must be in [1, 5000]")
+        removed = 0
+        while True:
+            batch = [r[0] for r in self._conn.execute(
+                "SELECT rowid FROM scheduler_events WHERE ts<? "
+                " ORDER BY rowid LIMIT ?",
+                (cutoff, batch_size)).fetchall()]
+            if not batch:
+                break
+            self._conn.execute(
+                "DELETE FROM scheduler_events WHERE rowid IN (%s)"
+                % ",".join("?" * len(batch)), batch)
+            self._conn.commit()
+            removed += len(batch)
+        return removed
 
     # ------------------------------------------------------------------ #
     # ADR-027: durable per-goal scheduling weights (scheduler POLICY,
@@ -1662,6 +2065,11 @@ class SQLiteStorage:
             "INSERT OR REPLACE INTO scheduler_goal_weights "
             "(goal_id, weight, enabled, updated_at, updated_by) VALUES (?,?,?,?,?)",
             (goal_id, int(weight), 1 if enabled else 0, now, str(by)[:100]))
+        self._sech_insert_in_tx(_audit_event(
+            kind="scheduler.config_changed", ts=now,
+            detail={"goal_id": goal_id, "config": "goal_weight",
+                    "reason": f"weight={int(weight)} enabled={enabled}",
+                    "outcome": "set", "ts": now}))
         self._conn.commit()
 
     @_threadsafe
@@ -1706,6 +2114,11 @@ class SQLiteStorage:
     def remove_goal_weight(self, goal_id: str) -> bool:
         cur = self._conn.execute(
             "DELETE FROM scheduler_goal_weights WHERE goal_id=?", (goal_id,))
+        if cur.rowcount > 0:
+            self._sech_insert_in_tx(_audit_event(
+                kind="scheduler.config_changed", ts=utcnow(),
+                detail={"goal_id": goal_id, "config": "goal_weight",
+                        "outcome": "removed", "ts": utcnow()}))
         self._conn.commit()
         return cur.rowcount > 0
 
@@ -1716,6 +2129,12 @@ class SQLiteStorage:
             "UPDATE scheduler_goal_weights SET enabled=?, updated_at=? "
             "WHERE goal_id=?",
             (1 if enabled else 0, utcnow(), goal_id))
+        if cur.rowcount > 0:
+            self._sech_insert_in_tx(_audit_event(
+                kind="scheduler.config_changed", ts=utcnow(),
+                detail={"goal_id": goal_id, "config": "goal_weight",
+                        "reason": "enabled" if enabled else "disabled",
+                        "outcome": "set", "ts": utcnow()}))
         self._conn.commit()
         if cur.rowcount == 0:
             return None

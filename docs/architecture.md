@@ -655,6 +655,68 @@ loop (ADR-016):
   deterministic, offline): default/equal/2:1/2:1:1/low-weight progress/
   cap enforcement/cross-process/dynamic change/restart/adversarial.
 
+## Scheduler observability / telemetry (ADR-028)
+
+- **Scope:** the existing bounded audit abstraction (`AuditEvent` +
+  `audit_events`) is extended — no second event system — with a durable,
+  bounded, queryable telemetry layer for the scheduler: registration/
+  liveness, queue admission (`work.queued`, atomic with the row insert),
+  work claims and denials (with reason codes), heartbeats,
+  lease expiry/reclaim, ownership handoff, scheduler abandonment,
+  global-cap and fair-share decisions, goal-weight/DWRR refill decisions,
+  terminal completion/failure, shutdown, and config changes.
+- **Storage:** `scheduler_events(id, ts, scheduler_id, worker_id, goal_id,
+  task_id, work_id, step_index, event_type, reason, success, detail,
+  schema_version)` with five covering indexes. `detail` is sanitized at
+  write time (whitelist of scalar keys, strings ≤ 200 chars, non-scalars
+  dropped, `schema_version` injected). Duplicate event ids are
+  `INSERT OR IGNORE` — idempotent, observational-only appends never error
+  the caller. No secrets, model prompts, planner output, credentials,
+  task payloads, or full memory ever enter an event.
+- **Atomicity:** every event commits inside the same `BEGIN IMMEDIATE`
+  transaction as the transition it describes (`_sech_insert_in_tx`), so a
+  rolled-back transition leaves no phantom success event; a crash between
+  transition and event is impossible. Claim success commits `work.claimed`
+  (+ optional `goal_weight.refill` with weight/credit_before/credit_after)
+  atomically; denials carry a specific kind (`capacity.denied`,
+  `scheduler_share.denied`, `goal_weight.denied`) plus a reason code.
+- **Observational only — never authority:** telemetry records are never
+  consulted as permission to execute, claim, complete, extend a lease,
+  bypass approval/recovery/dependencies/mutation locks, change capacity,
+  or change goal weights. Forged, deleted, or duplicated events have zero
+  effect on execution semantics; the durable registry rows and the
+  transactional claim path remain the only authorities. Tests prove a
+  forged claim creates no ownership, a forged completion/heartbeat never
+  completes or extends, a forged reclaim/refill never re-queues or
+  refills, delete-all leaves behavior identical, and duplicated events
+  never duplicate execution.
+- **Query API (read-only, bounded, fail-closed):** `scheduler_events(...)`
+  (oldest-first, `limit` clamped to [1, 1000], filters by goal/scheduler/
+  work/type/since), `scheduler_event_count()`, `oldest_scheduler_event()`,
+  `recent_scheduler_events(...)`, and `scheduler_status()` — a point-in-
+  time observation (counts, active/stale schedulers, running/queued by
+  scheduler and goal, weights, DWRR credit, recent reclaim/failure
+  counts) that is never a cached authority. No unbounded `SELECT *`.
+- **Retention:** `prune_scheduler_events(cutoff, batch_size ≤ 5000)` runs
+  bounded SELECT-then-DELETE batches, never touches scheduler authority
+  tables, and never silently deletes recent events (cutoff is caller
+  supplied and explicit).
+- **CLI:** `arion scheduler watch [--json] [--goal G] [--scheduler S]
+  [--work W] [--type T] [--since TS] [--limit N] [--follow]` — human rows
+  plus stable machine-readable JSON (`[{id,ts,kind,detail}]`); `--follow`
+  is a bounded read-only poller (no registration, no heartbeat) with a
+  Ctrl-C clean exit.
+- **Crash/restart:** events are durable across reopen; a crash after a
+  durable claim leaves `work.claimed` committed and the stale lease is
+  reclaimed with `work.reclaimed` committed atomically in the same
+  transaction; history replays oldest-first; an active heartbeat is
+  distinguishable from an abandoned scheduler.
+- **Demo:** `scripts/demo_adr028_scheduler_observability.py` (28 checks,
+  deterministic, offline): registration, claims, heartbeats, completion/
+  failure, capacity vs fair-share denials, DWRR refill, atomic reclaim,
+  handoff, abandonment, restart history, rollback-no-phantom, forged
+  telemetry powerless, retention, CLI JSON.
+
 ## Structured intelligence boundary (ADR-011)
 
 ```
