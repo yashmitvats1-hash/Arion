@@ -272,6 +272,37 @@ class SchedulerRegistry(Protocol):
         (terminal_row, next_row_or_None)."""
         ...
 
+    # ---- ADR-027: durable per-goal scheduling weights ----
+
+    def set_goal_weight(self, goal_id: str, weight: int, *,
+                        enabled: bool = True, by: str = "operator",
+                        now: str | None = None) -> None:
+        """Set/update a goal's durable scheduling weight (>= 1, bounded).
+        Typed error on invalid weights (fail closed)."""
+        ...
+
+    def get_goal_weight(self, goal_id: str) -> int:
+        """Configured weight, or the deterministic default 1."""
+        ...
+
+    def get_goal_weight_config(self, goal_id: str) -> dict | None:
+        """Bounded config row (weight/enabled/updated_at/updated_by) or
+        None when unconfigured."""
+        ...
+
+    def list_goal_weights(self) -> list[dict]:
+        """Bounded, ordered list of configured weights."""
+        ...
+
+    def remove_goal_weight(self, goal_id: str) -> bool:
+        """Delete the config (back to default behavior). True when a row
+        was removed."""
+        ...
+
+    def set_goal_weight_enabled(self, goal_id: str, enabled: bool) -> dict | None:
+        """Enable/disable a goal's weight config (None when unconfigured)."""
+        ...
+
 
 def _iso_plus(iso: str, seconds: float) -> str:
     """iso + seconds (naive/aware-safe, mirrors engine helpers)."""

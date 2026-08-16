@@ -180,6 +180,18 @@ CREATE TABLE IF NOT EXISTS scheduler_instances (
     heartbeat_at     TEXT,
     lease_expires_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS scheduler_goal_weights (
+    goal_id    TEXT PRIMARY KEY,
+    weight     INTEGER NOT NULL,
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT
+);
+CREATE TABLE IF NOT EXISTS scheduler_goal_state (
+    goal_id    TEXT PRIMARY KEY,
+    deficit    INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -1348,14 +1360,105 @@ class SQLiteStorage:
             (SchedulerWorkStatus.RUNNING.value, claiming_scheduler_id)).fetchone()[0]
         return mine < share
 
+    def _sys_goal_admission_in_tx(self, goal_id: str) -> bool:
+        """DWRR goal-weight gate (ADR-027). Caller holds BEGIN IMMEDIATE.
+
+        Deterministic weighted fair admission:
+
+        - contending goals = goals with QUEUED or RUNNING rows (an idle
+          goal never reserves capacity);
+        - every contending goal keeps a durable bounded deficit; when the
+          attempting goal's deficit is below 1, ALL contending goals are
+          refilled by their weight (disabled goals excluded) - the deficit
+          is capped at max(weight, 2 * global_max) so it stays bounded;
+        - a claim is granted iff the goal's deficit >= 1 (debited 1) and
+          the global-cap + scheduler fair-share gates passed;
+        - disabled goals are never admitted (fail closed);
+        - no global_max configured => the gate is a no-op (ADR-026
+          behavior exactly); unconfigured goals use the default weight 1.
+
+        The entire decision derives from durable rows, so a restart
+        reconstructs exactly the same policy (no in-memory counter).
+        """
+        global_max = self.get_scheduler_global_max()
+        if global_max is None:
+            return True  # no cross-process policy scope: default behavior
+        cfg = self.get_goal_weight_config(goal_id)
+        if cfg is not None and not cfg["enabled"]:
+            return False  # disabled goal: never admitted
+        weight = int(cfg["weight"]) if cfg is not None else 1
+        contending = [
+            r[0] for r in self._conn.execute(
+                "SELECT DISTINCT goal_id FROM scheduler_work WHERE status IN (?, ?)",
+                (SchedulerWorkStatus.QUEUED.value,
+                 SchedulerWorkStatus.RUNNING.value)).fetchall()]
+        if goal_id not in contending:
+            return False  # defensive: no work for this goal
+        cap = max(1, int(global_max))
+        row = self._conn.execute(
+            "SELECT deficit FROM scheduler_goal_state WHERE goal_id=?",
+            (goal_id,)).fetchone()
+        # a forged/inflated durable deficit is clamped at spend time to
+        # max(weight, 2 * cap): it can delay peers by at most a bounded
+        # number of admissions and can never exceed cap/share gates
+        deficit = min(int(row[0]) if row else 0,
+                      max(weight, 2 * cap))
+        if deficit < 1:
+            # A refill round starts ONLY when NO contending enabled goal
+            # still holds credit (a true round boundary): a hot goal cannot
+            # refill itself by repeatedly attempting. Every contending goal
+            # then receives +weight credit (bounded).
+            others_have_credit = False
+            for g in contending:
+                gcfg = self.get_goal_weight_config(g)
+                if gcfg is not None and not gcfg["enabled"]:
+                    continue
+                r2 = self._conn.execute(
+                    "SELECT deficit FROM scheduler_goal_state WHERE goal_id=?",
+                    (g,)).fetchone()
+                if r2 is not None and int(r2[0]) >= 1:
+                    others_have_credit = True
+                    break
+            if others_have_credit:
+                return False  # this goal's credit is spent; wait for its round
+            now = utcnow()
+            for g in contending:
+                gcfg = self.get_goal_weight_config(g)
+                if gcfg is not None and not gcfg["enabled"]:
+                    continue
+                gw = int(gcfg["weight"]) if gcfg is not None else 1
+                r2 = self._conn.execute(
+                    "SELECT deficit FROM scheduler_goal_state WHERE goal_id=?",
+                    (g,)).fetchone()
+                d = int(r2[0]) if r2 else 0
+                nd = min(d + gw, max(gw, 2 * cap))
+                if r2 is None:
+                    self._conn.execute(
+                        "INSERT INTO scheduler_goal_state "
+                        "(goal_id, deficit, updated_at) VALUES (?,?,?)",
+                        (g, nd, now))
+                else:
+                    self._conn.execute(
+                        "UPDATE scheduler_goal_state SET deficit=?, updated_at=? "
+                        "WHERE goal_id=?",
+                        (nd, now, g))
+            deficit = min(deficit + weight, max(weight, 2 * cap))
+        if deficit >= 1:
+            self._conn.execute(
+                "UPDATE scheduler_goal_state SET deficit=?, updated_at=? "
+                "WHERE goal_id=?",
+                (deficit - 1, utcnow(), goal_id))
+            return True
+        return False
+
     def _sys_claim_in_tx(self, worker_id: str, lease_seconds: float, now: str,
                          max_lease_seconds: float | None,
                          work_id: str | None = None,
                          scheduler_id: str | None = None) -> SchedulerWork | None:
         """Claim inside an open BEGIN IMMEDIATE transaction. Returns the
-        claimed row, or None when the capacity/fair share is full (row stays
-        QUEUED). Raises SchedulerStateError when a SPECIFIC row is not
-        claimable (raced / terminal)."""
+        claimed row, or None when the capacity/fair share/goal-weight gate
+        denies (row stays QUEUED). Raises SchedulerStateError when a
+        SPECIFIC row is not claimable (raced / terminal)."""
         self._sys_reclaim_stale_in_tx(now)
         if not self._sys_capacity_ok_in_tx(claiming_scheduler_id=scheduler_id):
             return None
@@ -1363,35 +1466,40 @@ class SQLiteStorage:
         if max_lease_seconds is not None:
             lease = min(lease, max(0.0, float(max_lease_seconds)))
         if work_id is not None:
-            cur = self._conn.execute(
+            row = self._conn.execute(
+                "SELECT work_id, goal_id, status FROM scheduler_work WHERE work_id=?",
+                (work_id,)).fetchone()
+            if row is None:
+                raise SchedulerStateError(
+                    f"unknown scheduler work id {work_id} (fail closed)")
+            if SchedulerWorkStatus(row[2]) != SchedulerWorkStatus.QUEUED:
+                self._sys_assert_transition(
+                    work_id, SchedulerWorkStatus.RUNNING,
+                    SchedulerWorkStatus(row[2]))
+            goal_id = row[1]
+            if not self._sys_goal_admission_in_tx(goal_id):
+                return None  # weighted gate denied: row stays QUEUED
+            self._conn.execute(
                 "UPDATE scheduler_work SET status=?, worker_id=?, started_at=?, "
                 "lease_expires_at=? WHERE work_id=? AND status=?",
                 (SchedulerWorkStatus.RUNNING.value, worker_id, now,
                  _iso_plus(now, lease), work_id, SchedulerWorkStatus.QUEUED.value))
-            if cur.rowcount == 0:
-                row = self._conn.execute(
-                    "SELECT work_id, status FROM scheduler_work WHERE work_id=?",
-                    (work_id,)).fetchone()
-                if row is None:
-                    raise SchedulerStateError(
-                        f"unknown scheduler work id {work_id} (fail closed)")
-                self._sys_assert_transition(
-                    work_id, SchedulerWorkStatus.RUNNING,
-                    SchedulerWorkStatus(row[1]))
             return self._sys_row(work_id)
         row = self._conn.execute(
-            "SELECT " + ", ".join(self._SYS_COLS) + " FROM scheduler_work "
+            "SELECT work_id, goal_id FROM scheduler_work "
             "WHERE status=? AND scheduler_id=? ORDER BY created_at, work_id LIMIT 1",
             (SchedulerWorkStatus.QUEUED.value, scheduler_id)).fetchone()
         if row is None:
             return None
-        claimed = _sys_work_from_row(row)
+        claimed_work_id, goal_id = row[0], row[1]
+        if not self._sys_goal_admission_in_tx(goal_id):
+            return None  # weighted gate denied: row stays QUEUED
         self._conn.execute(
             "UPDATE scheduler_work SET status=?, worker_id=?, started_at=?, "
             "lease_expires_at=? WHERE work_id=? AND status=?",
             (SchedulerWorkStatus.RUNNING.value, worker_id, now,
-             _iso_plus(now, lease), claimed.work_id, SchedulerWorkStatus.QUEUED.value))
-        return self._sys_row(claimed.work_id)
+             _iso_plus(now, lease), claimed_work_id, SchedulerWorkStatus.QUEUED.value))
+        return self._sys_row(claimed_work_id)
 
     @_threadsafe
     def claim(self, work_id: str, worker_id: str, lease_seconds: float,
@@ -1526,6 +1634,92 @@ class SQLiteStorage:
         except Exception:
             self._conn.rollback()
             raise
+
+    # ------------------------------------------------------------------ #
+    # ADR-027: durable per-goal scheduling weights (scheduler POLICY,
+    # never execution authority)
+    # ------------------------------------------------------------------ #
+
+    _WEIGHT_MAX = 10000
+
+    @_threadsafe
+    def set_goal_weight(self, goal_id: str, weight: int, *,
+                        enabled: bool = True, by: str = "operator",
+                        now: str | None = None) -> None:
+        """Set/update a goal's durable scheduling weight. Fail closed:
+        goal_id required, weight must be a positive integer <= 10000."""
+        now = now or utcnow()
+        if not goal_id:
+            raise SchedulerRegistryError("goal_id required (fail closed)")
+        if not isinstance(weight, int) or isinstance(weight, bool):
+            raise SchedulerRegistryError(
+                f"weight must be a positive integer, got {weight!r} (fail closed)")
+        if weight < 1 or weight > self._WEIGHT_MAX:
+            raise SchedulerRegistryError(
+                f"weight must be in [1, {self._WEIGHT_MAX}], got {weight} "
+                f"(fail closed)")
+        self._conn.execute(
+            "INSERT OR REPLACE INTO scheduler_goal_weights "
+            "(goal_id, weight, enabled, updated_at, updated_by) VALUES (?,?,?,?,?)",
+            (goal_id, int(weight), 1 if enabled else 0, now, str(by)[:100]))
+        self._conn.commit()
+
+    @_threadsafe
+    def get_goal_weight(self, goal_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT weight FROM scheduler_goal_weights WHERE goal_id=?",
+            (goal_id,)).fetchone()
+        if row is None:
+            return 1  # deterministic default
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return 1
+
+    @_threadsafe
+    def get_goal_weight_config(self, goal_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT goal_id, weight, enabled, updated_at, updated_by "
+            "FROM scheduler_goal_weights WHERE goal_id=?",
+            (goal_id,)).fetchone()
+        if row is None:
+            return None
+        return {
+            "goal_id": row[0],
+            "weight": int(row[1]),
+            "enabled": bool(row[2]),
+            "updated_at": row[3],
+            "updated_by": row[4],
+        }
+
+    @_threadsafe
+    def list_goal_weights(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT goal_id, weight, enabled, updated_at, updated_by "
+            "FROM scheduler_goal_weights ORDER BY goal_id").fetchall()
+        return [{
+            "goal_id": r[0], "weight": int(r[1]), "enabled": bool(r[2]),
+            "updated_at": r[3], "updated_by": r[4],
+        } for r in rows]
+
+    @_threadsafe
+    def remove_goal_weight(self, goal_id: str) -> bool:
+        cur = self._conn.execute(
+            "DELETE FROM scheduler_goal_weights WHERE goal_id=?", (goal_id,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    @_threadsafe
+    def set_goal_weight_enabled(self, goal_id: str,
+                                enabled: bool) -> dict | None:
+        cur = self._conn.execute(
+            "UPDATE scheduler_goal_weights SET enabled=?, updated_at=? "
+            "WHERE goal_id=?",
+            (1 if enabled else 0, utcnow(), goal_id))
+        self._conn.commit()
+        if cur.rowcount == 0:
+            return None
+        return self.get_goal_weight_config(goal_id)
 
 
 _GOAL_COLS = ["id", "description", "source", "status", "version", "strategy", "blockers",

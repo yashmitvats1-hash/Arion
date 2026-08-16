@@ -194,6 +194,21 @@ def build_parser() -> argparse.ArgumentParser:
     sched_reclaim = sched_sub.add_parser("reclaim", help="reclaim a STALE RUNNING work row whose lease expired (ADR-025; never executes)", parents=[common, common_memory])
     sched_reclaim.add_argument("work_id")
 
+    sched_weights = sched_sub.add_parser("weights", help="list durable per-goal scheduling weights (ADR-027)", parents=[common, common_memory])
+    sched_weight = sched_sub.add_parser("weight", help="manage a goal's durable scheduling weight (ADR-027)", parents=[common, common_memory])
+    sched_weight_sub = sched_weight.add_subparsers(dest="scheduler_weight_command", required=True)
+    sched_weight_set = sched_weight_sub.add_parser("set", help="set a goal's weight (>=1, bounded; scheduler POLICY, never authorization)", parents=[common, common_memory])
+    sched_weight_set.add_argument("goal_id")
+    sched_weight_set.add_argument("weight", type=int)
+    sched_weight_set.add_argument("--disable", action="store_true", help="set the config disabled (goal never admitted)")
+    sched_weight_set.add_argument("--by", default="cli-operator", help="who configured (audit only)")
+    sched_weight_rm = sched_weight_sub.add_parser("remove", help="remove a goal's weight config (back to default weight 1)", parents=[common, common_memory])
+    sched_weight_rm.add_argument("goal_id")
+    sched_weight_en = sched_weight_sub.add_parser("enable", help="enable a goal's weight config", parents=[common, common_memory])
+    sched_weight_en.add_argument("goal_id")
+    sched_weight_dis = sched_weight_sub.add_parser("disable", help="disable a goal's weight config (never admitted)", parents=[common, common_memory])
+    sched_weight_dis.add_argument("goal_id")
+
     return parser
 
 
@@ -383,6 +398,61 @@ def _scheduler_command(args, engine) -> int:
             return 1
         print(f"reclaimed {args.work_id} -> abandoned (lease had expired)")
         return 0
+
+    if args.scheduler_command == "weights":
+        from arion.state.scheduler_work import SchedulerRegistryError
+
+        rows = store.list_goal_weights() if hasattr(store, "list_goal_weights") else []
+        if args.json:
+            _emit(rows)
+            return 0
+        if not rows:
+            print("(no goal weights configured - all goals use the default weight 1)")
+            return 0
+        for r in rows:
+            state = "enabled" if r["enabled"] else "disabled"
+            print(f"{r['goal_id']:<24} weight={r['weight']:<5} {state:<9} "
+                  f"by={r['updated_by']}  at={r['updated_at']}")
+        return 0
+
+    if args.scheduler_command == "weight":
+        from arion.state.scheduler_work import SchedulerRegistryError
+
+        if args.scheduler_weight_command == "set":
+            try:
+                store.set_goal_weight(args.goal_id, args.weight,
+                                      enabled=not args.disable,
+                                      by=args.by, now=engine._lock_now())
+            except SchedulerRegistryError as exc:
+                print(f"invalid weight config: {exc}")
+                return 1
+            cfg = store.get_goal_weight_config(args.goal_id)
+            if args.json:
+                _emit(cfg)
+            else:
+                print(f"{args.goal_id}: weight={cfg['weight']} "
+                      f"{'disabled' if not cfg['enabled'] else 'enabled'} "
+                      f"(by {cfg['updated_by']})")
+            return 0
+        if args.scheduler_weight_command == "remove":
+            removed = store.remove_goal_weight(args.goal_id)
+            if not removed:
+                print(f"{args.goal_id}: no weight config (already default 1)")
+                return 1
+            print(f"{args.goal_id}: weight config removed (default 1 restored)")
+            return 0
+        if args.scheduler_weight_command in ("enable", "disable"):
+            enabled = args.scheduler_weight_command == "enable"
+            cfg = store.set_goal_weight_enabled(args.goal_id, enabled)
+            if cfg is None:
+                print(f"{args.goal_id}: no weight config to "
+                      f"{'enable' if enabled else 'disable'}")
+                return 1
+            print(f"{args.goal_id}: "
+                  f"{'enabled' if enabled else 'disabled'} "
+                  f"(weight={cfg['weight']})")
+            return 0
+        return 1
 
     return 1
 

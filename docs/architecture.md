@@ -622,6 +622,39 @@ loop (ADR-016):
   goal restart without duplicate mutations. Real subprocess coverage in
   `tests/test_multi_process_scheduler.py`.
 
+## Durable Per-Goal Capacity Shares + Weighted Fair Scheduling (ADR-027)
+
+- **Scope:** the ADR-026 cross-process scheduler becomes GOAL-AWARE. A
+  durable per-goal weight config (`scheduler_goal_weights`: goal_id,
+  positive bounded integer weight, enabled flag, updated_by/at) plus
+  durable DWRR credit (`scheduler_goal_state`) extend the atomic claim
+  transaction; unconfigured goals use the deterministic default weight 1
+  and no global cap ⇒ behavior identical to ADR-026.
+- **Weighted admission (deterministic DWRR inside `BEGIN IMMEDIATE`):**
+  contending goals = goals with QUEUED/RUNNING rows; when a claim is
+  attempted and NO contending goal holds credit, every contending enabled
+  goal is refilled by its weight (deficit bounded at max(weight, 2×cap)
+  and clamped at spend time); a claim is granted iff the goal's credit ≥ 1
+  (debited 1) after the global-cap and scheduler fair-share gates. A
+  weight-2 goal gets exactly 2× the claims of a weight-1 goal per round
+  under sustained contention; every contending goal claims at least once
+  per round (no starvation); idle goals reserve nothing; the global cap is
+  never exceeded.
+- **Dynamic policy:** weight changes apply to future refills only; RUNNING
+  work stays owned; no retroactive cancellation, no capacity duplication;
+  the durable deficit is the only fairness state (restart-safe, no
+  in-memory counter).
+- **Authority boundary:** weights are scheduler POLICY — planner output,
+  model output, memory, guidance, task metadata, worker input can never
+  establish or elevate a weight; forged deficits cannot exceed the global
+  cap, bypass the scheduler fair share, or grant ownership (heartbeat/
+  terminal/handoff stay owner-checked).
+- **CLI:** `arion scheduler weights`, `scheduler weight set <goal> <w>
+  [--disable] [--by]`, `scheduler weight remove|enable|disable <goal>`.
+- **Demo:** `scripts/demo_adr027_weighted_scheduler.py` (31 checks,
+  deterministic, offline): default/equal/2:1/2:1:1/low-weight progress/
+  cap enforcement/cross-process/dynamic change/restart/adversarial.
+
 ## Structured intelligence boundary (ADR-011)
 
 ```
