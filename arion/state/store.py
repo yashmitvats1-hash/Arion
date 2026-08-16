@@ -29,6 +29,13 @@ from arion.state.models import Checkpoint, Goal, Task, TaskStatus, new_id, utcno
 from arion.observability.events import AuditEvent
 from arion.state.recovery import MutationRecovery
 from arion.state.locks import LockWaiter, LockWaiterStatus, MutationLock, MutationLockError
+from arion.state.scheduler_work import (
+    SchedulerRegistryError,
+    SchedulerStateError,
+    SchedulerWork,
+    SchedulerWorkStatus,
+    legal_transition,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS goals (
@@ -145,6 +152,23 @@ CREATE TABLE IF NOT EXISTS mutation_lock_waiters (
 );
 CREATE INDEX IF NOT EXISTS idx_waiters_resource ON mutation_lock_waiters(resource_kind, resource, status, seq);
 CREATE INDEX IF NOT EXISTS idx_waiters_task ON mutation_lock_waiters(task_id);
+CREATE TABLE IF NOT EXISTS scheduler_work (
+    work_id          TEXT PRIMARY KEY,
+    task_id          TEXT NOT NULL,
+    goal_id          TEXT,
+    step_index       INTEGER NOT NULL,
+    scheduler_id     TEXT NOT NULL,
+    worker_id        TEXT,
+    status           TEXT NOT NULL,
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    error            TEXT,
+    created_at       TEXT NOT NULL,
+    started_at       TEXT,
+    completed_at     TEXT,
+    lease_expires_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sched_work_status ON scheduler_work(status, scheduler_id);
+CREATE INDEX IF NOT EXISTS idx_sched_work_task ON scheduler_work(task_id, step_index);
 """
 
 
@@ -944,6 +968,179 @@ class SQLiteStorage:
     def close(self) -> None:
         self._conn.close()
 
+    # ---- durable scheduler/work registry (ADR-025) ----
+
+    _SYS_COLS = [
+        "work_id", "task_id", "goal_id", "step_index", "scheduler_id",
+        "worker_id", "status", "attempts", "error", "created_at",
+        "started_at", "completed_at", "lease_expires_at",
+    ]
+
+    def _sys_assert_transition(self, work_id: str, target: SchedulerWorkStatus,
+                               actual: SchedulerWorkStatus) -> None:
+        """Fail closed: illegal or unknown transitions raise a typed error
+        carrying the ACTUAL durable state (never silently ignored)."""
+        if not legal_transition(actual, target):
+            raise SchedulerStateError(
+                f"invalid scheduler state transition {actual.value} -> "
+                f"{target.value} for {work_id} (fail closed)"
+            )
+
+    @_threadsafe
+    def create(self, *, task_id: str, goal_id: str | None, step_index: int,
+               scheduler_id: str, now: str | None = None) -> SchedulerWork:
+        if not task_id or not scheduler_id or step_index < 0:
+            raise SchedulerRegistryError(
+                "invalid scheduler work metadata (task_id/scheduler_id required, "
+                "step_index >= 0) - fail closed")
+        created = now or utcnow()
+        work = SchedulerWork(
+            work_id=new_id("sw"), task_id=task_id, goal_id=goal_id,
+            step_index=step_index, scheduler_id=scheduler_id,
+            status=SchedulerWorkStatus.QUEUED, created_at=created,
+        )
+        self._conn.execute(
+            "INSERT INTO scheduler_work (work_id, task_id, goal_id, step_index, "
+            "scheduler_id, worker_id, status, attempts, error, created_at, "
+            "started_at, completed_at, lease_expires_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (work.work_id, work.task_id, work.goal_id, work.step_index,
+             work.scheduler_id, work.worker_id, work.status.value, work.attempts,
+             work.error, work.created_at, work.started_at, work.completed_at,
+             work.lease_expires_at),
+        )
+        self._conn.commit()
+        return work
+
+    @_threadsafe
+    def mark_running(self, work_id: str, worker_id: str, lease_seconds: float,
+                     now: str | None = None) -> SchedulerWork:
+        cur = self._conn.execute(
+            "UPDATE scheduler_work SET status=?, worker_id=?, started_at=?, "
+            "lease_expires_at=? WHERE work_id=? AND status=?",
+            (SchedulerWorkStatus.RUNNING.value, worker_id, now or utcnow(),
+             _iso_plus(now or utcnow(), max(0.0, float(lease_seconds))),
+             work_id, SchedulerWorkStatus.QUEUED.value),
+        )
+        self._conn.commit()
+        if cur.rowcount == 0:
+            row = self._conn.execute(
+                "SELECT work_id, status FROM scheduler_work WHERE work_id=?",
+                (work_id,)).fetchone()
+            if row is None:
+                raise SchedulerStateError(f"unknown scheduler work id {work_id} (fail closed)")
+            self._sys_assert_transition(
+                work_id, SchedulerWorkStatus.RUNNING,
+                SchedulerWorkStatus(row[1]))
+        return self._sys_row(work_id)
+
+    @_threadsafe
+    def mark_terminal(self, work_id: str, status: SchedulerWorkStatus,
+                      error: str | None = None, now: str | None = None) -> SchedulerWork:
+        sources = self._sys_terminal_sources(status)
+        cur = self._conn.execute(
+            "UPDATE scheduler_work SET status=?, error=?, completed_at=?, "
+            "lease_expires_at=NULL WHERE work_id=? AND status IN (%s)"
+            % ",".join("?" * len(sources)),
+            (status.value, (error or "")[:500], now or utcnow(), work_id, *sources),
+        )
+        self._conn.commit()
+        if cur.rowcount == 0:
+            row = self._conn.execute(
+                "SELECT work_id, status FROM scheduler_work WHERE work_id=?",
+                (work_id,)).fetchone()
+            if row is None:
+                raise SchedulerStateError(f"unknown scheduler work id {work_id} (fail closed)")
+            self._sys_assert_transition(work_id, status, SchedulerWorkStatus(row[1]))
+        return self._sys_row(work_id)
+
+    @staticmethod
+    def _sys_terminal_sources(status: SchedulerWorkStatus) -> list[str]:
+        """Source states a terminal transition may come from (mirrors
+        legal_transition): CANCELLED only from QUEUED; ABANDONED from QUEUED
+        or RUNNING; COMPLETED/FAILED only from RUNNING."""
+        if status == SchedulerWorkStatus.CANCELLED:
+            return [SchedulerWorkStatus.QUEUED.value]
+        if status == SchedulerWorkStatus.ABANDONED:
+            return [SchedulerWorkStatus.QUEUED.value, SchedulerWorkStatus.RUNNING.value]
+        if status in (SchedulerWorkStatus.COMPLETED, SchedulerWorkStatus.FAILED):
+            return [SchedulerWorkStatus.RUNNING.value]
+        raise SchedulerStateError(f"not a terminal status: {status.value}")
+
+    @_threadsafe
+    def get_work(self, work_id: str) -> SchedulerWork | None:
+        row = self._conn.execute(
+            "SELECT " + ", ".join(self._SYS_COLS) + " FROM scheduler_work WHERE work_id=?",
+            (work_id,)).fetchone()
+        return _sys_work_from_row(row) if row else None
+
+    @_threadsafe
+    def list_work(self, status: SchedulerWorkStatus | None = None,
+             scheduler_id: str | None = None,
+             task_id: str | None = None,
+             goal_id: str | None = None) -> list[SchedulerWork]:
+        sql = "SELECT " + ", ".join(self._SYS_COLS) + " FROM scheduler_work"
+        where, params = [], []
+        if status is not None:
+            where.append("status=?")
+            params.append(status.value)
+        if scheduler_id is not None:
+            where.append("scheduler_id=?")
+            params.append(scheduler_id)
+        if task_id is not None:
+            where.append("task_id=?")
+            params.append(task_id)
+        if goal_id is not None:
+            where.append("goal_id=?")
+            params.append(goal_id)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at, work_id"
+        rows = self._conn.execute(sql, params).fetchall()
+        return [_sys_work_from_row(r) for r in rows]
+
+    @_threadsafe
+    def reclaim_stale(self, now: str | None = None) -> list[str]:
+        """Expired RUNNING leases -> ABANDONED. Idempotent: a terminal or
+        still-valid row is never touched. Returns reclaimed work ids."""
+        now = now or utcnow()
+        rows = self._conn.execute(
+            "SELECT work_id FROM scheduler_work WHERE status=? AND lease_expires_at IS NOT NULL "
+            "AND lease_expires_at <= ?",
+            (SchedulerWorkStatus.RUNNING.value, now)).fetchall()
+        ids = [r[0] for r in rows]
+        if ids:
+            self._conn.execute(
+                "UPDATE scheduler_work SET status=?, completed_at=?, lease_expires_at=NULL "
+                "WHERE work_id IN (%s) AND status=?"
+                % ",".join("?" * len(ids)),
+                [SchedulerWorkStatus.ABANDONED.value, now, *ids,
+                 SchedulerWorkStatus.RUNNING.value],
+            )
+            self._conn.commit()
+        return ids
+
+    @_threadsafe
+    def abandon_foreign_queued(self, scheduler_id: str,
+                               now: str | None = None) -> int:
+        """QUEUED rows owned by a DIFFERENT (presumed dead) scheduler ->
+        ABANDONED, so a restart never inherits another process's queue as if
+        it were its own. This scheduler's own QUEUED rows are untouched."""
+        cur = self._conn.execute(
+            "UPDATE scheduler_work SET status=?, completed_at=?, "
+            "lease_expires_at=NULL WHERE status=? AND scheduler_id<>?",
+            (SchedulerWorkStatus.ABANDONED.value, now or utcnow(),
+             SchedulerWorkStatus.QUEUED.value, scheduler_id),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def _sys_row(self, work_id: str) -> SchedulerWork:
+        work = self.get_work(work_id)
+        if work is None:
+            raise SchedulerStateError(f"unknown scheduler work id {work_id} (fail closed)")
+        return work
+
 
 _GOAL_COLS = ["id", "description", "source", "status", "version", "strategy", "blockers",
               "progress_metadata", "last_evaluated_at", "last_replan_reason", "created_at", "updated_at"]
@@ -1050,3 +1247,18 @@ def _goal_from_row(row: tuple[Any, ...]) -> Goal:
     except (TypeError, json.JSONDecodeError):
         d["progress_metadata"] = {}
     return Goal.from_dict(d)
+
+
+def _iso_plus(iso: str, seconds: float) -> str:
+    """iso + seconds (aware/naive-safe), for scheduler lease deadlines."""
+    from datetime import datetime, timedelta, timezone
+
+    dt = datetime.fromisoformat(iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (dt + timedelta(seconds=seconds)).isoformat()
+
+
+def _sys_work_from_row(row: tuple[Any, ...]) -> SchedulerWork:
+    d = {c: v for c, v in zip(SQLiteStorage._SYS_COLS, row)}
+    return SchedulerWork.from_dict(d)

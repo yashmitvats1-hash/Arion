@@ -283,11 +283,21 @@ def main() -> int:
         key=lambda e: e.detail.get("position", 0))
     check([w.detail["position"] for w in waiter_events] == [1, 2],
           "B: FIFO queue positions [1,2] preserved")
+    # map each durable position to its step so FIFO discipline is verified
+    # WITHOUT depending on which worker thread happened to enqueue first:
+    # the head (position 1) must acquire strictly before the tail (position 2),
+    # and the final file content must be the tail's write.
+    by_pos = {w.detail["position"]: int(w.step_id.rsplit("_", 1)[1])
+              for w in waiter_events}
     acq = [e for e in storage.list_events() if e.kind == "mutation.lock.acquired"]
     check(len({a.detail["lock_id"] for a in acq}) == 2,
           "B: each mutation held its OWN lock id (unique ownership)")
-    check((sb / "a.txt").read_text(encoding="utf-8") == "y",
-          "B: final content from the second (FIFO-ordered) write")
+    head_first = [int(a.step_id.rsplit("_", 1)[1]) for a in acq] == \
+        [by_pos[1], by_pos[2]]
+    check(head_first, "B: head waiter acquired BEFORE the tail waiter (FIFO)")
+    expected_final = "y" if by_pos[2] == 1 else "x"
+    check((sb / "a.txt").read_text(encoding="utf-8") == expected_final,
+          "B: final content from the FIFO-last write")
     holder.close()
     engine.shutdown()
     engine.storage.close()

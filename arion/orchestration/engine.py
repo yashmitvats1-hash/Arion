@@ -25,11 +25,13 @@ Conceptual flow per task:
 from __future__ import annotations
 
 import os
+import threading as _threading
 from typing import Any
 
 from arion.capabilities.registry import CapabilityError, CapabilityRegistry
 from arion.state.approvals import ApprovalError, ApprovalRequest, ApprovalStatus, ApprovalStore
 from arion.state.recovery import MutationRecovery, RecoveryError, RecoveryStatus
+from arion.state.scheduler_work import SchedulerStateError, SchedulerWorkStatus
 from arion.intelligence.plan_schema import PlanValidationError
 from arion.intelligence.plan_validator import topo_sort_steps
 from arion.intelligence.planner import Planner
@@ -50,6 +52,7 @@ from arion.state.models import (
     Checkpoint,
     Goal,
     GoalStateError,
+    GoalStatus,
     PlanStep,
     StepStatus,
     Task,
@@ -103,6 +106,9 @@ class ArionEngine:
         lock_wait_observer: Any | None = None,
         max_concurrency: int = 1,
         scheduler: Any | None = None,
+        scheduler_registry: Any | None = None,
+        scheduler_lease_seconds: float = 300.0,
+        scheduler_reclaim_on_start: bool = True,
     ):
         self.storage = storage
         self.registry = registry
@@ -172,6 +178,26 @@ class ArionEngine:
 
         self._inflight_locks: set[tuple[str, str]] = set()
         self._inflight_lock = _threading.RLock()
+        # Durable scheduler/work registry (ADR-025): the storage backend is
+        # the default implementation; an explicit store can be injected. The
+        # registry is the only source of durable worker-lifecycle state and
+        # is COORDINATION - never authorization (every dispatched step still
+        # passes live authorization -> approval -> durable lock -> FIFO).
+        self.scheduler_registry = scheduler_registry
+        if self.scheduler_registry is None and hasattr(storage, "create"):
+            self.scheduler_registry = storage  # type: ignore[assignment]
+        self.scheduler_lease_seconds = max(0.0, float(scheduler_lease_seconds))
+        # This engine's durable scheduler identity: on (re)start, QUEUED rows
+        # owned by a DIFFERENT (presumed dead) scheduler are abandoned and
+        # stale RUNNING leases are reclaimed, so no immortal RUNNING worker
+        # and no dead process's queue can ever be mistaken for live work.
+        self.scheduler_id = new_id("sched")
+        if self.scheduler_registry is not None and scheduler_reclaim_on_start:
+            try:
+                self.scheduler_registry.reclaim_stale(now=self._lock_now())
+                self.scheduler_registry.abandon_foreign_queued(self.scheduler_id)
+            except Exception:
+                pass
         # The goal manager's lock_contention recheck resolves via the engine's
         # live lock store (the lock store is the only lock authority).
         if self.goal_manager is not None:
@@ -454,10 +480,18 @@ class ArionEngine:
             waiter = self.mutation_lock_store.get_waiter(waiter_id)
             if waiter is None or waiter.status.value != "queued":
                 waiter = None  # stale/terminal: enqueue fresh
+        # The DURABLE WAITER ROW is the deadline authority (ADR-025 Phase H):
+        # a task-level lock_wait deadline that was forged (e.g. far in the
+        # future) can never extend the wait - the waiter row's deadline,
+        # written by the store with this engine's clock, wins. A legitimate
+        # preserved wait keeps its exact budget (never reset).
+        if waiter is not None:
+            deadline = waiter.deadline
         if waiter is None:
             waiter = self.mutation_lock_store.enqueue_waiter(
                 kind, resource, task.id, task.goal_id, step.index, deadline, now=now0)
             waiter_id = waiter.waiter_id
+            deadline = waiter.deadline
             self._emit("mutation.lock.queued", task_id=task.id, step_id=_step_id(step),
                        success=False, detail={
                            "waiter_id": waiter.waiter_id,
@@ -883,12 +917,31 @@ class ArionEngine:
         return False
 
     def shutdown(self, timeout: float = 30.0) -> None:
-        """Stop the in-process step scheduler (ADR-024): no new work is
+        """Stop the in-process step scheduler (ADR-024/025): no new work is
         accepted, queued (not-running) work is cancelled, bounded active
         workers are joined. After shutdown returns, no worker thread may
-        continue mutating. Idempotent."""
+        continue mutating. Idempotent.
+
+        The durable registry is mirrored: QUEUED rows of THIS scheduler are
+        marked CANCELLED (a cancelled row can never run). Rows already
+        RUNNING were drained by the join and reach their terminal state via
+        the worker's own mirror; stale rows are reclaimed on the next
+        engine construction."""
         if getattr(self, "scheduler", None) is not None:
             self.scheduler.shutdown(timeout=timeout)
+        if getattr(self, "scheduler_registry", None) is not None:
+            try:
+                for row in self.scheduler_registry.list_work(
+                        status=SchedulerWorkStatus.QUEUED,
+                        scheduler_id=self.scheduler_id):
+                    try:
+                        self.scheduler_registry.mark_terminal(
+                            row.work_id, SchedulerWorkStatus.CANCELLED,
+                            now=self._lock_now())
+                    except SchedulerStateError:
+                        pass  # already transitioned by a draining worker
+            except Exception:
+                pass
 
     # ---------- approval expiry (ADR-019) ----------
 
@@ -1631,10 +1684,7 @@ class ArionEngine:
             dispatch = dispatch[: self.max_concurrency]
             task.status = TaskStatus.RUNNING
             for i in dispatch:
-                step = task.steps[i]
-                self.scheduler.enqueue(
-                    f"{task.id}:{i}", task.id, i,
-                    (lambda s=step: self._run_step_worker(task, s)))
+                self._enqueue_step(task, task.steps[i])
             self.scheduler.run_until_done()
 
             self.storage.save_task(task)
@@ -1663,6 +1713,437 @@ class ArionEngine:
         if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
             return task
         raise RuntimeError(f"task {task_id} terminated without terminal state")
+
+    # ---------- ADR-025: shared multi-task / multi-goal execution ----------
+
+    def run_tasks(self, task_ids: list[str]) -> dict[str, Task]:
+        """Drive MULTIPLE tasks through the ONE bounded scheduler (ADR-025).
+
+        Semantics:
+
+        - one shared `StepScheduler` + one global `max_concurrency`; total
+          running workers never exceed the bound (the scheduler's worker pool
+          is capped, and each round admits at most `max_concurrency` items);
+        - fair admission: rounds rotate the task order round-robin and admit
+          at most `ceil(max_concurrency / active_tasks)` steps per task per
+          round, so one goal can never monopolize all capacity and a task
+          with few ready steps gets a worker within one round;
+        - every admitted step runs the FULL per-step pipeline (live
+          authorization -> approval -> durable mutation lock -> FIFO queue ->
+          capability -> verify) on its worker - concurrency never grants
+          authorization and the durable lock store stays the only mutation
+          ownership authority;
+        - dependencies stay authoritative per task; a blocked/approval-
+          pending/recovery-gated step is never admitted;
+        - safe parking: a mutating step whose canonical resource is actively
+          locked by ANOTHER task is PARKED - a durable FIFO waiter row is
+          registered (deadline/attempts preserved), but NO worker is
+          consumed and no registry row is created;
+        - clean stop: when a round admits nothing and every remaining task is
+          parked (or blocked), the call returns the current task states
+          instead of spinning; parked tasks resume on the next call (the
+          goal manager's await_lock path rechecks the live lock store).
+        """
+        tasks: dict[str, Task] = {}
+        for tid in task_ids:
+            task = self.storage.load_task(tid)
+            if task is None:
+                raise KeyError(f"task not found: {tid}")
+            tasks[tid] = task
+        results: dict[str, Task] = {}
+        round_no = 0
+        while tasks:
+            round_no += 1
+            order = list(tasks.keys())
+            order = order[round_no % len(order):] + order[:round_no % len(order)]
+            per_task_cap = max(1, -(-self.max_concurrency // max(1, len(order))))
+            # ---------------- round: compute candidates / parks ----------------
+            plan: dict[str, dict[str, Any]] = {}
+            for tid in order:
+                task = tasks[tid]
+                if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED,
+                                   TaskStatus.AWAITING_APPROVAL):
+                    results[tid] = task
+                    continue
+                if not task.steps:
+                    task = self._plan(task)
+                    if task.status == TaskStatus.FAILED:
+                        results[tid] = task
+                        continue
+                pending = [i for i, st in enumerate(task.steps)
+                           if st.status == StepStatus.PENDING]
+                if not pending:
+                    self._complete_task_shared(task)
+                    results[tid] = task
+                    continue
+                cursor = min(pending)
+                task.current_step = cursor
+                task.status = TaskStatus.RUNNING
+                chosen: set[tuple[str, str]] = set()
+                cursor_parked = False
+                cursor_spec = self.registry.action_spec(
+                    task.steps[cursor].capability, task.steps[cursor].action)
+                if cursor_spec is not None:
+                    ck, cr = self._lock_canonical(cursor_spec, task.steps[cursor])
+                    if ck and cr:
+                        if (self._cursor_lock_parked(task, cursor, cursor_spec, ck, cr)):
+                            cursor_parked = True
+                        else:
+                            chosen.add((ck, cr))
+                candidates = [cursor] if not cursor_parked else []
+                parked: list[int] = [cursor] if cursor_parked else []
+                for i in pending:
+                    if i == cursor:
+                        continue
+                    ok, reason = self._step_dispatchable(task, i, chosen, lock_gate=True)
+                    if ok:
+                        candidates.append(i)
+                    elif reason == "parked":
+                        parked.append(i)
+                plan[tid] = {"task": task, "candidates": candidates,
+                             "parked": parked, "cursor": cursor}
+            # ---------------- park (durable waiter, no worker) ----------------
+            for tid, info in plan.items():
+                for i in info["parked"]:
+                    self._park_on_lock(info["task"], info["task"].steps[i])
+            # ---------------- fair admission across tasks --------------------
+            admitted: list[tuple[str, int]] = []
+            taken: dict[str, int] = {}
+            cursor_pos = {tid: 0 for tid in plan}
+            while len(admitted) < self.max_concurrency:
+                progressed = False
+                for tid in order:
+                    if tid not in plan or taken.get(tid, 0) >= per_task_cap:
+                        continue
+                    info = plan[tid]
+                    if cursor_pos[tid] >= len(info["candidates"]):
+                        continue
+                    admitted.append((tid, info["candidates"][cursor_pos[tid]]))
+                    cursor_pos[tid] += 1
+                    taken[tid] = taken.get(tid, 0) + 1
+                    progressed = True
+                    if len(admitted) >= self.max_concurrency:
+                        break
+                if not progressed:
+                    break
+            # ---------------- dispatch + drain --------------------------------
+            for tid, i in admitted:
+                task = plan[tid]["task"]
+                step = task.steps[i]
+                self._enqueue_step(task, step)
+            if admitted:
+                self.scheduler.run_until_done()
+            # ---------------- post-round per task -----------------------------
+            for tid, info in plan.items():
+                task = info["task"]
+                self.storage.save_task(task)
+                cstep = task.steps[info["cursor"]]
+                if cstep.status == StepStatus.PENDING and task.status == TaskStatus.AWAITING_APPROVAL:
+                    self._checkpoint(task, reason="awaiting approval")
+                    self.storage.save_task(task)
+                    results[tid] = task
+                    continue
+                failed_indices = [i for i in info["candidates"] + info["parked"]
+                                  if task.steps[i].status == StepStatus.FAILED]
+                if cstep.status == StepStatus.FAILED or failed_indices:
+                    failed_step = task.steps[failed_indices[0]] if failed_indices else cstep
+                    task.status = TaskStatus.FAILED
+                    task.error = failed_step.error or "step failed"
+                    task.completed_at = utcnow()
+                    self.storage.save_task(task)
+                    self._cancel_waiters_for_task(task)
+                    self._emit("task.failed", task_id=task.id,
+                               detail={"step_index": failed_step.index, "error": task.error})
+                    self._record_memory(task)
+                    results[tid] = task
+                    continue
+                if info["candidates"]:
+                    self._checkpoint(task, reason="step completed")
+            for tid in list(results):
+                tasks.pop(tid, None)
+            if not tasks:
+                break
+            if not admitted:
+                # every remaining task is parked on a foreign lock (or the
+                # cursor was approval-gated and nothing else is ready):
+                # return cleanly - the caller re-checks the live lock store /
+                # approval state and re-invokes. No spin, no busy loop.
+                for tid, task in tasks.items():
+                    results[tid] = task
+                break
+        return results
+
+    def _cursor_lock_parked(self, task: Task, cursor: int, spec, kind: str,
+                            resource: str) -> bool:
+        """Park the cursor only when it would otherwise occupy a worker
+        waiting on a foreign lock AND it is not approval-gated (an
+        approval-gated cursor must still dispatch to REQUEST approval - it
+        stops before ever touching the lock)."""
+        if self.lock_wait_max_seconds <= 0:
+            return False
+        if not self._lock_is_active(kind, resource):
+            return False
+        request = self._build_authz_request(task, task.steps[cursor], spec)
+        decision = self.policy.decide(request)
+        if decision.outcome == PolicyOutcome.REQUIRE_APPROVAL and not self._step_has_approved_record(
+                task, task.steps[cursor], spec):
+            return False  # must dispatch to request approval
+        return True
+
+    def _step_dispatchable(self, task: Task, i: int,
+                           chosen_resources: set[tuple[str, str]],
+                           lock_gate: bool = False) -> tuple[bool, str]:
+        """ADR-024/025 readiness for a PENDING non-cursor step. Pure decision
+        (no side effects): dependencies, capability spec, same-resource
+        collision (waiting disabled), the ADR-025 lock gate (parking), and
+        the approval gate. Returns (dispatchable, reason)."""
+        step = task.steps[i]
+        if not self._step_deps_terminal(task, step):
+            return False, "deps"
+        spec = self.registry.action_spec(step.capability, step.action)
+        if spec is None:
+            return True, ""  # will fail fast inside _execute_step
+        if getattr(spec, "side_effects", "read_only") == "mutating":
+            k, r = self._lock_canonical(spec, step)
+            if k and r:
+                key = (k, r)
+                if self.lock_wait_max_seconds <= 0:
+                    if key in chosen_resources or self._inflight_lock_held(k, r):
+                        return False, "same-resource"
+                elif lock_gate and self._lock_is_active(k, r):
+                    return False, "parked"
+                chosen_resources.add(key)
+        request = self._build_authz_request(task, step, spec)
+        decision = self.policy.decide(request)
+        if decision.outcome == PolicyOutcome.REQUIRE_APPROVAL and not self._step_has_approved_record(
+                task, step, spec):
+            return False, "approval"
+        return True, ""
+
+    def _park_on_lock(self, task: Task, step: PlanStep) -> None:
+        """ADR-025 safe parking: register a DURABLE FIFO waiter row for a
+        step whose canonical resource is actively locked, persist the wait
+        metadata (deadline/attempts preserved across restarts), and consume
+        NO worker. The step is re-dispatched by a later round once the lock
+        frees; `_acquire_mutation_lock` then picks up the persisted waiter
+        row and acquires head-gated (FIFO). If the deadline elapsed while
+        parked, the step fails durably (typed timeout, no recovery record)."""
+        spec = self.registry.action_spec(step.capability, step.action)
+        if spec is None:
+            return
+        kind, resource = self._lock_canonical(spec, step)
+        if kind is None or resource is None:
+            return
+        if self.mutation_lock_store is None:
+            return
+        prior = None
+        if (task.lock_wait or {}).get("resource") == resource \
+                and (task.lock_wait or {}).get("step_index") == step.index:
+            prior = task.lock_wait
+        attempts = int(prior.get("attempts", 0)) if prior else 0
+        now = self._lock_now()
+        waiter_id = prior.get("waiter_id") if prior else None
+        waiter = None
+        if waiter_id is not None:
+            try:
+                waiter = self.mutation_lock_store.get_waiter(waiter_id)
+            except Exception:
+                waiter = None
+            if waiter is None or waiter.status.value != "queued":
+                waiter = None
+        # The durable waiter row is the deadline authority (ADR-025 Phase H):
+        # a forged task-level deadline can never extend a wait. A fresh park
+        # computes the deadline from the engine's bounded budget.
+        deadline = waiter.deadline if waiter is not None else (
+            prior.get("deadline") if prior else None)
+        if deadline is None:
+            deadline = _iso_plus(now, self.lock_wait_max_seconds)
+        if now >= deadline:
+            if waiter_id is not None:
+                try:
+                    self.mutation_lock_store.dequeue_waiter(waiter_id, "timed_out")
+                except Exception:
+                    pass
+            self._fail_lock_wait_timeout(task, step, kind, resource, deadline,
+                                         attempts, self._lock_owner(), waiter_id)
+            return
+        position = None
+        if waiter is None:
+            try:
+                waiter = self.mutation_lock_store.enqueue_waiter(
+                    kind, resource, task.id, task.goal_id, step.index,
+                    deadline, now=now)
+                waiter_id = waiter.waiter_id
+                position = waiter.seq
+                deadline = waiter.deadline
+            except Exception:
+                return  # registry-level failure: retry next round
+            self._emit("mutation.lock.queued", task_id=task.id,
+                       step_id=_step_id(step), success=False, detail={
+                           "waiter_id": waiter.waiter_id,
+                           "resource_kind": kind, "resource": resource,
+                           "capability": step.capability, "action": step.action,
+                           "position": waiter.seq, "deadline": deadline,
+                       })
+        attempts += 1
+        backoff = min(
+            self.lock_wait_backoff_base * (2 ** min(attempts - 1, 20)),
+            self.lock_wait_backoff_max,
+        )
+        next_retry = _iso_plus(now, backoff)
+        task.lock_wait = {
+            "step_index": step.index,
+            "resource_kind": kind,
+            "resource": resource,
+            "waiter_id": waiter_id,
+            "position": position if position is not None else prior.get("position"),
+            "deadline": deadline,
+            "attempts": attempts,
+            "next_retry": next_retry,
+        }
+        try:
+            self.mutation_lock_store.update_waiter(waiter_id, attempts=attempts,
+                                                   next_retry=next_retry)
+        except Exception:
+            pass
+        self._persist_lock_wait(task, step, kind, resource, deadline,
+                                attempts, next_retry, waiter_id,
+                                position if position is not None
+                                else (prior.get("position") if prior else None))
+        self._notify_lock_wait_observer(waiter_id, int(waiter.seq), kind, resource,
+                                        task.id, task.goal_id, attempts,
+                                        deadline, next_retry)
+
+    def _enqueue_step(self, task: Task, step: PlanStep) -> None:
+        """Admit one step to the shared scheduler + durable registry
+        (ADR-025): a QUEUED registry row is created (bounded metadata) and
+        the work item carries the row's id so the worker can mirror
+        RUNNING/terminal transitions."""
+        work_id = None
+        if self.scheduler_registry is not None:
+            try:
+                work = self.scheduler_registry.create(
+                    task_id=task.id, goal_id=task.goal_id, step_index=step.index,
+                    scheduler_id=self.scheduler_id, now=self._lock_now())
+                work_id = work.work_id
+            except Exception as exc:
+                step.status = StepStatus.FAILED
+                step.error = f"scheduler registry failed closed: {exc}"
+                return
+        self.scheduler.enqueue(
+            f"{task.id}:{step.index}", task.id, step.index,
+            (lambda s=step, w=work_id: self._run_step_worker(task, s, w)))
+
+    def _complete_task_shared(self, task: Task) -> None:
+        """Terminal COMPLETED handling shared by the multi-task driver."""
+        skipped = sum(1 for st in task.steps if st.status == StepStatus.SKIPPED)
+        task.status = TaskStatus.COMPLETED
+        task.completed_at = utcnow()
+        self.storage.save_task(task)
+        self._checkpoint(task, reason="task completed")
+        self._emit("task.completed", task_id=task.id,
+                   detail={"steps": len(task.steps), "skipped_steps": skipped})
+        self._record_memory(task)
+        self._cancel_waiters_for_task(task)
+
+    def run_goals(self, goal_ids: list[str], max_replans: int = 5) -> dict[str, Goal]:
+        """Drive MULTIPLE goals through the shared scheduler (ADR-025).
+
+        Each goal keeps its existing long-horizon lifecycle (ADR-016/017):
+        evaluate -> plan -> execute -> observe -> replan/complete, but the
+        execute phases of ALL goals share one scheduler, one global
+        max_concurrency, and one durable registry. Goals that are blocked
+        (approval pending / recovery required / missing capability / lock
+        contention) consume no workers and do not stall the others.
+
+        Returns {goal_id: Goal} after every goal is terminal or cleanly
+        stopped (blocked/awaiting - the caller re-invokes once the blocker
+        resolves, exactly like run_goal)."""
+        gm = self.goal_manager
+        if gm is None:
+            raise ValueError("goal manager not wired; use run_tasks instead")
+        active = list(goal_ids)
+        results: dict[str, Goal] = {}
+        while active:
+            tasks_to_run: list[str] = []
+            for gid in active:
+                goal = gm.get_goal(gid)
+                if goal is None or goal.status in (GoalStatus.COMPLETED, GoalStatus.FAILED):
+                    if goal is not None:
+                        results[gid] = goal
+                    continue
+                result, _ = gm.evaluate(gid)
+                action = result.next_action
+                if action == "complete":
+                    gm.complete_goal(gid, reason="all_work_complete")
+                    results[gid] = gm.get_goal(gid)
+                    continue
+                if action == "await_approval":
+                    # approval-pending: stop cleanly, never spin on the
+                    # awaiting task (ADR-017/018 semantics preserved)
+                    continue
+                if action == "await_lock":
+                    # parked on a mutation lock: re-check the LIVE lock store
+                    # (the only lock authority); only when the resource is
+                    # free does the parked task resume
+                    if gm.recheck_blockers(gid):
+                        pending = gm.pending_task(gid)
+                        if pending is not None and pending.status not in (
+                                TaskStatus.COMPLETED, TaskStatus.FAILED):
+                            tasks_to_run.append(pending.id)
+                    continue
+                if action == "resolve_blocker":
+                    if gm.recheck_blockers(gid):
+                        continue
+                    continue  # still blocked: consumes no worker
+                if action in ("none", "paused"):
+                    continue  # blocked: consumes no worker, does not stall
+                if action == "replan":
+                    replan_count = sum(
+                        1 for p in gm.plan_history(gid)
+                        if str(p.get("reason", "")).startswith("replan"))
+                    if replan_count >= max_replans:
+                        gm.fail_goal(gid, reason="max_replans_exceeded")
+                        results[gid] = gm.get_goal(gid)
+                        continue
+                    if self._block_on_missing_capability(gid, gm):
+                        continue
+                    if self._block_on_open_recovery(gid, gm):
+                        continue
+                    if self._block_on_lock_contention(gid, gm):
+                        continue
+                    task = self._plan_for_goal(
+                        gid, replan_reason=result.evidence.get("reason"))
+                else:  # continue / initial_plan
+                    if self._block_on_missing_capability(gid, gm):
+                        continue
+                    if self._block_on_open_recovery(gid, gm):
+                        continue
+                    if self._block_on_lock_contention(gid, gm):
+                        continue
+                    task = gm.pending_task(gid)
+                    if task is None:
+                        task = self._plan_for_goal(gid, replan_reason=None)
+                if task is not None and task.status not in (
+                        TaskStatus.COMPLETED, TaskStatus.FAILED):
+                    tasks_to_run.append(task.id)
+            if not tasks_to_run:
+                # every remaining goal is blocked/awaiting: re-check blockers
+                # once (capability/approval may have resolved); if nothing
+                # changed, stop cleanly - do not spin.
+                progressed = False
+                for gid in active:
+                    if gid not in results and gm.recheck_blockers(gid):
+                        progressed = True
+                if not progressed:
+                    break
+                continue
+            self.run_tasks(tasks_to_run)
+            # goals whose task stopped at a decision point stay active; the
+            # next cycle evaluates them (replan/fail/complete/await).
+        for gid in goal_ids:
+            results.setdefault(gid, gm.get_goal(gid))
+        return results
 
     # ---------- pipeline ----------
 
@@ -1696,6 +2177,17 @@ class ArionEngine:
             self._record_memory(task)
             return task
 
+        # Model/planner output can never carry EXECUTION state (ADR-025
+        # Phase H): a plan may only propose work (PENDING) or explicitly
+        # skip it (SKIPPED, with provenance from guidance). Any forged
+        # status (succeeded/failed/running/completed claims) is normalized
+        # back to PENDING so the step still passes live authorization and
+        # the real pipeline - a forged completion never sticks.
+        for s in steps:
+            if s.status not in (StepStatus.PENDING, StepStatus.SKIPPED):
+                s.status = StepStatus.PENDING
+                s.result = None
+                s.error = None
         task.steps = steps
         task.status = TaskStatus.PLANNED
         self.storage.save_task(task)
@@ -1791,8 +2283,8 @@ class ArionEngine:
         except Exception:
             return False
 
-    def _run_step_worker(self, task: Task, step: PlanStep) -> None:
-        """Execute one step on a scheduler worker (ADR-024 Phase D).
+    def _run_step_worker(self, task: Task, step: PlanStep, work_id: str | None = None) -> None:
+        """Execute one step on a scheduler worker (ADR-024 Phase D / ADR-025).
 
         Terminal per-step status is persisted IMMEDIATELY after the step
         finishes, so a crash mid-round (or process kill) never replays a
@@ -1800,8 +2292,44 @@ class ArionEngine:
         unit of restart, not the whole round. Bounded metadata only - the
         task snapshot is the pre-existing durable record (step ids, statuses,
         timestamps); no thread objects, stack traces, capability outputs or
-        model output are ever persisted."""
-        self._execute_step(task, step)
+        model output are ever persisted.
+
+        When a durable registry row exists for this dispatch (ADR-025), the
+        worker mirrors its lifecycle: QUEUED -> RUNNING (with a lease)
+        BEFORE the capability pipeline starts, and RUNNING -> COMPLETED /
+        FAILED afterwards. If the mirror fails (row was abandoned/reclaimed
+        or is unknown), the step FAILS CLOSED and never executes."""
+        if work_id is not None and self.scheduler_registry is not None:
+            try:
+                self.scheduler_registry.mark_running(
+                    work_id,
+                    worker_id=f"worker:{_threading.get_ident()}:{new_id('w')}",
+                    lease_seconds=self.scheduler_lease_seconds,
+                    now=self._lock_now())
+            except Exception as exc:
+                step.status = StepStatus.FAILED
+                step.error = f"scheduler registry failed closed: {exc}"
+                self.storage.save_task(task)
+                self._emit("error", task_id=task.id, step_id=_step_id(step), success=False,
+                           detail={"error": step.error[:300]})
+                return
+        try:
+            self._execute_step(task, step)
+        finally:
+            if work_id is not None and self.scheduler_registry is not None:
+                # the WORK unit finished: FAILED only when the step failed;
+                # SUCCEEDED/SKIPPED AND approval-paused steps are COMPLETED
+                # work (an approval-paused step requested its approval and
+                # stops cleanly - the task state is the authority on that)
+                terminal = (SchedulerWorkStatus.FAILED
+                            if step.status == StepStatus.FAILED
+                            else SchedulerWorkStatus.COMPLETED)
+                try:
+                    self.scheduler_registry.mark_terminal(
+                        work_id, terminal, error=step.error,
+                        now=self._lock_now())
+                except Exception:
+                    pass  # the durable step/task state is the authority
         if step.status in (StepStatus.SUCCEEDED, StepStatus.FAILED, StepStatus.SKIPPED):
             self.storage.save_task(task)
 

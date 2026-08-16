@@ -48,6 +48,7 @@ def build_engine(
     router: Any | None = None,
     memory: bool = True,
     cognition: bool = True,
+    scheduler_reclaim_on_start: bool = True,
 ) -> ArionEngine:
     storage = SQLiteStorage(db_path)
 
@@ -136,4 +137,5 @@ def build_engine(
         world_monitor=world_monitor,
         strategy_selector=strategy_selector,
         goal_manager=goal_manager,
+        scheduler_reclaim_on_start=scheduler_reclaim_on_start,
     )

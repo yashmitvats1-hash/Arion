@@ -1,0 +1,202 @@
+"""Durable scheduler/work registry (ADR-025, Phase A).
+
+A SchedulerWork row is the durable record of ONE unit of scheduler work (one
+task step admitted to the shared in-process scheduler). It exists so that a
+scheduler process can die and restart without losing sight of what was
+queued / running / done, and so a restarted scheduler can reclaim stale
+leases instead of believing in immortal RUNNING workers.
+
+Authority model (unchanged from ADR-024, now made durable):
+
+- The scheduler/work registry is COORDINATION, never authorization. A row
+  says nothing about whether the underlying step may touch the world; every
+  dispatched step still passes live authorization -> approval -> durable
+  mutation lock -> FIFO queue before its capability executes.
+- The registry is the only source of durable WORKER LIFECYCLE state. Nothing
+  in memory, cognition, strategy, guidance, model output, approval metadata,
+  recovery metadata, queue position, or worker identity can transition a row
+  or manufacture concurrency.
+- Rows carry bounded metadata only: ids, task/goal/step references,
+  scheduler + worker identity, timestamps, a lease deadline, and bounded
+  error text. NEVER threads, callables, stack traces, capability outputs,
+  model output, prompts, file contents, or secrets.
+
+States are explicit and fail closed:
+
+    QUEUED -> RUNNING -> COMPLETED | FAILED
+    QUEUED -> CANCELLED | ABANDONED
+    RUNNING -> ABANDONED            (stale lease reclaim)
+
+Terminal states (COMPLETED/FAILED/CANCELLED/ABANDONED) are final; every
+invalid transition raises the typed SchedulerStateError.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from typing import Any, Protocol
+
+from arion.state.models import new_id, utcnow
+
+
+class SchedulerWorkStatus(str, Enum):
+    """Durable lifecycle of one scheduler work row (ADR-025)."""
+
+    QUEUED = "queued"          # admitted, waiting for a worker
+    RUNNING = "running"        # picked up by a worker (lease held)
+    COMPLETED = "completed"    # worker finished successfully
+    FAILED = "failed"          # worker reported failure (bounded error)
+    CANCELLED = "cancelled"    # cancelled while queued (advisory, pre-execution)
+    ABANDONED = "abandoned"    # stale lease reclaimed / dead scheduler's queue
+
+
+# Legal transitions (terminal states are final). Fail closed: anything else
+# raises SchedulerStateError.
+_LEGAL_TRANSITIONS: dict[SchedulerWorkStatus, set[SchedulerWorkStatus]] = {
+    SchedulerWorkStatus.QUEUED: {
+        SchedulerWorkStatus.RUNNING,
+        SchedulerWorkStatus.CANCELLED,
+        SchedulerWorkStatus.ABANDONED,
+    },
+    SchedulerWorkStatus.RUNNING: {
+        SchedulerWorkStatus.COMPLETED,
+        SchedulerWorkStatus.FAILED,
+        SchedulerWorkStatus.ABANDONED,
+    },
+    SchedulerWorkStatus.COMPLETED: set(),
+    SchedulerWorkStatus.FAILED: set(),
+    SchedulerWorkStatus.CANCELLED: set(),
+    SchedulerWorkStatus.ABANDONED: set(),
+}
+
+
+def legal_transition(current: SchedulerWorkStatus, target: SchedulerWorkStatus) -> bool:
+    return target in _LEGAL_TRANSITIONS.get(current, set())
+
+
+class SchedulerStateError(Exception):
+    """Typed invalid scheduler-state transition (fail closed)."""
+
+
+class SchedulerRegistryError(Exception):
+    """Typed registry-level failure (e.g. invalid metadata)."""
+
+
+@dataclass
+class SchedulerWork:
+    """One durable scheduler work row.
+
+    Bounded metadata only - identifiers, references, timestamps, a lease
+    deadline and truncated error text. Never persisted: threads, callables,
+    stack traces, capability outputs, model output, prompts, file contents,
+    or secrets.
+    """
+
+    work_id: str
+    task_id: str
+    goal_id: str | None
+    step_index: int
+    scheduler_id: str
+    status: SchedulerWorkStatus = SchedulerWorkStatus.QUEUED
+    worker_id: str | None = None
+    attempts: int = 0
+    error: str | None = None
+    created_at: str = field(default_factory=utcnow)
+    started_at: str | None = None
+    completed_at: str | None = None
+    lease_expires_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "work_id": self.work_id,
+            "task_id": self.task_id,
+            "goal_id": self.goal_id,
+            "step_index": self.step_index,
+            "scheduler_id": self.scheduler_id,
+            "worker_id": self.worker_id,
+            "status": self.status.value,
+            "attempts": self.attempts,
+            "error": (self.error or "")[:500],
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "lease_expires_at": self.lease_expires_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "SchedulerWork":
+        return cls(
+            work_id=d["work_id"],
+            task_id=d["task_id"],
+            goal_id=d.get("goal_id"),
+            step_index=int(d.get("step_index", 0)),
+            scheduler_id=d["scheduler_id"],
+            status=SchedulerWorkStatus(d.get("status", SchedulerWorkStatus.QUEUED.value)),
+            worker_id=d.get("worker_id"),
+            attempts=int(d.get("attempts", 0)),
+            error=d.get("error"),
+            created_at=d.get("created_at", utcnow()),
+            started_at=d.get("started_at"),
+            completed_at=d.get("completed_at"),
+            lease_expires_at=d.get("lease_expires_at"),
+        )
+
+
+def new_work_id() -> str:
+    return new_id("sw")
+
+
+class SchedulerRegistry(Protocol):
+    """Store protocol for the durable scheduler registry (ADR-025).
+
+    The engine and CLI talk to this protocol only - never to SQLite
+    directly. Implemented by SQLiteStorage (the default), exactly like the
+    approval/recovery/lock stores.
+    """
+
+    def create(self, *, task_id: str, goal_id: str | None, step_index: int,
+               scheduler_id: str, now: str | None = None) -> SchedulerWork:
+        """Admit one unit of work in QUEUED state. Returns the durable row."""
+        ...
+
+    def mark_running(self, work_id: str, worker_id: str, lease_seconds: float,
+                     now: str | None = None) -> SchedulerWork:
+        """QUEUED -> RUNNING with a lease deadline. Typed error otherwise."""
+        ...
+
+    def mark_terminal(self, work_id: str, status: SchedulerWorkStatus,
+                      error: str | None = None, now: str | None = None) -> SchedulerWork:
+        """Transition to a legal terminal state (COMPLETED/FAILED/CANCELLED/
+        ABANDONED). Typed error on illegal or unknown transitions."""
+        ...
+
+    def get_work(self, work_id: str) -> SchedulerWork | None:
+        ...
+
+    def list_work(self, status: SchedulerWorkStatus | None = None,
+             scheduler_id: str | None = None,
+             task_id: str | None = None,
+             goal_id: str | None = None) -> list[SchedulerWork]:
+        ...
+
+    def reclaim_stale(self, now: str | None = None) -> list[str]:
+        """RUNNING rows whose lease expired -> ABANDONED. Returns reclaimed
+        work ids. Idempotent: terminal rows are never touched."""
+        ...
+
+    def abandon_foreign_queued(self, scheduler_id: str,
+                               now: str | None = None) -> int:
+        """QUEUED rows owned by a DIFFERENT (presumed dead) scheduler ->
+        ABANDONED. This engine's own QUEUED rows are untouched. Returns the
+        number abandoned. Idempotent."""
+        ...
+
+
+def _iso_plus(iso: str, seconds: float) -> str:
+    """iso + seconds (naive/aware-safe, mirrors engine helpers)."""
+    dt = datetime.fromisoformat(iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (dt + timedelta(seconds=seconds)).isoformat()

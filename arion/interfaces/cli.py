@@ -182,6 +182,18 @@ def build_parser() -> argparse.ArgumentParser:
     locks_reclaim = locks_sub.add_parser("reclaim", help="reclaim an EXPIRED mutation lock (ADR-021; never authorizes)", parents=[common, common_memory])
     locks_reclaim.add_argument("id")
 
+    sched = sub.add_parser("scheduler", help="durable scheduler/work registry (ADR-025)")
+    sched.add_argument("--db", default=None, dest="db_scheduler", help=argparse.SUPPRESS)
+    sched_sub = sched.add_subparsers(dest="scheduler_command", required=True)
+
+    sched_status = sched_sub.add_parser("status", help="scheduler status: capacity + work counts by state (bounded, metadata-only)", parents=[common, common_memory])
+    sched_workers = sched_sub.add_parser("workers", help="list RUNNING work + worker leases (ADR-025)", parents=[common, common_memory])
+    sched_queue = sched_sub.add_parser("queue", help="list QUEUED work in admission order (ADR-025)", parents=[common, common_memory])
+    sched_show = sched_sub.add_parser("show", help="show one scheduler work row (bounded metadata; fails closed on unknown id)", parents=[common, common_memory])
+    sched_show.add_argument("work_id")
+    sched_reclaim = sched_sub.add_parser("reclaim", help="reclaim a STALE RUNNING work row whose lease expired (ADR-025; never executes)", parents=[common, common_memory])
+    sched_reclaim.add_argument("work_id")
+
     return parser
 
 
@@ -191,13 +203,18 @@ def main(argv: list[str] | None = None) -> int:
     db_path = (args.db or args.db_global or getattr(args, "db_mem", None)
                or getattr(args, "db_cog", None) or getattr(args, "db_goals", None)
                or getattr(args, "db_approvals", None) or getattr(args, "db_recovery", None)
-               or getattr(args, "db_locks", None)
+               or getattr(args, "db_locks", None) or getattr(args, "db_scheduler", None)
                or str(root / "arion_data" / "arion.db"))
 
     engine = build_engine(
         db_path=db_path,
         sandbox_root=str(root),
         jsonl_log=str(root / "arion_data" / "events.jsonl") if args.command in ("run", "resume", "capabilities") else None,
+        # The `scheduler` command is a PASSIVE observer of the durable
+        # registry: it must not abandon another (possibly live) scheduler's
+        # QUEUED rows. Every other command performs the normal restart
+        # reclamation (stale leases + dead schedulers' queues).
+        scheduler_reclaim_on_start=args.command != "scheduler",
     )
     storage = engine.storage
 
@@ -253,10 +270,121 @@ def main(argv: list[str] | None = None) -> int:
         return _recovery_command(args, engine)
     elif args.command == "locks":
         return _locks_command(args, engine)
+    elif args.command == "scheduler":
+        return _scheduler_command(args, engine)
 
-    engine.shutdown()  # ADR-024: join bounded workers, no orphans
+    engine.shutdown()  # ADR-024/025: join bounded workers, no orphans
     storage.close()
     return 0
+
+
+def _scheduler_command(args, engine) -> int:
+    """arion scheduler status|workers|queue|show|reclaim (ADR-025).
+
+    Reads the DURABLE scheduler/work registry through the domain store only -
+    never raw SQLite. Output is bounded, metadata-only, secret-free and
+    restart-safe (it reflects the durable rows, not live engine memory).
+    Unknown work ids fail closed (non-zero exit). Reclaim only moves a STALE
+    RUNNING row (lease expired) to ABANDONED; it never executes anything and
+    never authorizes a mutation - abandoned work re-runs the full fresh
+    authorization/recovery path on the next engine run.
+    """
+    import json
+
+    store = getattr(engine, "scheduler_registry", None)
+    if store is None or not hasattr(store, "list_work"):
+        print("scheduler registry is not available on this engine")
+        return 1
+
+    def _emit(obj):
+        if getattr(args, "json", False):
+            print(json.dumps(obj, indent=2, default=str))
+        else:
+            print(obj)
+
+    if args.scheduler_command == "status":
+        from arion.state.scheduler_work import SchedulerWorkStatus
+
+        rows = store.list_work()
+        counts = {s.value: 0 for s in SchedulerWorkStatus}
+        for r in rows:
+            counts[r.status.value] = counts.get(r.status.value, 0) + 1
+        stale = [r for r in rows if r.status == SchedulerWorkStatus.RUNNING
+                 and r.lease_expires_at is not None and r.lease_expires_at <= engine._lock_now()]
+        out = {
+            "total": len(rows),
+            "queued": counts["queued"],
+            "running": counts["running"],
+            "completed": counts["completed"],
+            "failed": counts["failed"],
+            "cancelled": counts["cancelled"],
+            "abandoned": counts["abandoned"],
+            "stale_running_leases": len(stale),
+        }
+        if args.json:
+            _emit(out)
+        else:
+            for k, v in out.items():
+                print(f"{k:<22} {v}")
+        return 0
+
+    if args.scheduler_command == "workers":
+        from arion.state.scheduler_work import SchedulerWorkStatus
+
+        workers = [r for r in store.list_work(status=SchedulerWorkStatus.RUNNING)]
+        if args.json:
+            _emit([w.to_dict() for w in workers])
+            return 0
+        for w in workers:
+            print(f"{w.work_id}  running  worker={w.worker_id}  "
+                  f"task={w.task_id}  goal={w.goal_id or '-'}  step={w.step_index}  "
+                  f"lease_expires={w.lease_expires_at}")
+        return 0
+
+    if args.scheduler_command == "queue":
+        from arion.state.scheduler_work import SchedulerWorkStatus
+
+        queued = store.list_work(status=SchedulerWorkStatus.QUEUED)
+        if args.json:
+            _emit([q.to_dict() for q in queued])
+            return 0
+        for pos, q in enumerate(queued, start=1):
+            print(f"#{pos:<4} {q.work_id}  queued  task={q.task_id}  "
+                  f"goal={q.goal_id or '-'}  step={q.step_index}  created={q.created_at}")
+        return 0
+
+    if args.scheduler_command == "show":
+        work = store.get_work(args.work_id)
+        if work is None:
+            print(f"unknown scheduler work id: {args.work_id} (fail closed)")
+            return 1
+        _emit(work.to_dict())
+        return 0
+
+    if args.scheduler_command == "reclaim":
+        from arion.state.scheduler_work import SchedulerStateError, SchedulerWorkStatus
+
+        work = store.get_work(args.work_id)
+        if work is None:
+            print(f"unknown scheduler work id: {args.work_id} (fail closed)")
+            return 1
+        if work.status != SchedulerWorkStatus.RUNNING:
+            print(f"work {args.work_id} is {work.status.value} (only RUNNING rows can be reclaimed)")
+            return 1
+        if work.lease_expires_at is None or work.lease_expires_at > engine._lock_now():
+            print(f"work {args.work_id} lease is still valid (expires {work.lease_expires_at}); "
+                  f"not reclaimed")
+            return 1
+        try:
+            store.mark_terminal(args.work_id, SchedulerWorkStatus.ABANDONED,
+                                now=engine._lock_now())
+        except SchedulerStateError as exc:
+            print(f"reclaim failed: {exc}")
+            return 1
+        print(f"reclaimed {args.work_id} -> abandoned (lease had expired)")
+        return 0
+
+    return 1
 
 
 def _locks_command(args, engine) -> int:

@@ -548,6 +548,45 @@ loop (ADR-016):
   resource concurrency, blocked mutation not stalling reads, restart/cancel/
   shutdown with no orphan work.
 
+## Cross-Goal Durable Concurrency (ADR-025)
+
+- **Scope:** multiple goals/tasks share ONE bounded in-process scheduler
+  (`ArionEngine.run_tasks`/`run_goals`) with a global `max_concurrency`
+  (default 1 = historical behavior). Total running workers never exceed the
+  bound; independent tasks execute concurrently; a blocked/approval-pending/
+  recovery-gated goal consumes no worker and never stalls the others.
+- **Durable scheduler registry:** `arion/state/scheduler_work.py` +
+  `scheduler_work` table (typed store protocol, no raw SQLite from the
+  engine/CLI). States QUEUED/RUNNING/COMPLETED/FAILED/CANCELLED/ABANDONED
+  with legal transitions enforced by typed errors (fail closed); bounded
+  metadata only (ids, task/goal/step refs, scheduler + worker identity,
+  timestamps, lease, truncated error) — never threads/callables/stack
+  traces/capability outputs/model output/prompts/file contents/secrets.
+- **Restart/crash recovery:** engine construction reclaims expired RUNNING
+  leases (ABANDONED — no immortal RUNNING) and abandons dead schedulers'
+  QUEUED rows; tasks re-run the full fresh authorization/recovery path;
+  completed mutations are never replayed; stale mutation locks are reclaimed
+  through the existing lock store; approval, FIFO waiter positions and
+  mutation-lock state survive restarts (incl. a real-subprocess crash test).
+- **Fairness:** rounds rotate tasks round-robin with a per-task per-round
+  cap of `ceil(max_concurrency / active_tasks)` — a goal with many steps
+  cannot starve a goal with one (bounded window = one round). Strictly
+  scheduler coordination; never authorization.
+- **Safe parking:** a mutating step whose resource is locked by another
+  task registers a durable FIFO waiter and consumes NO worker; the durable
+  waiter row is the deadline authority (forged leases cannot extend waits).
+- **CLI:** `arion scheduler status|workers|queue|show <id>|reclaim <id>`
+  (bounded, metadata-only, secret-free, restart-safe, fails closed on
+  unknown ids; reclaim only abandons expired RUNNING leases).
+- **Authority boundary (unchanged and regression-tested):** scheduler
+  coordinates execution; the durable lock store coordinates mutation
+  ownership; only live authorization permits execution. Scheduler state is
+  never authorization state.
+- **Demo:** `scripts/demo_adr025_cross_goal_concurrency.py` (29 checks,
+  deterministic, offline): concurrent goals, same-resource FIFO writes,
+  approval-pending/recovery-gated goals not stalling others, multi-goal
+  restart without duplicate mutations, fairness.
+
 ## Structured intelligence boundary (ADR-011)
 
 ```
