@@ -287,6 +287,13 @@ class SQLiteMemoryStore:
         return [_reflection_from_row(r) for r in rows]
 
     @_threadsafe
+    def count_reflections(self) -> int:
+        """Bounded read-only count of reflection rows (ADR-014 prune event)."""
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM reflections"
+        ).fetchone()[0]
+
+    @_threadsafe
     def link_reflection(self, episode_id: str, reflection_id: str) -> None:
         self._conn.execute(
             "UPDATE episodic_memories SET reflection_id=?, updated_at=datetime('now') WHERE episode_id=?",
@@ -330,18 +337,106 @@ class SQLiteMemoryStore:
         return out
 
     @_threadsafe
-    def prune(self, older_than: str | None = None, max_episodes: int | None = None) -> int:
-        """Archival/pruning seam (ADR-014) - intentionally NOT implemented.
+    def prune(self, older_than: str | None = None, max_episodes: int | None = None,
+              batch_size: int = 500, keep_importance: float = 0.0,
+              dry_run: bool = False) -> int:
+        """Explicit archival/pruning (ADR-014 addendum).
 
-        Consolidation preserves history and therefore does not bound physical
-        storage; this seam is where a future archival policy (age-based,
-        count-capped, or importance-weighted pruning/archival) will live.
-        Memory is never deleted in this milestone.
+        Deterministic, operator-invoked, bounded-batched (ADR-028 pattern):
+
+        - older_than: remove episodes with created_at < the ISO cutoff
+          (never silent, never recent) together with their reflections;
+        - max_episodes: keep the NEWEST N episodes (by created_at), remove
+          the rest with their reflections;
+        - keep_importance: age-pruning protects episodes with
+          importance >= floor (salient failures stay);
+        - batch_size in [1, 5000] (fail closed outside); the loop drains in
+          bounded SELECT-batch-then-DELETE batches;
+        - dry_run: return the would-be count WITHOUT deleting anything;
+        - CONSOLIDATIONS are NEVER pruned here (they are the permanent
+          merged summary; source provenance is preserved);
+        - idempotent: a repeated identical prune removes 0;
+        - authority isolation: touches ONLY episodic_memories + reflections
+          (never tasks/goals/scheduler/audit/cognition tables).
+
+        Returns the number of episodes removed (their reflections count
+        toward the same removal; the return value is the episode count).
         """
-        raise NotImplementedError(
-            "archival/pruning seam (ADR-014): not yet implemented - memory is never deleted; "
-            "design the archival policy before enabling this"
-        )
+        if older_than is not None:
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(str(older_than).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    raise ValueError
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"older_than must be an ISO-8601 timestamp, got {older_than!r} "
+                    f"(fail closed)")
+        if max_episodes is not None:
+            if not isinstance(max_episodes, int) or isinstance(max_episodes, bool) \
+                    or max_episodes < 1:
+                raise ValueError(
+                    f"max_episodes must be a positive integer, got "
+                    f"{max_episodes!r} (fail closed)")
+        if not isinstance(batch_size, int) or isinstance(batch_size, bool) \
+                or batch_size < 1 or batch_size > 5000:
+            raise ValueError(
+                f"batch_size must be in [1, 5000], got {batch_size!r} "
+                f"(fail closed)")
+        if not isinstance(keep_importance, (int, float)) \
+                or isinstance(keep_importance, bool) \
+                or not (0.0 <= float(keep_importance) <= 1.0):
+            raise ValueError(
+                f"keep_importance must be within [0, 1], got "
+                f"{keep_importance!r} (fail closed)")
+        if older_than is None and max_episodes is None:
+            raise ValueError(
+                "prune requires older_than and/or max_episodes "
+                "(never silently delete)")
+
+        # Deterministic candidate selection FIRST (read-before-delete):
+        # episodes to remove = old ones (respecting the importance floor)
+        # OR beyond the newest-N cap; always keep the newest-N (by
+        # created_at) when max_episodes is set.
+        rows = self._conn.execute(
+            "SELECT episode_id, created_at, importance FROM episodic_memories"
+        ).fetchall()
+        rows.sort(key=lambda r: r[1])  # oldest first (ISO strings compare)
+        doomed: list[str] = []
+        if max_episodes is not None:
+            doomed_ids = {r[0] for r in rows[:-int(max_episodes)]}
+        else:
+            doomed_ids = set()
+        for ep_id, created_at, importance in rows:
+            remove = False
+            if older_than is not None and created_at < older_than:
+                remove = True
+                if float(keep_importance) > 0.0 and \
+                        float(importance) >= float(keep_importance):
+                    remove = False  # salient memories are protected
+            if ep_id in doomed_ids:
+                remove = True  # count cap overrides the importance floor
+            if remove:
+                doomed.append(ep_id)
+        if not doomed:
+            return 0
+        if dry_run:
+            return len(doomed)
+
+        # bounded SELECT-batch-then-DELETE loop (ADR-028 pattern)
+        removed = 0
+        for i in range(0, len(doomed), int(batch_size)):
+            batch = doomed[i:i + int(batch_size)]
+            marks = ",".join("?" * len(batch))
+            self._conn.execute(
+                "DELETE FROM reflections WHERE episode_id IN (" + marks + ")",
+                batch)
+            self._conn.execute(
+                "DELETE FROM episodic_memories WHERE episode_id IN ("
+                + marks + ")", batch)
+            removed += len(batch)
+        self._conn.commit()
+        return removed
 
     @_threadsafe
     def close(self) -> None:

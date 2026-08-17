@@ -199,16 +199,47 @@ confidence, timestamps, and source (deterministic|model);
 `SQLiteCognitiveStore` (same DB file; restart-safe). **Informational only** —
 beliefs can never authorize (tested).
 
-- **Archival/pruning seam:** consolidation preserves history, so it does not
-  bound storage; `MemoryStore.prune` is the designed (not-yet-implemented)
-  seam for a future archival policy — memory is never deleted.
+- **Archival policy (ADR-014 addendum, implemented):** explicit,
+  operator-invoked, bounded-batched (ADR-028 SELECT-then-DELETE pattern),
+  fail-closed pruning — memory/cognition is never silently deleted:
+  - `SQLiteMemoryStore.prune(older_than, max_episodes, keep_importance=0.0,
+    batch_size=500, dry_run=False) -> int` — age/count pruning of episodes
+    (never recent, never high-importance when a floor is set); reflections
+    are pruned WITH their episodes; CONSOLIDATIONS are never pruned; at
+    least one criterion required; idempotent; touches only
+    `episodic_memories` + `reflections`.
+  - `SQLiteCognitiveStore.prune_superseded_beliefs(older_than,
+    keep_versions=1, batch_size=500, dry_run=False)` — superseded-history
+    pruning; ACTIVE beliefs are never pruned; the newest `keep_versions`
+    rows per belief lineage (category+statement) are always retained.
+  - `SQLiteCognitiveStore.prune_goal_plans(goal_id=None, keep_latest=10,
+    batch_size=500, dry_run=False)` — replan-history bounding; the latest
+    immutable plan version per goal is never pruned (replay safety).
+  - `--dry-run` never mutates (byte-identical DB; emits no event); real
+    prunes emit a bounded `memory.pruned` audit event (counts + criteria
+    only, never content). Preferences and environment facts are already
+    bounded per key — no prune needed (stale facts are flagged, never
+    deleted). Pruning is storage hygiene with NO authority influence:
+    scheduler/task/goal authority, leases, ownership, reservations,
+    ceilings, weights, DWRR credit, and execution state stay
+    byte-identical (adversarial-tested); forged telemetry/metadata/ids and
+    oversized values fail closed.
+  - **Consolidation-fed beliefs:** `refresh_from_memory(limit=20,
+    include_consolidations=False)` optionally lifts merged consolidation
+    lessons into procedural beliefs with complete provenance
+    (`episode_ids` + `consolidation_ids`); default False preserves the
+    original behavior; idempotent, deterministic supersession,
+    informational only.
 - **Strategy-level learning:** `apply_guidance_to_steps` is non-mutating,
   registry-aware (ActionSpec.resource_param — no hardcoded `path`), and can
   substitute actions (different decomposition) with verification adopted from
   the registry. `PlanTransformation` retains original + transformed plans with
   per-decision provenance; audited via `planning.memory.transformation`; each
   transformed step carries its provenance.
-- CLI: `arion cognition beliefs|preferences|environment|snapshot|world|goals [--json]`.
+- CLI: `arion cognition beliefs|preferences|environment|snapshot|world|goals|prune-superseded|prune-plans [--json]`;
+  `arion memory prune [--older-than TS] [--max-episodes N] [--keep-importance F]
+  [--batch-size N] [--dry-run] [--json]` — exit 0 on success (incl. dry-run),
+  1 on invalid input (fail closed); deterministic output.
 
 ## World State → Long-Horizon Goals (ADR-015)
 

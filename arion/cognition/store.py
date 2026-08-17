@@ -14,6 +14,7 @@ import functools
 import json
 import sqlite3
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -317,6 +318,156 @@ class SQLiteCognitiveStore:
             (goal_id,),
         ).fetchall()
         return _goal_plan_from_row(rows[0]) if rows else None
+
+    # ---- cognitive archival/pruning (ADR-014 addendum) ----
+
+    @_threadsafe
+    def prune_superseded_beliefs(self, older_than: str | None = None,
+                                 keep_versions: int = 1,
+                                 batch_size: int = 500,
+                                 dry_run: bool = False) -> int:
+        """Prune superseded belief history (ADR-014 addendum, Phase B).
+
+        Deterministic, operator-invoked, bounded-batched (ADR-028 pattern):
+
+        - only rows with superseded_at IS NOT NULL are ever candidates;
+          ACTIVE beliefs are never pruned (a belief only leaves the active
+          set by being superseded, never by pruning) - fail closed;
+        - the newest `keep_versions` rows per belief lineage (category +
+          statement, ordered by superseded_at DESC, created_at DESC) are
+          always retained; `keep_versions` defaults to 1;
+        - `older_than` additionally restricts candidates to rows whose
+          superseded_at is strictly before the ISO cutoff;
+        - batch_size in [1, 5000] (fail closed outside); deletion drains in
+          bounded SELECT-then-DELETE chunks;
+        - dry_run computes the count and mutates nothing.
+
+        Returns the number of belief rows removed (or that WOULD be removed
+        in a dry run). Idempotent: a second call with the same arguments
+        returns 0.
+        """
+        if (isinstance(keep_versions, bool) or not isinstance(keep_versions, int)
+                or keep_versions < 1):
+            raise ValueError(
+                f"keep_versions must be an int >= 1, got {keep_versions!r} "
+                f"(fail closed)")
+        if (isinstance(batch_size, bool) or not isinstance(batch_size, int)
+                or not (1 <= batch_size <= 5000)):
+            raise ValueError(
+                f"batch_size must be within [1, 5000], got {batch_size!r} "
+                f"(fail closed)")
+        cutoff: str | None = None
+        if older_than is not None:
+            try:
+                cutoff = str(older_than).replace("Z", "+00:00")
+                datetime.fromisoformat(cutoff)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"older_than must be an ISO-8601 timestamp, got "
+                    f"{older_than!r} (fail closed)") from None
+
+        # Read-before-delete candidate selection: superseded rows only,
+        # newest keep_versions per lineage protected.
+        rows = self._conn.execute(
+            "SELECT belief_id, category, statement, superseded_at, created_at "
+            "FROM beliefs WHERE superseded_at IS NOT NULL"
+        ).fetchall()
+        lineages: dict[tuple[str, str], list[tuple[Any, ...]]] = {}
+        for r in rows:
+            lineages.setdefault((r[1], r[2]), []).append(r)
+        doomed: list[str] = []
+        for lineage_rows in lineages.values():
+            # newest first (superseded_at DESC, created_at DESC tiebreak)
+            lineage_rows.sort(key=lambda r: (r[3], r[4]), reverse=True)
+            for rank, r in enumerate(lineage_rows):
+                if rank < keep_versions:
+                    continue  # newest keep_versions per lineage protected
+                if cutoff is None or r[3] < cutoff:
+                    doomed.append(r[0])
+        if dry_run:
+            return len(doomed)
+
+        removed = 0
+        for i in range(0, len(doomed), batch_size):
+            chunk = doomed[i:i + batch_size]
+            placeholders = ", ".join("?" * len(chunk))
+            cur = self._conn.execute(
+                f"DELETE FROM beliefs WHERE belief_id IN ({placeholders})",
+                chunk,
+            )
+            removed += cur.rowcount
+        self._conn.commit()
+        return removed
+
+    @_threadsafe
+    def prune_goal_plans(self, goal_id: str | None = None,
+                         keep_latest: int = 10,
+                         batch_size: int = 500,
+                         dry_run: bool = False) -> int:
+        """Bound replan history (ADR-014 addendum, Phase B).
+
+        Deterministic, operator-invoked, bounded-batched (ADR-028 pattern):
+
+        - keeps the newest `keep_latest` immutable plan versions per goal
+          (ordered by plan_version); the LATEST version per goal is never
+          pruned (keep_latest >= 1, replay/latest-version safety) - fail
+          closed;
+        - goal_id scopes the prune to one goal; None prunes all goals;
+        - batch_size in [1, 5000] (fail closed outside); deletion drains in
+          bounded SELECT-then-DELETE chunks;
+        - dry_run computes the count and mutates nothing.
+
+        Returns the number of plan rows removed (or that WOULD be removed in
+        a dry run). Idempotent: a second call with the same arguments
+        returns 0.
+        """
+        if (isinstance(keep_latest, bool) or not isinstance(keep_latest, int)
+                or keep_latest < 1):
+            raise ValueError(
+                f"keep_latest must be an int >= 1, got {keep_latest!r} "
+                f"(fail closed)")
+        if (isinstance(batch_size, bool) or not isinstance(batch_size, int)
+                or not (1 <= batch_size <= 5000)):
+            raise ValueError(
+                f"batch_size must be within [1, 5000], got {batch_size!r} "
+                f"(fail closed)")
+
+        # Read-before-delete candidate selection (newest per goal first).
+        if goal_id is not None:
+            rows = self._conn.execute(
+                "SELECT goal_id, plan_version FROM goal_plans "
+                "WHERE goal_id=? ORDER BY plan_version DESC",
+                (goal_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT goal_id, plan_version FROM goal_plans "
+                "ORDER BY goal_id, plan_version DESC"
+            ).fetchall()
+        per_goal: dict[str, list[int]] = {}
+        for gid, version in rows:
+            per_goal.setdefault(gid, []).append(int(version))
+        doomed: dict[str, list[int]] = {}
+        for gid, versions in per_goal.items():
+            for rank, version in enumerate(versions):
+                if rank >= keep_latest:
+                    doomed.setdefault(gid, []).append(version)
+        if dry_run:
+            return sum(len(v) for v in doomed.values())
+
+        removed = 0
+        for gid, versions in doomed.items():
+            for i in range(0, len(versions), batch_size):
+                chunk = versions[i:i + batch_size]
+                placeholders = ", ".join("?" * len(chunk))
+                cur = self._conn.execute(
+                    f"DELETE FROM goal_plans WHERE goal_id=? AND "
+                    f"plan_version IN ({placeholders})",
+                    (gid, *chunk),
+                )
+                removed += cur.rowcount
+        self._conn.commit()
+        return removed
 
     # ---- aggregate ----
 

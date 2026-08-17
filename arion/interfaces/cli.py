@@ -88,6 +88,21 @@ def build_parser() -> argparse.ArgumentParser:
     mem_inspect = mem_sub.add_parser("inspect", help="show ONE episode's bounded structured view (ADR-013; read-only)", parents=[common, common_memory])
     mem_inspect.add_argument("episode_id")
 
+    mem_prune = mem_sub.add_parser(
+        "prune",
+        help="explicit archival of old/excess episodes (ADR-014; bounded, fail-closed, never recent/high-importance)",
+        parents=[common, common_memory])
+    mem_prune.add_argument("--older-than", default=None,
+                           help="ISO-8601 cutoff; episodes with created_at strictly before it are candidates")
+    mem_prune.add_argument("--max-episodes", type=int, default=None,
+                           help="keep the NEWEST N episodes (by created_at)")
+    mem_prune.add_argument("--keep-importance", type=float, default=0.0,
+                           help="age-pruning protects episodes with importance >= this floor (default 0.0 = no floor)")
+    mem_prune.add_argument("--batch-size", type=int, default=500,
+                           help="bounded DELETE chunk size (default 500)")
+    mem_prune.add_argument("--dry-run", action="store_true",
+                           help="report what would be removed; never mutates")
+
     cog = sub.add_parser("cognition", help="inspect the cognitive state / world model (ADR-014)")
     cog.add_argument("--db", default=None, dest="db_cog", help=argparse.SUPPRESS)
     cog_sub = cog.add_subparsers(dest="cognition_command", required=True)
@@ -106,6 +121,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     cog_goals = cog_sub.add_parser("goals", help="long-horizon goal plan history", parents=[common, common_memory])
     cog_goals.add_argument("goal_id", help="goal id to inspect")
+
+    cog_prune_sup = cog_sub.add_parser(
+        "prune-superseded",
+        help="prune superseded belief history (ADR-014; ACTIVE beliefs are never pruned)",
+        parents=[common, common_memory])
+    cog_prune_sup.add_argument("--older-than", default=None,
+                               help="ISO-8601 cutoff; superseded_at must be strictly before it")
+    cog_prune_sup.add_argument("--keep-versions", type=int, default=1,
+                               help="keep the newest N superseded rows per belief lineage (default 1)")
+    cog_prune_sup.add_argument("--batch-size", type=int, default=500,
+                               help="bounded DELETE chunk size (default 500)")
+    cog_prune_sup.add_argument("--dry-run", action="store_true",
+                               help="report what would be removed; never mutates")
+
+    cog_prune_plans = cog_sub.add_parser(
+        "prune-plans",
+        help="bound goal replan history (ADR-014; the latest plan version per goal is never pruned)",
+        parents=[common, common_memory])
+    cog_prune_plans.add_argument("--goal", default=None,
+                                 help="scope the prune to one goal id (default: all goals)")
+    cog_prune_plans.add_argument("--keep-latest", type=int, default=10,
+                                 help="keep the newest N immutable plan versions per goal (default 10)")
+    cog_prune_plans.add_argument("--batch-size", type=int, default=500,
+                                 help="bounded DELETE chunk size (default 500)")
+    cog_prune_plans.add_argument("--dry-run", action="store_true",
+                                 help="report what would be removed; never mutates")
 
     goals = sub.add_parser("goals", help="durable goal management (ADR-016)")
     goals.add_argument("--db", default=None, dest="db_goals", help=argparse.SUPPRESS)
@@ -1289,8 +1330,88 @@ def _cognition_command(args, engine) -> int:
             return 0
         print(f"goal {args.goal_id}: {len(history)} plan version(s)")
         for h in history:
-            print(f"  v{h['plan_version']} strategy={h['strategy']} steps={len(json.loads(h['plan_summary']))} at {h['created_at']}")
+            print(f"  v{h['plan_version']} strategy={h['strategy']} steps={len(h['plan_summary'])} at {h['created_at']}")
         print(f"progress: {gm.progress(args.goal_id)}")
+        return 0
+
+    if args.cognition_command == "prune-superseded":
+        # Superseded-history pruning (ADR-014): ACTIVE beliefs are never
+        # pruned; bounded, fail-closed, deterministic.
+        from arion.observability.events import AuditEvent
+
+        store = cognition.cognition
+        try:
+            removed = store.prune_superseded_beliefs(
+                older_than=args.older_than,
+                keep_versions=args.keep_versions,
+                batch_size=args.batch_size,
+                dry_run=args.dry_run,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}")
+            return 1
+        detail = {
+            "scope": "cognition.beliefs",
+            "episodes": 0,
+            "reflections": 0,
+            "beliefs": removed,
+            "goal_plans": 0,
+            "cutoff": args.older_than,
+            "limit": args.keep_versions,
+            "dry_run": args.dry_run,
+        }
+        if args.json:
+            _emit(detail)
+        elif args.dry_run:
+            print(f"cognition prune-superseded (dry-run): would remove "
+                  f"{removed} superseded belief(s) "
+                  f"[cutoff={args.older_than}, keep_versions={args.keep_versions}]")
+        else:
+            print(f"cognition prune-superseded: removed {removed} "
+                  f"superseded belief(s) "
+                  f"[cutoff={args.older_than}, keep_versions={args.keep_versions}]")
+        if not args.dry_run:
+            engine.events.emit(AuditEvent(kind="memory.pruned", detail=detail))
+        return 0
+
+    if args.cognition_command == "prune-plans":
+        # Replan-history bounding (ADR-014): the LATEST plan version per
+        # goal is never pruned; bounded, fail-closed, deterministic.
+        from arion.observability.events import AuditEvent
+
+        store = cognition.cognition
+        try:
+            removed = store.prune_goal_plans(
+                goal_id=args.goal,
+                keep_latest=args.keep_latest,
+                batch_size=args.batch_size,
+                dry_run=args.dry_run,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}")
+            return 1
+        detail = {
+            "scope": "cognition.goal_plans",
+            "episodes": 0,
+            "reflections": 0,
+            "beliefs": 0,
+            "goal_plans": removed,
+            "cutoff": None,
+            "limit": args.keep_latest,
+            "goal_id": args.goal,
+            "dry_run": args.dry_run,
+        }
+        if args.json:
+            _emit(detail)
+        elif args.dry_run:
+            print(f"cognition prune-plans (dry-run): would remove {removed} "
+                  f"historical plan(s) [goal={args.goal}, "
+                  f"keep_latest={args.keep_latest}]")
+        else:
+            print(f"cognition prune-plans: removed {removed} historical "
+                  f"plan(s) [goal={args.goal}, keep_latest={args.keep_latest}]")
+        if not args.dry_run:
+            engine.events.emit(AuditEvent(kind="memory.pruned", detail=detail))
         return 0
 
     print(f"unknown cognition command: {args.cognition_command}")
@@ -1412,6 +1533,52 @@ def _memory_command(args, engine) -> int:
                   f"(category={record.category}, sources={record.source_episode_ids})")
             print(f"  lesson: {record.merged_lesson[:200]}")
         print(f"{len(records)} consolidation record(s) created")
+        return 0
+
+    if args.memory_command == "prune":
+        # Explicit archival (ADR-014): bounded, fail-closed, deterministic.
+        from arion.observability.events import AuditEvent
+
+        try:
+            reflections_before = memory.count_reflections()
+            removed = memory.prune(
+                older_than=args.older_than,
+                max_episodes=args.max_episodes,
+                keep_importance=args.keep_importance,
+                batch_size=args.batch_size,
+                dry_run=args.dry_run,
+            )
+            reflections_removed = reflections_before - memory.count_reflections()
+        except ValueError as exc:
+            print(f"error: {exc}")
+            return 1
+        detail = {
+            "scope": "memory.episodes",
+            "episodes": removed,
+            "reflections": reflections_removed,
+            "beliefs": 0,
+            "goal_plans": 0,
+            "cutoff": args.older_than,
+            "limit": args.max_episodes,
+            "dry_run": args.dry_run,
+        }
+        if args.json:
+            _emit(detail)
+        elif args.dry_run:
+            # Dry-run reports episode candidates only: a diff-based reflection
+            # count would always be 0 (nothing is deleted), so it is omitted.
+            print(f"memory prune (dry-run): would remove {removed} episode(s) "
+                  f"[cutoff={args.older_than}, max_episodes={args.max_episodes}, "
+                  f"keep_importance={args.keep_importance}]")
+        else:
+            print(f"memory prune: removed {removed} episode(s), "
+                  f"{reflections_removed} reflection(s) "
+                  f"[cutoff={args.older_than}, max_episodes={args.max_episodes}, "
+                  f"keep_importance={args.keep_importance}]")
+        if not args.dry_run:
+            # Observational audit (ADR-028 rule): counts + criteria only,
+            # never content. Dry-runs emit nothing (they never mutate).
+            engine.events.emit(AuditEvent(kind="memory.pruned", detail=detail))
         return 0
 
     print(f"unknown memory command: {args.memory_command}")
