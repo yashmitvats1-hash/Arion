@@ -167,8 +167,24 @@ def build_parser() -> argparse.ArgumentParser:
     goals_show = goals_sub.add_parser("show", help="show a goal", parents=[common, common_memory])
     goals_show.add_argument("goal_id")
 
-    goals_prog = goals_sub.add_parser("progress", help="goal progress", parents=[common, common_memory])
+    goals_prog = goals_sub.add_parser("progress", help="goal progress (read-only)", parents=[common, common_memory])
     goals_prog.add_argument("goal_id")
+
+    goals_diff = goals_sub.add_parser(
+        "diff",
+        help="structural diff of two stored plan versions (ADR-016; read-only)",
+        parents=[common, common_memory])
+    goals_diff.add_argument("goal_id")
+    goals_diff.add_argument("version_a")       # str; validated in-handler
+    goals_diff.add_argument("version_b")       # so invalid types -> exit 1
+
+    goals_rollback = goals_sub.add_parser(
+        "rollback",
+        help="re-adopt a stored historical plan version as a new immutable "
+             "version (ADR-016; via readopt_plan)",
+        parents=[common, common_memory])
+    goals_rollback.add_argument("goal_id")
+    goals_rollback.add_argument("version")     # str; validated in-handler
 
     goals_pause = goals_sub.add_parser("pause", help="pause a goal", parents=[common, common_memory])
     goals_pause.add_argument("goal_id")
@@ -1204,14 +1220,85 @@ def _goals_command(args, engine) -> int:
         return 0
 
     if args.goals_command == "progress":
-        result, goal = gm.evaluate(args.goal_id)
+        # READ-ONLY progress peek (ADR-016 addendum Phase C/D): the public
+        # non-mutating peek_evaluate() computes the same deterministic
+        # evaluation WITHOUT persisting progress_metadata /
+        # last_evaluated_at / updated_at and WITHOUT emitting
+        # progress.evaluated / goal.evaluated. The authoritative lifecycle
+        # (engine run_goal) keeps using the mutating evaluate().
+        goal = gm.get_goal(args.goal_id)
+        if goal is None:
+            print(f"goal {args.goal_id} not found")
+            return 1
+        result = gm.peek_evaluate(args.goal_id)
+        if result is None:
+            print(f"goal {args.goal_id} not found")
+            return 1
         if args.json:
-            _emit({"evaluation": result.to_dict(), "goal": goal.to_dict()})
+            _emit({"goal_id": args.goal_id,
+                   "evaluation": result.to_dict(),
+                   "status": goal.status_value,
+                   "progress_metadata": goal.progress_metadata})
             return 0
         print(f"goal {args.goal_id}: progress={result.progress:.2f} status={result.status} next_action={result.next_action}")
         print(f"  evidence: {result.evidence}")
         if result.blockers:
             print(f"  blockers: {result.blockers}")
+        return 0
+
+    if args.goals_command == "diff":
+        # Read-only structural diff of two immutable plan versions.
+        try:
+            va = int(args.version_a)
+            vb = int(args.version_b)
+        except (TypeError, ValueError):
+            print(f"error: versions must be positive integers, got "
+                  f"{args.version_a!r} and {args.version_b!r} (fail closed)")
+            return 1
+        try:
+            d = gm.diff_plans(args.goal_id, va, vb)
+        except ValueError as exc:
+            print(f"error: {exc}")
+            return 1
+        if args.json:
+            _emit(d)
+            return 0
+        if d["identical"]:
+            print(f"goal {args.goal_id}: v{args.version_a} and "
+                  f"v{args.version_b} are identical (empty diff)")
+            return 0
+        print(f"goal {args.goal_id}: v{args.version_a} "
+              f"({d['strategy_a']}) vs v{args.version_b} "
+              f"({d['strategy_b']})")
+        print(f"  steps: {d['steps_a']} -> {d['steps_b']}")
+        print(f"  added:   {d['added']}")
+        print(f"  removed: {d['removed']}")
+        print(f"  kept:    {d['kept']}")
+        return 0
+
+    if args.goals_command == "rollback":
+        # Thin CLI wrapper around the single re-adoption mechanism
+        # (GoalManager.readopt_plan) - no second rollback implementation.
+        try:
+            version = int(args.version)
+        except (TypeError, ValueError):
+            print(f"error: version must be a positive integer, got "
+                  f"{args.version!r} (fail closed)")
+            return 1
+        try:
+            record = gm.readopt_plan(args.goal_id, version)
+        except ValueError as exc:
+            print(f"error: {exc}")
+            return 1
+        if args.json:
+            _emit({"goal_id": args.goal_id,
+                   "plan_version": record["plan_version"],
+                   "strategy": record["strategy"],
+                   "reason": record["reason"]})
+            return 0
+        print(f"goal {args.goal_id}: re-adopted plan v{args.version} as "
+              f"v{record['plan_version']} (strategy={record['strategy']}, "
+              f"reason={record['reason']})")
         return 0
 
     from arion.state.models import GoalStateError

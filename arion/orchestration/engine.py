@@ -1570,11 +1570,63 @@ class ArionEngine:
         return rec
 
     def _plan_for_goal(self, goal_id: str, replan_reason: str | None = None) -> Task | None:
-        """Create + plan a task for a goal (records an immutable plan version)."""
+        """Create + plan a task for a goal (records an immutable plan version).
+
+        STORED-PLAN FAST PATH (ADR-016 addendum Phase B): when the goal's
+        LATEST plan version already exists (e.g. a re-adopted historical
+        plan from readopt_plan) and no task implements it yet, the task's
+        steps are reconstructed deterministically from the stored
+        plan_summary - the planner is NOT invoked. Re-adoption is
+        INFORMATIONAL: the reconstructed steps are treated exactly like a
+        freshly planned task (status normalization to PENDING/SKIPPED) and
+        every step passes the FULL live authorization pipeline at
+        execution time - historical authorization/capability decisions are
+        never trusted. A stored version whose plan_summary is
+        malformed/oversized or whose strategy is unknown fails closed
+        (ValueError) rather than executing.
+        """
         gm = self.goal_manager
         goal = gm.get_goal(goal_id)
         if goal is None:
             return None
+        latest = gm.latest_plan(goal_id)
+        if latest is not None and not gm._any_task_for_plan(
+                goal_id, latest["plan_version"]):
+            strategy = latest.get("strategy", "") or ""
+            summary = latest.get("plan_summary")
+            from arion.cognition.strategy import STRATEGY_NAMES
+
+            if strategy in STRATEGY_NAMES and isinstance(summary, list) \
+                    and summary and all(isinstance(s, dict) for s in summary) \
+                    and len(summary) <= 500:
+                # Stored-plan execution: rebuild PlanStep objects from the
+                # stored summary. Steps are normalized exactly like planner
+                # output (PENDING unless explicitly SKIPPED) - a stored
+                # summary can never carry execution state.
+                try:
+                    steps = [PlanStep.from_dict(s) for s in summary]
+                except Exception as exc:
+                    raise ValueError(
+                        f"stored plan v{latest['plan_version']} for goal "
+                        f"{goal_id} has an invalid step shape: {exc} "
+                        f"(fail closed)") from None
+                for s in steps:
+                    if s.status not in (StepStatus.PENDING, StepStatus.SKIPPED):
+                        s.status = StepStatus.PENDING
+                        s.result = None
+                        s.error = None
+                task = self.create_task(goal, plan_version=latest["plan_version"])
+                task.steps = steps
+                task.status = TaskStatus.PLANNED
+                self.storage.save_task(task)
+                self._emit(
+                    "plan.produced",
+                    task_id=task.id,
+                    detail={"steps": [s.to_dict() for s in steps],
+                            "stored_plan": True,
+                            "plan_version": latest["plan_version"]},
+                )
+                return task
         task = self.create_task(goal)
         self._plan(task, replan_reason=replan_reason)
         return task

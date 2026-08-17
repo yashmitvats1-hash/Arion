@@ -95,14 +95,17 @@ Every step is decided by a permission policy over
   machine: authorization gate, retries, verification policies, checkpointing,
   recovery, the long-horizon `run_goal` loop).
 - `arion/cognition` — `GoalManager` (authoritative goal state machine,
-  plan versioning, progress evaluation), `DeterministicProgressEvaluator`
+  plan versioning, progress evaluation, `readopt_plan` re-adoption +
+  `diff_plans` deterministic diff, `peek_evaluate` read-only evaluation
+  seam), `DeterministicProgressEvaluator`
   (model-independent evaluation seam), `StrategySelector` (explainable
   strategy selection + escalation), `SQLiteCognitiveStore` (goal_plans,
   beliefs, environment facts), `WorldStateMonitor` (versioned facts +
   change detection).
 - `arion/observability` — `AuditEvent` vocabulary, `EventLogger`, JSONL sink.
 - `arion/interfaces` — CLI (`run`, `resume`, `status`, `tasks`, `events`,
-  `capabilities`, `goals list|show|progress|pause|resume|cancel`,
+  `capabilities`,
+  `goals list|show|diff|rollback|progress|pause|resume|cancel`,
   `approvals list|show|approve|deny`).
 - `arion/memory` — `MemoryStore` protocol + `SQLiteMemoryStore` (episodic
   memories + reflections tables), `MemoryRetriever` (deterministic scoring +
