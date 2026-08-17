@@ -52,6 +52,7 @@ EVENT_KINDS = (
     "memory.episode.recorded",
     "memory.retrieval.completed",
     "memory.consolidated",
+    "memory.learning.catchup",
     "reflection.requested",
     "reflection.validation.passed",
     "reflection.validation.failed",

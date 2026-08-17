@@ -21,6 +21,10 @@ from arion.state.models import new_id, utcnow
 
 # Outcome vocabulary for episodes.
 EPISODE_OUTCOMES = ("completed", "failed", "denied", "recovered")
+# Learning lifecycle states (ADR-013 addendum): recorded -> reflected ->
+# consolidated. "recorded" is the retryable state (a crash mid-learning
+# leaves the episode recorded; the catch-up pass resumes from there).
+LIFECYCLE_STATES = ("recorded", "reflected", "consolidated")
 
 
 @dataclass
@@ -42,6 +46,7 @@ class Episode:
     tags: list[str] = field(default_factory=list)                    # capability names, outcome, categories, context tags
     importance: float = 0.5                                          # 0..1 salience
     reflection_id: str | None = None
+    lifecycle: str = "recorded"                                      # learning lifecycle state
     created_at: str = field(default_factory=utcnow)
     updated_at: str = field(default_factory=utcnow)
 
@@ -52,6 +57,10 @@ class Episode:
             raise ValueError("episode_id must be non-empty")
         if not (0.0 <= self.importance <= 1.0):
             raise ValueError("importance must be within [0, 1]")
+        if self.lifecycle not in LIFECYCLE_STATES:
+            raise ValueError(
+                f"unknown lifecycle state {self.lifecycle!r} "
+                f"(allowed: {LIFECYCLE_STATES})")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -70,6 +79,7 @@ class Episode:
             "tags": self.tags,
             "importance": self.importance,
             "reflection_id": self.reflection_id,
+            "lifecycle": self.lifecycle,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -92,6 +102,7 @@ class Episode:
             tags=d.get("tags", []) or [],
             importance=float(d.get("importance", 0.5)),
             reflection_id=d.get("reflection_id"),
+            lifecycle=d.get("lifecycle", "recorded"),
             created_at=d.get("created_at", utcnow()),
             updated_at=d.get("updated_at", utcnow()),
         )

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from arion.memory.models import Episode, EpisodeFilter, Reflection
+from arion.state.models import utcnow
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS episodic_memories (
@@ -37,6 +38,7 @@ CREATE TABLE IF NOT EXISTS episodic_memories (
     tags          TEXT NOT NULL,
     importance    REAL NOT NULL DEFAULT 0.5,
     reflection_id TEXT,
+    lifecycle     TEXT NOT NULL DEFAULT 'recorded',
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL
 );
@@ -97,7 +99,7 @@ class ConsolidationRecord:
 _EPISODE_COLS = [
     "episode_id", "task_id", "goal_id", "goal", "plan_summary", "actions", "resources",
     "outcome", "verification", "failures", "authorization", "recovery",
-    "tags", "importance", "reflection_id", "created_at", "updated_at",
+    "tags", "importance", "reflection_id", "lifecycle", "created_at", "updated_at",
 ]
 _REFLECTION_COLS = [
     "reflection_id", "episode_id", "what_happened", "what_worked", "what_failed",
@@ -128,7 +130,25 @@ class SQLiteMemoryStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._conn.executescript(SCHEMA)
-        self._conn.commit()
+        # ADR-013 addendum: exactly one episode per task. Older databases may
+        # contain duplicate rows for the same task (pre-idempotency bug
+        # artifact); merge them here, keeping the newest row per task. This
+        # is a duplicate merge, NOT archival pruning (memory is never
+        # deleted otherwise). Then enforce the invariant at the DB level as
+        # the cross-process backstop.
+        try:
+            self._conn.execute(
+                "DELETE FROM episodic_memories WHERE episode_id NOT IN ("
+                "SELECT episode_id FROM episodic_memories m2 WHERE "
+                "m2.task_id = episodic_memories.task_id ORDER BY updated_at "
+                "DESC, rowid DESC LIMIT 1)")
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_task_unique "
+                "ON episodic_memories(task_id)")
+            self._conn.commit()
+        except sqlite3.Error:
+            self._conn.rollback()
+            raise
 
     # ---- episodes ----
 
@@ -153,6 +173,7 @@ class SQLiteMemoryStore:
                 json.dumps(episode.tags),
                 float(episode.importance),
                 episode.reflection_id,
+                episode.lifecycle,
                 episode.created_at,
                 episode.updated_at,
             ),
@@ -166,6 +187,30 @@ class SQLiteMemoryStore:
             (episode_id,),
         ).fetchone()
         return _episode_from_row(row) if row else None
+
+    @_threadsafe
+    def get_episode_by_task(self, task_id: str) -> Episode | None:
+        """Exactly one episode per task (ADR-013 addendum): the task-keyed
+        unique index guarantees at most one row."""
+        row = self._conn.execute(
+            "SELECT " + ", ".join(_EPISODE_COLS)
+            + " FROM episodic_memories WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        return _episode_from_row(row) if row else None
+
+    @_threadsafe
+    def set_episode_lifecycle(self, episode_id: str, state: str) -> None:
+        """Advance the durable learning lifecycle state (recorded ->
+        reflected -> consolidated). Observational bookkeeping only."""
+        if state not in ("recorded", "reflected", "consolidated"):
+            raise ValueError(f"unknown lifecycle state {state!r}")
+        self._conn.execute(
+            "UPDATE episodic_memories SET lifecycle=?, updated_at=? "
+            "WHERE episode_id=?",
+            (state, utcnow(), episode_id),
+        )
+        self._conn.commit()
 
     @_threadsafe
     def search_episodes(self, filters: EpisodeFilter) -> list[Episode]:

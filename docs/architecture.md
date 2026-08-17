@@ -161,6 +161,27 @@ Memory is INFORMATIONAL — it never authorizes (`Memory ≠ Authority`):
   `planning.memory.influence` audits which memories influenced each plan.
 - **Poisoning defenses**: adversarial memory/reflection content stays
   informational; all authorization answers come from the current policy.
+- **Lifecycle idempotency (addendum):** exactly ONE durable episode per
+  task (`get_episode_by_task` + a DB-level UNIQUE index on
+  `episodic_memories.task_id` as the cross-process backstop; init-time
+  merge of pre-idempotency duplicates keeps the newest row — a bug-artifact
+  merge, never archival pruning). Episodes carry a durable `lifecycle`
+  state: `recorded` → `reflected` → `consolidated`; `recorded` is the
+  retryable state, so a crash mid-learning resumes instead of duplicating.
+- **Catch-up learning:** `engine.learn_from_terminal_tasks()` is an
+  idempotent, restart-safe pass that records episodes for every terminal
+  task that lacks one — recovering experience lost when a process crashed
+  between the durable task save and the episode write (bounded
+  `memory.learning.catchup` event; never touches scheduler authority).
+- **Query-aware retrieval precision (addendum):** `retrieve` /
+  `build_planning_context` accept an optional `capabilities` set; the
+  engine passes the planner's requirement heuristic, so capability tags
+  count as a relevance signal only when they match the task's likely
+  capabilities (an http.get task never receives filesystem.read memory).
+  Direct callers without the hint keep the original semantics.
+- **CLI diagnostics:** `arion memory episodes|reflections|search|stats|
+  consolidate` plus `memory inspect <episode_id>` (read-only, bounded,
+  secret-free; human + `--json`).
 
 ## Cognitive State / World Model v1 (ADR-014)
 

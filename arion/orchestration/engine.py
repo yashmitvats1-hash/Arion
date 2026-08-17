@@ -3002,7 +3002,10 @@ class ArionEngine:
             from arion.memory.retrieval import MemoryRetriever, build_planning_context
 
             retriever = MemoryRetriever(self.memory)
-            ctx = build_planning_context(retriever, task.description, ContextBudget())
+            ctx = build_planning_context(
+                retriever, task.description, ContextBudget(),
+                capabilities=set(self._planner_requirements(task.description)
+                                 or []))
             self._emit(
                 "memory.retrieval.completed",
                 task_id=task.id,
@@ -3118,9 +3121,14 @@ class ArionEngine:
     def _record_memory(self, task: Task) -> None:
         """Record a structured episode + reflection for a terminal task.
 
-        Runs best-effort: memory failure never changes task outcome. Stores
-        structured summaries only - never secrets, credentials, raw prompts,
-        or raw model responses.
+        IDEMPOTENT (ADR-013 addendum): exactly one episode per task. If an
+        episode already exists for this task, the pass reuses it - an
+        existing reflection means the whole pass already completed, so
+        nothing is duplicated; a recorded-but-unreflected episode (crash
+        mid-learning) resumes from reflection onward. Runs best-effort:
+        memory failure never changes task outcome. Stores structured
+        summaries only - never secrets, credentials, raw prompts, or raw
+        model responses.
         """
         if self.memory is None:
             return
@@ -3128,12 +3136,31 @@ class ArionEngine:
             from arion.memory.lifecycle import build_episode_from_task
             from arion.memory.reflector import DeterministicReflector
 
+            existing = None
+            try:
+                existing = self.memory.get_episode_by_task(task.id)
+            except Exception:
+                existing = None
+            if existing is not None and existing.reflection_id:
+                return  # fully learned already: idempotent no-op
+
             events = []
             try:
                 events = self.storage.list_events(task.id)
             except Exception:
                 events = []
             episode = build_episode_from_task(task, events, registry=self.registry)
+            if existing is not None:
+                # same task, same episode id: refresh content in place
+                # (outcome/tags may have been finalized after the first
+                # partial pass) - never mint a second episode for a task.
+                episode.episode_id = existing.episode_id
+                episode.created_at = existing.created_at
+            try:
+                self.memory.set_episode_lifecycle(
+                    episode.episode_id, "recorded")
+            except Exception:
+                pass
             self.memory.record_episode(episode)
             self._emit(
                 "memory.episode.recorded",
@@ -3143,6 +3170,7 @@ class ArionEngine:
                     "outcome": episode.outcome,
                     "tags": episode.tags[:20],
                     "importance": round(episode.importance, 2),
+                    "reused": existing is not None,
                 },
             )
 
@@ -3167,6 +3195,11 @@ class ArionEngine:
                 self.memory.link_reflection(episode.episode_id, reflection.reflection_id)
             except Exception:
                 pass
+            try:
+                self.memory.set_episode_lifecycle(
+                    episode.episode_id, "reflected")
+            except Exception:
+                pass
             self._emit(
                 "reflection.created",
                 task_id=task.id,
@@ -3179,9 +3212,63 @@ class ArionEngine:
 
             # Consolidation: deterministic duplicate/lesson merging (never deletes).
             self._consolidate(task.id)
+            try:
+                self.memory.set_episode_lifecycle(
+                    episode.episode_id, "consolidated")
+            except Exception:
+                pass
         except Exception:
             # Memory is best-effort; never break the task lifecycle.
             pass
+
+    def learn_from_terminal_tasks(self, limit: int = 200) -> int:
+        """ADR-013 addendum: catch-up learning after restart.
+
+        Records an episode (then reflection + consolidation) for every
+        TERMINAL task that has none - recovering experience that was lost
+        when a process crashed between the durable terminal task save and
+        the episode write. Idempotent: tasks that already have a fully
+        learned episode are skipped; a second pass records nothing new.
+        Bounded (limit tasks per pass), read-mostly, best-effort - never
+        touches scheduler or execution authority. Returns the number of
+        tasks newly learned in this pass.
+        """
+        if self.memory is None:
+            return 0
+        from arion.state.models import TaskStatus
+
+        terminal = [t for t in self.storage.list_tasks()
+                    if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)]
+        recorded = 0
+        skipped = 0
+        for task in terminal[: int(limit)]:
+            try:
+                existing = self.memory.get_episode_by_task(task.id)
+            except Exception:
+                existing = None
+            if existing is not None and existing.reflection_id:
+                skipped += 1
+                continue
+            self._record_memory(task)
+            try:
+                after = self.memory.get_episode_by_task(task.id)
+            except Exception:
+                after = None
+            if after is not None:
+                recorded += 1
+            else:
+                skipped += 1
+        try:
+            self._emit(
+                "memory.learning.catchup",
+                task_id=None,
+                detail={"processed": len(terminal[: int(limit)]),
+                        "recorded": recorded, "skipped": skipped,
+                        "limit": int(limit)},
+            )
+        except Exception:
+            pass
+        return recorded
 
     def _derive_beliefs(self, episode, reflection) -> None:
         """Derive + store cognitive beliefs from the latest experience.

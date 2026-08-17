@@ -85,6 +85,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     mem_consol = mem_sub.add_parser("consolidate", help="run deterministic consolidation", parents=[common, common_memory])
     mem_consol.add_argument("--limit", type=int, default=200)
+    mem_inspect = mem_sub.add_parser("inspect", help="show ONE episode's bounded structured view (ADR-013; read-only)", parents=[common, common_memory])
+    mem_inspect.add_argument("episode_id")
 
     cog = sub.add_parser("cognition", help="inspect the cognitive state / world model (ADR-014)")
     cog.add_argument("--db", default=None, dest="db_cog", help=argparse.SUPPRESS)
@@ -1309,6 +1311,33 @@ def _memory_command(args, engine) -> int:
             print(json.dumps(obj, indent=2, default=str))
         else:
             print(obj)
+
+    if args.memory_command == "inspect":
+        episode = memory.get_episode(args.episode_id)
+        if episode is None:
+            print(f"episode {args.episode_id!r} not found")
+            return 1
+        if args.json:
+            _emit(episode.to_dict())
+            return 0
+        d = episode.to_dict()
+        print(f"episode={d['episode_id']}  outcome={d['outcome']}  "
+              f"lifecycle={d.get('lifecycle', 'recorded')}  "
+              f"importance={d['importance']:.2f}")
+        print(f"task={d.get('task_id')}  goal_id={d.get('goal_id')}  "
+              f"goal={d['goal'][:120]!r}")
+        print(f"tags={d['tags'][:10]}")
+        print(f"steps={len(d['plan_summary'])}  actions={len(d['actions'])}  "
+              f"failures={len(d['failures'])}  "
+              f"reflection={d.get('reflection_id')}")
+        for f in d["failures"][:3]:
+            print(f"  failure step={f.get('step')} "
+                  f"{f.get('capability')}/{f.get('action')} "
+                  f"category={f.get('category')} "
+                  f"error={(f.get('error') or '')[:120]!r}")
+        if d.get("authorization", {}).get("denials"):
+            print(f"  denials={len(d['authorization']['denials'])}")
+        return 0
 
     if args.memory_command == "episodes":
         from arion.memory.models import EpisodeFilter

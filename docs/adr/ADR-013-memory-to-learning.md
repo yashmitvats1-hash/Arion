@@ -105,3 +105,51 @@ full matrix.
 
 ADR-009 (authorization authoritative), ADR-012 (memory), ADR-011 (intelligence
 boundary), ADR-008 (offline testing).
+
+---
+
+## Integration addendum (2026-08-17) — lifecycle idempotency, catch-up learning, explicit state
+
+Status: Approved & implemented (on top of the ADR-013 baseline; scheduler layer ADR-025…031 settled).
+
+### Phase-0 assessment (what the baseline already had)
+
+The ADR-013 loop was already fully implemented and tested before this addendum:
+
+- episodes (`Episode`, outcomes completed|failed|denied|recovered, bounded metadata, param KEY names only);
+- durable `SQLiteMemoryStore` (episodic_memories / reflections / consolidations, same DB file as core state);
+- reflection (`DeterministicReflector` + `ModelReflector`, strict `reflection_schema` validation, authority-field rejection, deterministic fallback);
+- deterministic consolidation (`MemoryConsolidator`, idempotent, never deletes);
+- deterministic retrieval + bounded context (`MemoryRetriever`, `build_planning_context`, `ContextBudget`);
+- guidance into planning (`MemoryGuidance` avoid/prefer/informational, `apply_guidance_to_steps`);
+- engine hooks (`_record_memory` at every terminal path, `_build_planning_context` inside `_plan`);
+- provenance + observability events + read-only CLI (`memory episodes|reflections|search|stats|consolidate`);
+- poisoning defenses + the Plan-A≠Plan-B acceptance gate.
+
+### Gaps closed by this addendum
+
+1. **Episode idempotency (proven defect):** `_record_memory` is reachable from ~10 terminal paths (plus restart/resume/retry), and each invocation minted a NEW episode id, so recording the same terminal task twice produced duplicate episodes + duplicate reflections. Fixed by: engine-level task-keyed dedup (`get_episode_by_task`), a DB-level UNIQUE index on `episodic_memories.task_id` as the cross-process backstop, and an init-time duplicate cleanup (keep the newest row per task — a merge of a bug artifact, never archival pruning).
+2. **Catch-up learning:** a crash between the terminal task save and `_record_memory` silently lost the experience. Added `engine.learn_from_terminal_tasks()` — an idempotent, restart-safe pass that records episodes (and reflections/consolidations) for every terminal task that has none, with a bounded `memory.learning.catchup` observability event.
+3. **Explicit lifecycle state:** `Episode.lifecycle` ∈ {`recorded`, `reflected`, `consolidated`}, durable on the episode row and advanced transactionally by the engine after each stage. `recorded` is the retryable state (recovery after a mid-learning crash); reflection failure still falls back to the deterministic reflector, so a separate `failed` state is not required (consistent with the existing model).
+4. **CLI diagnostic:** `arion memory inspect <episode_id>` (read-only, bounded, secret-free; `--json`).
+5. **Demo:** `scripts/demo_adr013_learning_loop.py` (deterministic, offline).
+6. **Tests:** lifecycle invariants (duplicate invocation, retry, empty/malformed input, concurrent completion), subprocess restart/crash recovery, adversarial learning-boundary tests, unrelated-memory exclusion at the engine level.
+
+### Lifecycle (exact, after this addendum)
+
+```text
+execution outcome (durable task row)
+   ↓  _record_memory / learn_from_terminal_tasks
+durable episode (lifecycle=recorded; task-keyed, exactly one per task)
+   ↓  reflect (configured reflector; deterministic fallback on failure)
+reflection recorded + linked (lifecycle=reflected)
+   ↓  consolidate (idempotent; never deletes)
+consolidation records (lifecycle=consolidated)
+   ↓  retrieval (bounded, deterministic) → PlanningContext → guidance → future planning
+```
+
+Learning is idempotent end-to-end: repeated passes never create duplicate
+episodes, reflections, or consolidation records for the same experience.
+Learning failure never rolls back execution, and execution never depends on
+learning (memory remains strictly informational; the scheduler/authorization
+contracts are untouched).
