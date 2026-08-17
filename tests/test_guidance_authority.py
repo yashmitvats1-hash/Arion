@@ -186,8 +186,48 @@ def test_guidance_cannot_register_capabilities(tmp_path, sandbox):
 
 
 def test_consolidation_does_not_bind_storage_seam_raises(tmp_path):
-    """The archival/pruning seam exists but intentionally does nothing yet."""
+    """The archival/pruning seam (ADR-014) is now implemented, fail-closed.
+
+    - prune() with no criterion raises (never silently delete);
+    - pruning episodes deletes their reflections but never consolidations
+      (consolidation history is preserved, provenance intact).
+    """
+    from arion.memory.models import Episode, Reflection
+    from arion.memory.store import ConsolidationRecord
+    from datetime import datetime, timedelta, timezone
+
+    def _iso_plus(iso, seconds):
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (dt + timedelta(seconds=seconds)).isoformat()
+
+    t0 = "2026-01-01T00:00:00+00:00"
     store = SQLiteMemoryStore(tmp_path / "a.db")
-    with pytest.raises(NotImplementedError, match="not yet implemented"):
+
+    # no criteria -> fail closed, nothing deleted
+    with pytest.raises(ValueError, match="never silently delete"):
         store.prune()
+
+    # seed one old episode with a reflection + a consolidation over it
+    store.record_episode(Episode(episode_id="ep-old", task_id="t-1", goal_id="g",
+                                 goal="g", outcome="completed", importance=0.3,
+                                 created_at=_iso_plus(t0, 0), updated_at=_iso_plus(t0, 0),
+                                 reflection_id="refl-old"))
+    store.record_reflection(Reflection(reflection_id="refl-old", episode_id="ep-old",
+                                       what_happened="x", what_worked="", what_failed="",
+                                       why="", lesson="lesson", recommendation="",
+                                       confidence="medium", importance=0.3,
+                                       created_at=_iso_plus(t0, 0)))
+    store.record_consolidation(ConsolidationRecord(
+        consolidation_id="consol-1", source_episode_ids=["ep-old"],
+        category="lesson", merged_lesson="merged lesson", count=1,
+        importance=0.5, created_at=_iso_plus(t0, 60)))
+
+    removed = store.prune(older_than=_iso_plus(t0, 5))
+    assert removed == 1                       # the old episode is prunable
+    assert store.get_episode("ep-old") is None
+    assert store.get_reflection("refl-old") is None    # reflection went with it
+    consol_ids = [c.consolidation_id for c in store.list_consolidations()]
+    assert "consol-1" in consol_ids           # consolidation preserved
     store.close()

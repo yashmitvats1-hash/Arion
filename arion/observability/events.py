@@ -52,6 +52,8 @@ EVENT_KINDS = (
     "memory.episode.recorded",
     "memory.retrieval.completed",
     "memory.consolidated",
+    "memory.learning.catchup",
+    "memory.pruned",
     "reflection.requested",
     "reflection.validation.passed",
     "reflection.validation.failed",
@@ -63,6 +65,7 @@ EVENT_KINDS = (
     "step.skipped",
     "world.state.changed",
     "strategy.selected",
+    "strategy.outcome",
     "capability.discovered",
     "capability.executed",
     "observation.recorded",
@@ -89,6 +92,29 @@ EVENT_KINDS = (
     "checkpoint.persisted",
     "task.completed",
     "task.failed",
+    # Scheduler telemetry (ADR-028) - observational only, never authority.
+    "scheduler.registered",
+    "scheduler.heartbeat",
+    "scheduler.shutdown",
+    "scheduler.abandoned",
+    "scheduler.config_changed",
+    "work.queued",
+    "work.claimed",
+    "work.claim_denied",
+    "work.heartbeat",
+    "work.reclaimed",
+    "work.handoff",
+    "work.completed",
+    "work.failed",
+    "capacity.denied",
+    "scheduler_share.denied",
+    "goal_weight.denied",
+    "goal_weight.refill",
+    "goal_reservation_changed",
+    "reservation.denied",
+    "reservation.satisfied",
+    "goal_ceiling_changed",
+    "ceiling.denied",
     "error",
 )
 
@@ -103,6 +129,7 @@ class AuditEvent:
     actor: str = "system"
     ts: str = field(default_factory=utcnow)
     id: str = field(default_factory=lambda: new_id("evt"))
+    work_id: str | None = None  # scheduler telemetry convenience (ADR-028)
 
     def __post_init__(self) -> None:
         if self.kind not in EVENT_KINDS:

@@ -291,6 +291,10 @@ class StepScheduler:
         with self._lock:
             return len(self._running)
 
+    def workers_count(self) -> int:
+        with self._lock:
+            return len(self._workers)
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {

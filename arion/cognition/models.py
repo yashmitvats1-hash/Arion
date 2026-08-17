@@ -24,7 +24,8 @@ from arion.state.models import new_id, utcnow
 
 BELIEF_CATEGORIES = ("semantic", "procedural", "preference", "environment")
 BELIEF_SOURCES = ("deterministic", "model")
-PROVENANCE_KEYS = frozenset({"episode_ids", "reflection_ids", "guidance_ids"})
+PROVENANCE_KEYS = frozenset({"episode_ids", "reflection_ids", "guidance_ids",
+                             "consolidation_ids"})
 STATEMENT_MAX = 600
 
 

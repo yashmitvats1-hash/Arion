@@ -85,6 +85,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     mem_consol = mem_sub.add_parser("consolidate", help="run deterministic consolidation", parents=[common, common_memory])
     mem_consol.add_argument("--limit", type=int, default=200)
+    mem_inspect = mem_sub.add_parser("inspect", help="show ONE episode's bounded structured view (ADR-013; read-only)", parents=[common, common_memory])
+    mem_inspect.add_argument("episode_id")
+
+    mem_prune = mem_sub.add_parser(
+        "prune",
+        help="explicit archival of old/excess episodes (ADR-014; bounded, fail-closed, never recent/high-importance)",
+        parents=[common, common_memory])
+    mem_prune.add_argument("--older-than", default=None,
+                           help="ISO-8601 cutoff; episodes with created_at strictly before it are candidates")
+    mem_prune.add_argument("--max-episodes", type=int, default=None,
+                           help="keep the NEWEST N episodes (by created_at)")
+    mem_prune.add_argument("--keep-importance", type=float, default=0.0,
+                           help="age-pruning protects episodes with importance >= this floor (default 0.0 = no floor)")
+    mem_prune.add_argument("--batch-size", type=int, default=500,
+                           help="bounded DELETE chunk size (default 500)")
+    mem_prune.add_argument("--dry-run", action="store_true",
+                           help="report what would be removed; never mutates")
 
     cog = sub.add_parser("cognition", help="inspect the cognitive state / world model (ADR-014)")
     cog.add_argument("--db", default=None, dest="db_cog", help=argparse.SUPPRESS)
@@ -105,6 +122,41 @@ def build_parser() -> argparse.ArgumentParser:
     cog_goals = cog_sub.add_parser("goals", help="long-horizon goal plan history", parents=[common, common_memory])
     cog_goals.add_argument("goal_id", help="goal id to inspect")
 
+    cog_strategies = cog_sub.add_parser(
+        "strategies",
+        help="list learned strategy outcomes (ADR-015; read-only, informational)",
+        parents=[common, common_memory])
+    cog_strategies.add_argument("--goal", default=None,
+                                help="filter to one goal id (default: all goals)")
+    cog_strategies.add_argument("--limit", type=int, default=200,
+                                help="max rows (default 200, bounded [1, 1000])")
+
+    cog_prune_sup = cog_sub.add_parser(
+        "prune-superseded",
+        help="prune superseded belief history (ADR-014; ACTIVE beliefs are never pruned)",
+        parents=[common, common_memory])
+    cog_prune_sup.add_argument("--older-than", default=None,
+                               help="ISO-8601 cutoff; superseded_at must be strictly before it")
+    cog_prune_sup.add_argument("--keep-versions", type=int, default=1,
+                               help="keep the newest N superseded rows per belief lineage (default 1)")
+    cog_prune_sup.add_argument("--batch-size", type=int, default=500,
+                               help="bounded DELETE chunk size (default 500)")
+    cog_prune_sup.add_argument("--dry-run", action="store_true",
+                               help="report what would be removed; never mutates")
+
+    cog_prune_plans = cog_sub.add_parser(
+        "prune-plans",
+        help="bound goal replan history (ADR-014; the latest plan version per goal is never pruned)",
+        parents=[common, common_memory])
+    cog_prune_plans.add_argument("--goal", default=None,
+                                 help="scope the prune to one goal id (default: all goals)")
+    cog_prune_plans.add_argument("--keep-latest", type=int, default=10,
+                                 help="keep the newest N immutable plan versions per goal (default 10)")
+    cog_prune_plans.add_argument("--batch-size", type=int, default=500,
+                                 help="bounded DELETE chunk size (default 500)")
+    cog_prune_plans.add_argument("--dry-run", action="store_true",
+                                 help="report what would be removed; never mutates")
+
     goals = sub.add_parser("goals", help="durable goal management (ADR-016)")
     goals.add_argument("--db", default=None, dest="db_goals", help=argparse.SUPPRESS)
     goals_sub = goals.add_subparsers(dest="goals_command", required=True)
@@ -115,8 +167,24 @@ def build_parser() -> argparse.ArgumentParser:
     goals_show = goals_sub.add_parser("show", help="show a goal", parents=[common, common_memory])
     goals_show.add_argument("goal_id")
 
-    goals_prog = goals_sub.add_parser("progress", help="goal progress", parents=[common, common_memory])
+    goals_prog = goals_sub.add_parser("progress", help="goal progress (read-only)", parents=[common, common_memory])
     goals_prog.add_argument("goal_id")
+
+    goals_diff = goals_sub.add_parser(
+        "diff",
+        help="structural diff of two stored plan versions (ADR-016; read-only)",
+        parents=[common, common_memory])
+    goals_diff.add_argument("goal_id")
+    goals_diff.add_argument("version_a")       # str; validated in-handler
+    goals_diff.add_argument("version_b")       # so invalid types -> exit 1
+
+    goals_rollback = goals_sub.add_parser(
+        "rollback",
+        help="re-adopt a stored historical plan version as a new immutable "
+             "version (ADR-016; via readopt_plan)",
+        parents=[common, common_memory])
+    goals_rollback.add_argument("goal_id")
+    goals_rollback.add_argument("version")     # str; validated in-handler
 
     goals_pause = goals_sub.add_parser("pause", help="pause a goal", parents=[common, common_memory])
     goals_pause.add_argument("goal_id")
@@ -182,6 +250,79 @@ def build_parser() -> argparse.ArgumentParser:
     locks_reclaim = locks_sub.add_parser("reclaim", help="reclaim an EXPIRED mutation lock (ADR-021; never authorizes)", parents=[common, common_memory])
     locks_reclaim.add_argument("id")
 
+    sched = sub.add_parser("scheduler", help="durable scheduler/work registry (ADR-025)")
+    sched.add_argument("--db", default=None, dest="db_scheduler", help=argparse.SUPPRESS)
+    sched_sub = sched.add_subparsers(dest="scheduler_command", required=True)
+
+    sched_status = sched_sub.add_parser("status", help="scheduler status: capacity + work counts by state (bounded, metadata-only)", parents=[common, common_memory])
+    sched_workers = sched_sub.add_parser("workers", help="list RUNNING work + worker leases (ADR-025)", parents=[common, common_memory])
+    sched_queue = sched_sub.add_parser("queue", help="list QUEUED work in admission order (ADR-025)", parents=[common, common_memory])
+    sched_show = sched_sub.add_parser("show", help="show one scheduler work row (bounded metadata; fails closed on unknown id)", parents=[common, common_memory])
+    sched_show.add_argument("work_id")
+    sched_reclaim = sched_sub.add_parser("reclaim", help="reclaim a STALE RUNNING work row whose lease expired (ADR-025; never executes)", parents=[common, common_memory])
+    sched_reclaim.add_argument("work_id")
+
+    sched_weights = sched_sub.add_parser("weights", help="list durable per-goal scheduling weights (ADR-027)", parents=[common, common_memory])
+    sched_weight = sched_sub.add_parser("weight", help="manage a goal's durable scheduling weight (ADR-027)", parents=[common, common_memory])
+    sched_weight_sub = sched_weight.add_subparsers(dest="scheduler_weight_command", required=True)
+    sched_weight_set = sched_weight_sub.add_parser("set", help="set a goal's weight (>=1, bounded; scheduler POLICY, never authorization)", parents=[common, common_memory])
+    sched_weight_set.add_argument("goal_id")
+    sched_weight_set.add_argument("weight", type=int)
+    sched_weight_set.add_argument("--disable", action="store_true", help="set the config disabled (goal never admitted)")
+    sched_weight_set.add_argument("--by", default="cli-operator", help="who configured (audit only)")
+    sched_weight_rm = sched_weight_sub.add_parser("remove", help="remove a goal's weight config (back to default weight 1)", parents=[common, common_memory])
+    sched_weight_rm.add_argument("goal_id")
+    sched_weight_en = sched_weight_sub.add_parser("enable", help="enable a goal's weight config", parents=[common, common_memory])
+    sched_weight_en.add_argument("goal_id")
+    sched_weight_dis = sched_weight_sub.add_parser("disable", help="disable a goal's weight config (never admitted)", parents=[common, common_memory])
+    sched_weight_dis.add_argument("goal_id")
+
+    sched_reservations = sched_sub.add_parser("reservations", help="list durable per-goal capacity reservations (ADR-029)", parents=[common, common_memory])
+    sched_reservations.add_argument("--check", action="store_true", help="read-only feasibility check of the current reservation config (ADR-030; exit 0 feasible / 1 infeasible)")
+    sched_reservation = sched_sub.add_parser("reservation", help="manage a goal's durable capacity reservation (ADR-029)", parents=[common, common_memory])
+    sched_reservation_sub = sched_reservation.add_subparsers(dest="scheduler_reservation_command", required=True)
+    sched_reservation_set = sched_reservation_sub.add_parser("set", help="set a goal's reservation (>=0, bounded; scheduler POLICY, never authorization)", parents=[common, common_memory])
+    sched_reservation_set.add_argument("goal_id")
+    sched_reservation_set.add_argument("capacity", type=int)
+    sched_reservation_set.add_argument("--disable", action="store_true", help="set the config disabled (no floor)")
+    sched_reservation_set.add_argument("--by", default="cli-operator", help="who configured (audit only)")
+    sched_reservation_rm = sched_reservation_sub.add_parser("remove", help="remove a goal's reservation config (back to 0)", parents=[common, common_memory])
+    sched_reservation_rm.add_argument("goal_id")
+    sched_reservation_en = sched_reservation_sub.add_parser("enable", help="enable a goal's reservation config", parents=[common, common_memory])
+    sched_reservation_en.add_argument("goal_id")
+    sched_reservation_dis = sched_reservation_sub.add_parser("disable", help="disable a goal's reservation config (no floor)", parents=[common, common_memory])
+    sched_reservation_dis.add_argument("goal_id")
+    sched_reservation_plan = sched_reservation_sub.add_parser("plan", help="DRY-RUN: simulate setting a goal's reservation WITHOUT persisting (ADR-030)", parents=[common, common_memory])
+    sched_reservation_plan.add_argument("goal_id")
+    sched_reservation_plan.add_argument("capacity", type=int)
+
+    sched_ceilings = sched_sub.add_parser("ceilings", help="list durable per-goal concurrency ceilings (ADR-031)", parents=[common, common_memory])
+    sched_ceiling = sched_sub.add_parser("ceiling", help="manage a goal's durable concurrency ceiling (ADR-031)", parents=[common, common_memory])
+    sched_ceiling_sub = sched_ceiling.add_subparsers(dest="scheduler_ceiling_command", required=True)
+    sched_ceiling_set = sched_ceiling_sub.add_parser("set", help="set a goal's ceiling (>=1, bounded; scheduler POLICY, never authorization)", parents=[common, common_memory])
+    sched_ceiling_set.add_argument("goal_id")
+    sched_ceiling_set.add_argument("capacity", type=int)
+    sched_ceiling_set.add_argument("--disable", action="store_true", help="set the config disabled (unbounded)")
+    sched_ceiling_set.add_argument("--by", default="cli-operator", help="who configured (audit only)")
+    sched_ceiling_rm = sched_ceiling_sub.add_parser("remove", help="remove a goal's ceiling config (back to unbounded)", parents=[common, common_memory])
+    sched_ceiling_rm.add_argument("goal_id")
+    sched_ceiling_en = sched_ceiling_sub.add_parser("enable", help="enable a goal's ceiling config", parents=[common, common_memory])
+    sched_ceiling_en.add_argument("goal_id")
+    sched_ceiling_dis = sched_ceiling_sub.add_parser("disable", help="disable a goal's ceiling config (unbounded)", parents=[common, common_memory])
+    sched_ceiling_dis.add_argument("goal_id")
+    sched_ceiling_plan = sched_ceiling_sub.add_parser("plan", help="DRY-RUN: simulate setting a goal's ceiling WITHOUT persisting (ADR-031)", parents=[common, common_memory])
+    sched_ceiling_plan.add_argument("goal_id")
+    sched_ceiling_plan.add_argument("capacity", type=int)
+
+    sched_watch = sched_sub.add_parser("watch", help="show scheduler telemetry events (ADR-028; observational only)", parents=[common, common_memory])
+    sched_watch.add_argument("--goal", default=None, help="filter by goal id")
+    sched_watch.add_argument("--scheduler", default=None, help="filter by scheduler id")
+    sched_watch.add_argument("--work", default=None, help="filter by work id")
+    sched_watch.add_argument("--type", default=None, help="filter by event type")
+    sched_watch.add_argument("--since", default=None, help="only events at/after this ISO timestamp")
+    sched_watch.add_argument("--limit", type=int, default=50, help="max events to show (bounded; default 50)")
+    sched_watch.add_argument("--follow", action="store_true", help="bounded polling mode (Ctrl-C to stop); read-only, no registration/heartbeat")
+
     return parser
 
 
@@ -191,13 +332,18 @@ def main(argv: list[str] | None = None) -> int:
     db_path = (args.db or args.db_global or getattr(args, "db_mem", None)
                or getattr(args, "db_cog", None) or getattr(args, "db_goals", None)
                or getattr(args, "db_approvals", None) or getattr(args, "db_recovery", None)
-               or getattr(args, "db_locks", None)
+               or getattr(args, "db_locks", None) or getattr(args, "db_scheduler", None)
                or str(root / "arion_data" / "arion.db"))
 
     engine = build_engine(
         db_path=db_path,
         sandbox_root=str(root),
         jsonl_log=str(root / "arion_data" / "events.jsonl") if args.command in ("run", "resume", "capabilities") else None,
+        # The `scheduler` command is a PASSIVE observer of the durable
+        # registry: it must not abandon another (possibly live) scheduler's
+        # QUEUED rows. Every other command performs the normal restart
+        # reclamation (stale leases + dead schedulers' queues).
+        scheduler_reclaim_on_start=args.command != "scheduler",
     )
     storage = engine.storage
 
@@ -253,10 +399,491 @@ def main(argv: list[str] | None = None) -> int:
         return _recovery_command(args, engine)
     elif args.command == "locks":
         return _locks_command(args, engine)
+    elif args.command == "scheduler":
+        return _scheduler_command(args, engine)
 
-    engine.shutdown()  # ADR-024: join bounded workers, no orphans
+    engine.shutdown()  # ADR-024/025: join bounded workers, no orphans
     storage.close()
     return 0
+
+
+def _scheduler_command(args, engine) -> int:
+    """arion scheduler status|workers|queue|show|reclaim (ADR-025).
+
+    Reads the DURABLE scheduler/work registry through the domain store only -
+    never raw SQLite. Output is bounded, metadata-only, secret-free and
+    restart-safe (it reflects the durable rows, not live engine memory).
+    Unknown work ids fail closed (non-zero exit). Reclaim only moves a STALE
+    RUNNING row (lease expired) to ABANDONED; it never executes anything and
+    never authorizes a mutation - abandoned work re-runs the full fresh
+    authorization/recovery path on the next engine run.
+    """
+    import json
+
+    store = getattr(engine, "scheduler_registry", None)
+    if store is None or not hasattr(store, "list_work"):
+        print("scheduler registry is not available on this engine")
+        return 1
+
+    def _emit(obj):
+        if getattr(args, "json", False):
+            print(json.dumps(obj, indent=2, default=str))
+        else:
+            print(obj)
+
+    if args.scheduler_command == "status":
+        from arion.state.scheduler_work import SchedulerWorkStatus
+
+        rows = store.list_work()
+        counts = {s.value: 0 for s in SchedulerWorkStatus}
+        for r in rows:
+            counts[r.status.value] = counts.get(r.status.value, 0) + 1
+        stale = [r for r in rows if r.status == SchedulerWorkStatus.RUNNING
+                 and r.lease_expires_at is not None and r.lease_expires_at <= engine._lock_now()]
+        out = {
+            "total": len(rows),
+            "queued": counts["queued"],
+            "running": counts["running"],
+            "completed": counts["completed"],
+            "failed": counts["failed"],
+            "cancelled": counts["cancelled"],
+            "abandoned": counts["abandoned"],
+            "stale_running_leases": len(stale),
+        }
+        # ADR-030: additive read-only capacity-planning block
+        planning = {}
+        if hasattr(store, "capacity_snapshot"):
+            snap = store.capacity_snapshot(now=engine._lock_now())
+            planning = {k: snap[k] for k in (
+                "global_max_concurrency", "available_capacity",
+                "reserved_capacity", "active_reserved_capacity",
+                "reservation_pressure", "unreserved_capacity",
+                "active_scheduler_count", "active_goal_count",
+                "reserved_goal_count", "goals_below_reservation",
+                "goals_at_reservation", "goals_above_reservation",
+                "ceiling_limited_goal_count", "goals_at_ceiling",
+                "recent_ceiling_denials")}
+            out.update(planning)
+            out["goals"] = snap["goals"]
+            out["goal_weights"] = snap["goal_weights"]
+            out["goal_reservations"] = snap["goal_reservations"]
+            out["goal_ceilings"] = snap.get("goal_ceilings", [])
+        if args.json:
+            _emit(out)
+        elif planning:
+            cap = planning["global_max_concurrency"]
+            print(f"Global capacity:      {cap if cap is not None else 'unbounded'}")
+            print(f"Running:              {out['running']}")
+            print(f"Available:            {planning['available_capacity'] if planning['available_capacity'] is not None else 'unbounded'}")
+            print(f"Configured reserved:  {planning['reserved_capacity']}")
+            print(f"Active reservation:   {planning['active_reserved_capacity']}")
+            print(f"Unreserved capacity:  {planning['unreserved_capacity'] if planning['unreserved_capacity'] is not None else 'unbounded'}")
+            print()
+            print("Goals:")
+            for g in out["goals"]:
+                sat = "yes" if g["reservation_satisfied"] else "no"
+                state = g["state"]
+                ceiling = g.get("ceiling")
+                ceiling_s = ("-" if ceiling is None else str(ceiling))
+                print(f"  {g['goal_id']:<10} weight={g['weight']} "
+                      f"reservation={g['reservation']} ceiling={ceiling_s} "
+                      f"running={g['running']} queued={g['queued']} "
+                      f"satisfied={sat} state={state}")
+            if not out["goals"]:
+                print("  (no goals)")
+        else:
+            for k, v in out.items():
+                print(f"{k:<22} {v}")
+        return 0
+
+    if args.scheduler_command == "workers":
+        from arion.state.scheduler_work import SchedulerWorkStatus
+
+        workers = [r for r in store.list_work(status=SchedulerWorkStatus.RUNNING)]
+        if args.json:
+            _emit([w.to_dict() for w in workers])
+            return 0
+        for w in workers:
+            print(f"{w.work_id}  running  worker={w.worker_id}  "
+                  f"task={w.task_id}  goal={w.goal_id or '-'}  step={w.step_index}  "
+                  f"lease_expires={w.lease_expires_at}")
+        return 0
+
+    if args.scheduler_command == "queue":
+        from arion.state.scheduler_work import SchedulerWorkStatus
+
+        queued = store.list_work(status=SchedulerWorkStatus.QUEUED)
+        if args.json:
+            _emit([q.to_dict() for q in queued])
+            return 0
+        for pos, q in enumerate(queued, start=1):
+            print(f"#{pos:<4} {q.work_id}  queued  task={q.task_id}  "
+                  f"goal={q.goal_id or '-'}  step={q.step_index}  created={q.created_at}")
+        return 0
+
+    if args.scheduler_command == "show":
+        work = store.get_work(args.work_id)
+        if work is None:
+            print(f"unknown scheduler work id: {args.work_id} (fail closed)")
+            return 1
+        _emit(work.to_dict())
+        return 0
+
+    if args.scheduler_command == "reclaim":
+        from arion.state.scheduler_work import SchedulerStateError, SchedulerWorkStatus
+
+        work = store.get_work(args.work_id)
+        if work is None:
+            print(f"unknown scheduler work id: {args.work_id} (fail closed)")
+            return 1
+        if work.status != SchedulerWorkStatus.RUNNING:
+            print(f"work {args.work_id} is {work.status.value} (only RUNNING rows can be reclaimed)")
+            return 1
+        if work.lease_expires_at is None or work.lease_expires_at > engine._lock_now():
+            print(f"work {args.work_id} lease is still valid (expires {work.lease_expires_at}); "
+                  f"not reclaimed")
+            return 1
+        try:
+            store.mark_terminal(args.work_id, SchedulerWorkStatus.ABANDONED,
+                                now=engine._lock_now())
+        except SchedulerStateError as exc:
+            print(f"reclaim failed: {exc}")
+            return 1
+        print(f"reclaimed {args.work_id} -> abandoned (lease had expired)")
+        return 0
+
+    if args.scheduler_command == "weights":
+        from arion.state.scheduler_work import SchedulerRegistryError
+
+        rows = store.list_goal_weights() if hasattr(store, "list_goal_weights") else []
+        if args.json:
+            _emit(rows)
+            return 0
+        if not rows:
+            print("(no goal weights configured - all goals use the default weight 1)")
+            return 0
+        for r in rows:
+            state = "enabled" if r["enabled"] else "disabled"
+            print(f"{r['goal_id']:<24} weight={r['weight']:<5} {state:<9} "
+                  f"by={r['updated_by']}  at={r['updated_at']}")
+        return 0
+
+    if args.scheduler_command == "weight":
+        from arion.state.scheduler_work import SchedulerRegistryError
+
+        if args.scheduler_weight_command == "set":
+            try:
+                store.set_goal_weight(args.goal_id, args.weight,
+                                      enabled=not args.disable,
+                                      by=args.by, now=engine._lock_now())
+            except SchedulerRegistryError as exc:
+                print(f"invalid weight config: {exc}")
+                return 1
+            cfg = store.get_goal_weight_config(args.goal_id)
+            if args.json:
+                _emit(cfg)
+            else:
+                print(f"{args.goal_id}: weight={cfg['weight']} "
+                      f"{'disabled' if not cfg['enabled'] else 'enabled'} "
+                      f"(by {cfg['updated_by']})")
+            return 0
+        if args.scheduler_weight_command == "remove":
+            removed = store.remove_goal_weight(args.goal_id)
+            if not removed:
+                print(f"{args.goal_id}: no weight config (already default 1)")
+                return 1
+            print(f"{args.goal_id}: weight config removed (default 1 restored)")
+            return 0
+        if args.scheduler_weight_command in ("enable", "disable"):
+            enabled = args.scheduler_weight_command == "enable"
+            cfg = store.set_goal_weight_enabled(args.goal_id, enabled)
+            if cfg is None:
+                print(f"{args.goal_id}: no weight config to "
+                      f"{'enable' if enabled else 'disable'}")
+                return 1
+            print(f"{args.goal_id}: "
+                  f"{'enabled' if enabled else 'disabled'} "
+                  f"(weight={cfg['weight']})")
+            return 0
+        return 1
+
+    if args.scheduler_command == "reservations" and getattr(args, "check", False):
+        if not hasattr(store, "reservation_check"):
+            print("capacity planning is not available on this engine")
+            return 1
+        data = store.reservation_check()
+        if args.json:
+            _emit(data)
+        else:
+            cap = data["global_max"]
+            print(f"Global capacity:      {cap if cap is not None else 'unbounded'}")
+            print(f"Configured total:     {data['configured_total']}")
+            print(f"Active reservation:   {data['active_reservation']}")
+            print(f"Reservation pressure: {data['reservation_pressure']}")
+            print(f"Unreserved capacity:  {data['unreserved_capacity'] if data['unreserved_capacity'] is not None else 'unbounded'}")
+            print(f"Feasible:             {'yes' if data['feasible'] else 'no'}"
+                  + (f" (overflow {data['overflow']})" if data["overflow"] else ""))
+            print(f"Goals below floor:    {', '.join(data['goals_below']) or '-'}")
+            print(f"Idle reserved goals:  {', '.join(data['idle_reserved_goals']) or '-'}")
+            print(f"Goals at ceiling:     {', '.join(data['goals_at_ceiling']) or '-'}")
+        return 0 if data["feasible"] else 1
+
+    if args.scheduler_command == "reservations":
+        rows = (store.list_goal_reservations()
+                if hasattr(store, "list_goal_reservations") else [])
+        if args.json:
+            _emit(rows)
+            return 0
+        if not rows:
+            print("(no goal reservations configured - all goals have floor 0)")
+            return 0
+        total = sum(int(r["reservation"]) for r in rows if r["enabled"])
+        for r in rows:
+            state = "enabled" if r["enabled"] else "disabled"
+            print(f"{r['goal_id']:<24} reservation={r['reservation']:<5} "
+                  f"{state:<9} by {r['updated_by']} @ {r['updated_at']}")
+        print(f"(reserved_capacity={total})")
+        return 0
+
+    if args.scheduler_command == "reservation":
+        from arion.state.scheduler_work import SchedulerRegistryError
+
+        if args.scheduler_reservation_command == "plan":
+            if not hasattr(store, "simulate_reservation_change"):
+                print("capacity planning is not available on this engine")
+                return 1
+            try:
+                sim = store.simulate_reservation_change(
+                    args.goal_id, args.capacity)
+            except SchedulerRegistryError as exc:
+                print(f"invalid reservation plan: {exc}")
+                return 1
+            if args.json:
+                _emit(sim)
+            else:
+                cap = sim["global_max"]
+                print(f"goal={sim['goal_id']} reservation "
+                      f"{sim['current_reservation']} -> "
+                      f"{sim['proposed_reservation']} "
+                      f"(enabled={sim['current_enabled']})")
+                print(f"totals: {sim['current_total']} -> "
+                      f"{sim['proposed_total']} "
+                      f"(global cap {cap if cap is not None else 'unbounded'})")
+                print(f"feasible={'yes' if sim['feasible'] else 'no'} "
+                      f"overflow={sim['overflow']} "
+                      f"remaining={sim['remaining_capacity']}")
+                print(f"pressure: {sim['pressure_delta']} "
+                      f"({sim['reservation_pressure_now']} -> "
+                      f"{sim['reservation_pressure_proposed']})")
+                print("dry-run only: nothing was persisted")
+            return 0
+        if args.scheduler_reservation_command == "set":
+            try:
+                store.set_goal_reservation(args.goal_id, args.capacity,
+                                           enabled=not args.disable,
+                                           by=args.by, now=engine._lock_now())
+            except SchedulerRegistryError as exc:
+                print(f"invalid reservation config: {exc}")
+                return 1
+            cfg = store.get_goal_reservation_config(args.goal_id)
+            if args.json:
+                _emit(cfg)
+            else:
+                print(f"{args.goal_id}: reservation={cfg['reservation']} "
+                      f"{'disabled' if not cfg['enabled'] else 'enabled'} "
+                      f"(by {cfg['updated_by']})")
+            return 0
+        if args.scheduler_reservation_command == "remove":
+            removed = store.remove_goal_reservation(args.goal_id)
+            if not removed:
+                print(f"{args.goal_id}: no reservation config (floor 0)")
+                return 1
+            print(f"{args.goal_id}: reservation removed (floor 0 restored)")
+            return 0
+        if args.scheduler_reservation_command in ("enable", "disable"):
+            enabled = args.scheduler_reservation_command == "enable"
+            cfg = store.set_goal_reservation_enabled(args.goal_id, enabled)
+            if cfg is None:
+                print(f"{args.goal_id}: no reservation config to "
+                      f"{'enable' if enabled else 'disable'}")
+                return 1
+            print(f"{args.goal_id}: "
+                  f"{'enabled' if enabled else 'disabled'} "
+                  f"(reservation={cfg['reservation']})")
+            return 0
+        return 1
+
+    if args.scheduler_command == "ceilings":
+        rows = (store.list_goal_ceilings()
+                if hasattr(store, "list_goal_ceilings") else [])
+        if args.json:
+            _emit(rows)
+            return 0
+        if not rows:
+            print("(no goal ceilings configured - all goals are unbounded)")
+            return 0
+        for r in rows:
+            state = "enabled" if r["enabled"] else "disabled"
+            print(f"{r['goal_id']:<24} ceiling={r['ceiling']:<5} "
+                  f"{state:<9} by {r['updated_by']} @ {r['updated_at']}")
+        return 0
+
+    if args.scheduler_command == "ceiling":
+        from arion.state.scheduler_work import SchedulerRegistryError
+
+        if args.scheduler_ceiling_command == "plan":
+            if not hasattr(store, "simulate_ceiling_change"):
+                print("capacity planning is not available on this engine")
+                return 1
+            try:
+                sim = store.simulate_ceiling_change(args.goal_id,
+                                                    args.capacity)
+            except SchedulerRegistryError as exc:
+                print(f"invalid ceiling plan: {exc}")
+                return 1
+            if args.json:
+                _emit(sim)
+            else:
+                cur = sim["current_ceiling"]
+                print(f"goal={sim['goal_id']} ceiling "
+                      f"{cur if cur is not None else 'unbounded'} -> "
+                      f"{sim['proposed_ceiling']}")
+                print(f"floor={sim['floor']} "
+                      f"floor<=ceiling={'yes' if sim['floor_ceiling_valid'] else 'no'} "
+                      f"headroom {sim['ceiling_headroom_now']} -> "
+                      f"{sim['ceiling_headroom_proposed']} "
+                      f"({sim['headroom_delta']})")
+                print("dry-run only: nothing was persisted")
+            return 0
+        if args.scheduler_ceiling_command == "set":
+            try:
+                store.set_goal_ceiling(args.goal_id, args.capacity,
+                                       enabled=not args.disable,
+                                       by=args.by, now=engine._lock_now())
+            except SchedulerRegistryError as exc:
+                print(f"invalid ceiling config: {exc}")
+                return 1
+            cfg = store.get_goal_ceiling_config(args.goal_id)
+            if args.json:
+                _emit(cfg)
+            else:
+                print(f"{args.goal_id}: ceiling={cfg['ceiling']} "
+                      f"{'disabled' if not cfg['enabled'] else 'enabled'} "
+                      f"(by {cfg['updated_by']})")
+            return 0
+        if args.scheduler_ceiling_command == "remove":
+            removed = store.remove_goal_ceiling(args.goal_id)
+            if not removed:
+                print(f"{args.goal_id}: no ceiling config (unbounded)")
+                return 1
+            print(f"{args.goal_id}: ceiling removed (unbounded restored)")
+            return 0
+        if args.scheduler_ceiling_command in ("enable", "disable"):
+            enabled = args.scheduler_ceiling_command == "enable"
+            cfg = store.set_goal_ceiling_enabled(args.goal_id, enabled)
+            if cfg is None:
+                print(f"{args.goal_id}: no ceiling config to "
+                      f"{'enable' if enabled else 'disable'}")
+                return 1
+            print(f"{args.goal_id}: "
+                  f"{'enabled' if enabled else 'disabled'} "
+                  f"(ceiling={cfg['ceiling']})")
+            return 0
+        return 1
+
+    if args.scheduler_command == "watch":
+        if not hasattr(store, "scheduler_events"):
+            print("scheduler telemetry is not available on this engine")
+            return 1
+        if args.limit < 1 or args.limit > 1000:
+            print("watch --limit must be in [1, 1000] (bounded; fail closed)")
+            return 1
+        if args.follow:
+            return _scheduler_watch_follow(args, store, engine)
+
+        def _human(e):
+            d = e.detail
+            who = (d.get("worker_id") or d.get("scheduler_id") or "-")
+            goal = d.get("goal_id") or "-"
+            work = d.get("work_id") or "-"
+            extra = ""
+            if e.kind in ("work.claimed", "work.heartbeat", "work.reclaimed"):
+                extra = f" lease={d.get('lease_expires_at', '-')}"
+            if e.kind in ("work.claim_denied", "capacity.denied",
+                          "scheduler_share.denied", "goal_weight.denied",
+                          "reservation.denied"):
+                extra = f" reason={d.get('reason', '-')}"
+                if e.kind == "reservation.denied":
+                    extra += (f" pressure={d.get('pressure', '-')} "
+                              f"reserved={d.get('reserved_capacity', '-')}")
+            if e.kind == "goal_weight.refill":
+                extra = (f" weight={d.get('weight')} "
+                         f"credit={d.get('credit_before')}->{d.get('credit_after')}")
+            if e.kind == "scheduler.config_changed":
+                extra = f" config={d.get('config')} ({d.get('reason', '-')})"
+            if e.kind == "reservation.satisfied":
+                extra = (f" reservation={d.get('reservation')} "
+                         f"running={d.get('running')}")
+            if e.kind == "goal_reservation_changed":
+                extra = f" config={d.get('config')} ({d.get('outcome', '-')} {d.get('reason', '')})"
+            if e.kind == "goal_ceiling_changed":
+                extra = f" config={d.get('config')} ({d.get('outcome', '-')} {d.get('reason', '')})"
+            if e.kind == "ceiling.denied":
+                extra = (f" reason={d.get('reason', '-')} "
+                         f"running={d.get('running')} "
+                         f"ceiling={d.get('ceiling')}")
+            print(f"{e.ts}  {e.kind:<24} who={who:<20} goal={goal:<12} "
+                  f"work={work:<12}{extra}")
+
+        events = store.scheduler_events(
+            scheduler_id=args.scheduler, goal_id=args.goal, work_id=args.work,
+            event_type=args.type, since=args.since, limit=args.limit)
+        if args.json:
+            _emit([{"id": e.id, "ts": e.ts, "kind": e.kind,
+                    "detail": e.detail, "success": e.success}
+                   for e in events])
+        else:
+            for e in events:
+                _human(e)
+        return 0
+
+    return 1
+
+
+def _scheduler_watch_follow(args, store, engine) -> int:
+    """Bounded polling watch mode (ADR-028 Phase F): prints NEW events each
+    poll. READ-ONLY: no mutation, no registration, no heartbeat, no claims.
+    Ctrl-C (KeyboardInterrupt) exits cleanly; the in-memory cursor is the
+    only state, so memory growth is bounded."""
+    import time as _time
+
+    if not hasattr(store, "oldest_scheduler_event"):
+        print("scheduler telemetry is not available on this engine")
+        return 1
+    # start from the newest event so the first poll prints only new ones
+    recent = store.recent_scheduler_events(limit=1)
+    last_id = recent[0].id if recent else None
+    interval = max(0.5, float(getattr(args, "follow_interval", 2.0)))
+    print("watching scheduler events (Ctrl-C to stop)...", flush=True)
+    try:
+        while True:
+            rows = store.scheduler_events(
+                scheduler_id=args.scheduler, goal_id=args.goal,
+                work_id=args.work, event_type=args.type, since=args.since,
+                limit=args.limit)
+            for e in rows:
+                if last_id is None or e.id != last_id:
+                    print(f"{e.ts}  {e.kind:<24} "
+                          f"who={(e.detail.get('worker_id') or e.detail.get('scheduler_id') or '-'):<20} "
+                          f"goal={e.detail.get('goal_id', '-'):<12} "
+                          f"work={e.detail.get('work_id', '-'):<12}",
+                          flush=True)
+            if rows:
+                last_id = rows[-1].id
+            _time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nwatch stopped (no mutation performed)", flush=True)
+        return 0
 
 
 def _locks_command(args, engine) -> int:
@@ -565,6 +1192,14 @@ def _goals_command(args, engine) -> int:
         if not summary.get("exists"):
             print(f"goal {args.goal_id} not found")
             return 1
+        # Additive ADR-015 addendum (Phase C): bounded, clearly-labeled
+        # strategy-learning summary - informational evidence, distinct from
+        # the authoritative goal state above. Existing keys/output preserved.
+        outcomes = gm.strategy_outcomes(args.goal_id, limit=1000)
+        outcome_counts = {"superseded": 0, "succeeded": 0, "failed": 0}
+        for r in outcomes:
+            outcome_counts[r["outcome"]] = outcome_counts.get(r["outcome"], 0) + 1
+        summary["strategy_outcomes"] = outcome_counts
         if args.json:
             _emit(summary)
             return 0
@@ -578,17 +1213,92 @@ def _goals_command(args, engine) -> int:
                   + (f" (task {b.get('task_id')} step {b.get('step_index')})" if b.get("task_id") else ""))
         print(f"  progress: {summary['progress']}")
         print(f"  tasks: {summary['tasks']}")
+        print(f"  learned strategy outcomes (informational): "
+              f"{outcome_counts['succeeded']} succeeded, "
+              f"{outcome_counts['failed']} failed, "
+              f"{outcome_counts['superseded']} superseded")
         return 0
 
     if args.goals_command == "progress":
-        result, goal = gm.evaluate(args.goal_id)
+        # READ-ONLY progress peek (ADR-016 addendum Phase C/D): the public
+        # non-mutating peek_evaluate() computes the same deterministic
+        # evaluation WITHOUT persisting progress_metadata /
+        # last_evaluated_at / updated_at and WITHOUT emitting
+        # progress.evaluated / goal.evaluated. The authoritative lifecycle
+        # (engine run_goal) keeps using the mutating evaluate().
+        goal = gm.get_goal(args.goal_id)
+        if goal is None:
+            print(f"goal {args.goal_id} not found")
+            return 1
+        result = gm.peek_evaluate(args.goal_id)
+        if result is None:
+            print(f"goal {args.goal_id} not found")
+            return 1
         if args.json:
-            _emit({"evaluation": result.to_dict(), "goal": goal.to_dict()})
+            _emit({"goal_id": args.goal_id,
+                   "evaluation": result.to_dict(),
+                   "status": goal.status_value,
+                   "progress_metadata": goal.progress_metadata})
             return 0
         print(f"goal {args.goal_id}: progress={result.progress:.2f} status={result.status} next_action={result.next_action}")
         print(f"  evidence: {result.evidence}")
         if result.blockers:
             print(f"  blockers: {result.blockers}")
+        return 0
+
+    if args.goals_command == "diff":
+        # Read-only structural diff of two immutable plan versions.
+        try:
+            va = int(args.version_a)
+            vb = int(args.version_b)
+        except (TypeError, ValueError):
+            print(f"error: versions must be positive integers, got "
+                  f"{args.version_a!r} and {args.version_b!r} (fail closed)")
+            return 1
+        try:
+            d = gm.diff_plans(args.goal_id, va, vb)
+        except ValueError as exc:
+            print(f"error: {exc}")
+            return 1
+        if args.json:
+            _emit(d)
+            return 0
+        if d["identical"]:
+            print(f"goal {args.goal_id}: v{args.version_a} and "
+                  f"v{args.version_b} are identical (empty diff)")
+            return 0
+        print(f"goal {args.goal_id}: v{args.version_a} "
+              f"({d['strategy_a']}) vs v{args.version_b} "
+              f"({d['strategy_b']})")
+        print(f"  steps: {d['steps_a']} -> {d['steps_b']}")
+        print(f"  added:   {d['added']}")
+        print(f"  removed: {d['removed']}")
+        print(f"  kept:    {d['kept']}")
+        return 0
+
+    if args.goals_command == "rollback":
+        # Thin CLI wrapper around the single re-adoption mechanism
+        # (GoalManager.readopt_plan) - no second rollback implementation.
+        try:
+            version = int(args.version)
+        except (TypeError, ValueError):
+            print(f"error: version must be a positive integer, got "
+                  f"{args.version!r} (fail closed)")
+            return 1
+        try:
+            record = gm.readopt_plan(args.goal_id, version)
+        except ValueError as exc:
+            print(f"error: {exc}")
+            return 1
+        if args.json:
+            _emit({"goal_id": args.goal_id,
+                   "plan_version": record["plan_version"],
+                   "strategy": record["strategy"],
+                   "reason": record["reason"]})
+            return 0
+        print(f"goal {args.goal_id}: re-adopted plan v{args.version} as "
+              f"v{record['plan_version']} (strategy={record['strategy']}, "
+              f"reason={record['reason']})")
         return 0
 
     from arion.state.models import GoalStateError
@@ -728,8 +1438,113 @@ def _cognition_command(args, engine) -> int:
             return 0
         print(f"goal {args.goal_id}: {len(history)} plan version(s)")
         for h in history:
-            print(f"  v{h['plan_version']} strategy={h['strategy']} steps={len(json.loads(h['plan_summary']))} at {h['created_at']}")
+            print(f"  v{h['plan_version']} strategy={h['strategy']} steps={len(h['plan_summary'])} at {h['created_at']}")
         print(f"progress: {gm.progress(args.goal_id)}")
+        return 0
+
+    if args.cognition_command == "strategies":
+        # Read-only inspection of learned strategy outcomes (ADR-015 addendum
+        # Phase C). Informational only - never mutates anything.
+        store = cognition.cognition
+        if args.goal is not None and args.goal == "":
+            print("error: --goal must be a non-empty goal id (fail closed)")
+            return 1
+        if not (1 <= args.limit <= 1000):
+            print(f"error: --limit must be within [1, 1000], got {args.limit} "
+                  f"(fail closed)")
+            return 1
+        rows = store.list_strategy_outcomes(goal_id=args.goal, limit=args.limit)
+        if args.json:
+            # ADR-015 design §8: "no content, ids + counts only" - the
+            # free-text goal_description stays in the durable row (context
+            # for selection) but is never emitted by the CLI (E4).
+            _emit([{k: v for k, v in r.items() if k != "goal_description"}
+                   for r in rows])
+            return 0
+        for r in rows:
+            print(f"{r['goal_id']}  v{r['plan_version']}  "
+                  f"{r['strategy']:<24} {r['outcome']:<11} "
+                  f"{(r['reason'] or '')[:120]}")
+        return 0
+
+    if args.cognition_command == "prune-superseded":
+        # Superseded-history pruning (ADR-014): ACTIVE beliefs are never
+        # pruned; bounded, fail-closed, deterministic.
+        from arion.observability.events import AuditEvent
+
+        store = cognition.cognition
+        try:
+            removed = store.prune_superseded_beliefs(
+                older_than=args.older_than,
+                keep_versions=args.keep_versions,
+                batch_size=args.batch_size,
+                dry_run=args.dry_run,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}")
+            return 1
+        detail = {
+            "scope": "cognition.beliefs",
+            "episodes": 0,
+            "reflections": 0,
+            "beliefs": removed,
+            "goal_plans": 0,
+            "cutoff": args.older_than,
+            "limit": args.keep_versions,
+            "dry_run": args.dry_run,
+        }
+        if args.json:
+            _emit(detail)
+        elif args.dry_run:
+            print(f"cognition prune-superseded (dry-run): would remove "
+                  f"{removed} superseded belief(s) "
+                  f"[cutoff={args.older_than}, keep_versions={args.keep_versions}]")
+        else:
+            print(f"cognition prune-superseded: removed {removed} "
+                  f"superseded belief(s) "
+                  f"[cutoff={args.older_than}, keep_versions={args.keep_versions}]")
+        if not args.dry_run:
+            engine.events.emit(AuditEvent(kind="memory.pruned", detail=detail))
+        return 0
+
+    if args.cognition_command == "prune-plans":
+        # Replan-history bounding (ADR-014): the LATEST plan version per
+        # goal is never pruned; bounded, fail-closed, deterministic.
+        from arion.observability.events import AuditEvent
+
+        store = cognition.cognition
+        try:
+            removed = store.prune_goal_plans(
+                goal_id=args.goal,
+                keep_latest=args.keep_latest,
+                batch_size=args.batch_size,
+                dry_run=args.dry_run,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}")
+            return 1
+        detail = {
+            "scope": "cognition.goal_plans",
+            "episodes": 0,
+            "reflections": 0,
+            "beliefs": 0,
+            "goal_plans": removed,
+            "cutoff": None,
+            "limit": args.keep_latest,
+            "goal_id": args.goal,
+            "dry_run": args.dry_run,
+        }
+        if args.json:
+            _emit(detail)
+        elif args.dry_run:
+            print(f"cognition prune-plans (dry-run): would remove {removed} "
+                  f"historical plan(s) [goal={args.goal}, "
+                  f"keep_latest={args.keep_latest}]")
+        else:
+            print(f"cognition prune-plans: removed {removed} historical "
+                  f"plan(s) [goal={args.goal}, keep_latest={args.keep_latest}]")
+        if not args.dry_run:
+            engine.events.emit(AuditEvent(kind="memory.pruned", detail=detail))
         return 0
 
     print(f"unknown cognition command: {args.cognition_command}")
@@ -750,6 +1565,33 @@ def _memory_command(args, engine) -> int:
             print(json.dumps(obj, indent=2, default=str))
         else:
             print(obj)
+
+    if args.memory_command == "inspect":
+        episode = memory.get_episode(args.episode_id)
+        if episode is None:
+            print(f"episode {args.episode_id!r} not found")
+            return 1
+        if args.json:
+            _emit(episode.to_dict())
+            return 0
+        d = episode.to_dict()
+        print(f"episode={d['episode_id']}  outcome={d['outcome']}  "
+              f"lifecycle={d.get('lifecycle', 'recorded')}  "
+              f"importance={d['importance']:.2f}")
+        print(f"task={d.get('task_id')}  goal_id={d.get('goal_id')}  "
+              f"goal={d['goal'][:120]!r}")
+        print(f"tags={d['tags'][:10]}")
+        print(f"steps={len(d['plan_summary'])}  actions={len(d['actions'])}  "
+              f"failures={len(d['failures'])}  "
+              f"reflection={d.get('reflection_id')}")
+        for f in d["failures"][:3]:
+            print(f"  failure step={f.get('step')} "
+                  f"{f.get('capability')}/{f.get('action')} "
+                  f"category={f.get('category')} "
+                  f"error={(f.get('error') or '')[:120]!r}")
+        if d.get("authorization", {}).get("denials"):
+            print(f"  denials={len(d['authorization']['denials'])}")
+        return 0
 
     if args.memory_command == "episodes":
         from arion.memory.models import EpisodeFilter
@@ -824,6 +1666,52 @@ def _memory_command(args, engine) -> int:
                   f"(category={record.category}, sources={record.source_episode_ids})")
             print(f"  lesson: {record.merged_lesson[:200]}")
         print(f"{len(records)} consolidation record(s) created")
+        return 0
+
+    if args.memory_command == "prune":
+        # Explicit archival (ADR-014): bounded, fail-closed, deterministic.
+        from arion.observability.events import AuditEvent
+
+        try:
+            reflections_before = memory.count_reflections()
+            removed = memory.prune(
+                older_than=args.older_than,
+                max_episodes=args.max_episodes,
+                keep_importance=args.keep_importance,
+                batch_size=args.batch_size,
+                dry_run=args.dry_run,
+            )
+            reflections_removed = reflections_before - memory.count_reflections()
+        except ValueError as exc:
+            print(f"error: {exc}")
+            return 1
+        detail = {
+            "scope": "memory.episodes",
+            "episodes": removed,
+            "reflections": reflections_removed,
+            "beliefs": 0,
+            "goal_plans": 0,
+            "cutoff": args.older_than,
+            "limit": args.max_episodes,
+            "dry_run": args.dry_run,
+        }
+        if args.json:
+            _emit(detail)
+        elif args.dry_run:
+            # Dry-run reports episode candidates only: a diff-based reflection
+            # count would always be 0 (nothing is deleted), so it is omitted.
+            print(f"memory prune (dry-run): would remove {removed} episode(s) "
+                  f"[cutoff={args.older_than}, max_episodes={args.max_episodes}, "
+                  f"keep_importance={args.keep_importance}]")
+        else:
+            print(f"memory prune: removed {removed} episode(s), "
+                  f"{reflections_removed} reflection(s) "
+                  f"[cutoff={args.older_than}, max_episodes={args.max_episodes}, "
+                  f"keep_importance={args.keep_importance}]")
+        if not args.dry_run:
+            # Observational audit (ADR-028 rule): counts + criteria only,
+            # never content. Dry-runs emit nothing (they never mutate).
+            engine.events.emit(AuditEvent(kind="memory.pruned", detail=detail))
         return 0
 
     print(f"unknown memory command: {args.memory_command}")

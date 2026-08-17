@@ -95,14 +95,17 @@ Every step is decided by a permission policy over
   machine: authorization gate, retries, verification policies, checkpointing,
   recovery, the long-horizon `run_goal` loop).
 - `arion/cognition` — `GoalManager` (authoritative goal state machine,
-  plan versioning, progress evaluation), `DeterministicProgressEvaluator`
+  plan versioning, progress evaluation, `readopt_plan` re-adoption +
+  `diff_plans` deterministic diff, `peek_evaluate` read-only evaluation
+  seam), `DeterministicProgressEvaluator`
   (model-independent evaluation seam), `StrategySelector` (explainable
   strategy selection + escalation), `SQLiteCognitiveStore` (goal_plans,
   beliefs, environment facts), `WorldStateMonitor` (versioned facts +
   change detection).
 - `arion/observability` — `AuditEvent` vocabulary, `EventLogger`, JSONL sink.
 - `arion/interfaces` — CLI (`run`, `resume`, `status`, `tasks`, `events`,
-  `capabilities`, `goals list|show|progress|pause|resume|cancel`,
+  `capabilities`,
+  `goals list|show|diff|rollback|progress|pause|resume|cancel`,
   `approvals list|show|approve|deny`).
 - `arion/memory` — `MemoryStore` protocol + `SQLiteMemoryStore` (episodic
   memories + reflections tables), `MemoryRetriever` (deterministic scoring +
@@ -161,6 +164,27 @@ Memory is INFORMATIONAL — it never authorizes (`Memory ≠ Authority`):
   `planning.memory.influence` audits which memories influenced each plan.
 - **Poisoning defenses**: adversarial memory/reflection content stays
   informational; all authorization answers come from the current policy.
+- **Lifecycle idempotency (addendum):** exactly ONE durable episode per
+  task (`get_episode_by_task` + a DB-level UNIQUE index on
+  `episodic_memories.task_id` as the cross-process backstop; init-time
+  merge of pre-idempotency duplicates keeps the newest row — a bug-artifact
+  merge, never archival pruning). Episodes carry a durable `lifecycle`
+  state: `recorded` → `reflected` → `consolidated`; `recorded` is the
+  retryable state, so a crash mid-learning resumes instead of duplicating.
+- **Catch-up learning:** `engine.learn_from_terminal_tasks()` is an
+  idempotent, restart-safe pass that records episodes for every terminal
+  task that lacks one — recovering experience lost when a process crashed
+  between the durable task save and the episode write (bounded
+  `memory.learning.catchup` event; never touches scheduler authority).
+- **Query-aware retrieval precision (addendum):** `retrieve` /
+  `build_planning_context` accept an optional `capabilities` set; the
+  engine passes the planner's requirement heuristic, so capability tags
+  count as a relevance signal only when they match the task's likely
+  capabilities (an http.get task never receives filesystem.read memory).
+  Direct callers without the hint keep the original semantics.
+- **CLI diagnostics:** `arion memory episodes|reflections|search|stats|
+  consolidate` plus `memory inspect <episode_id>` (read-only, bounded,
+  secret-free; human + `--json`).
 
 ## Cognitive State / World Model v1 (ADR-014)
 
@@ -178,16 +202,47 @@ confidence, timestamps, and source (deterministic|model);
 `SQLiteCognitiveStore` (same DB file; restart-safe). **Informational only** —
 beliefs can never authorize (tested).
 
-- **Archival/pruning seam:** consolidation preserves history, so it does not
-  bound storage; `MemoryStore.prune` is the designed (not-yet-implemented)
-  seam for a future archival policy — memory is never deleted.
+- **Archival policy (ADR-014 addendum, implemented):** explicit,
+  operator-invoked, bounded-batched (ADR-028 SELECT-then-DELETE pattern),
+  fail-closed pruning — memory/cognition is never silently deleted:
+  - `SQLiteMemoryStore.prune(older_than, max_episodes, keep_importance=0.0,
+    batch_size=500, dry_run=False) -> int` — age/count pruning of episodes
+    (never recent, never high-importance when a floor is set); reflections
+    are pruned WITH their episodes; CONSOLIDATIONS are never pruned; at
+    least one criterion required; idempotent; touches only
+    `episodic_memories` + `reflections`.
+  - `SQLiteCognitiveStore.prune_superseded_beliefs(older_than,
+    keep_versions=1, batch_size=500, dry_run=False)` — superseded-history
+    pruning; ACTIVE beliefs are never pruned; the newest `keep_versions`
+    rows per belief lineage (category+statement) are always retained.
+  - `SQLiteCognitiveStore.prune_goal_plans(goal_id=None, keep_latest=10,
+    batch_size=500, dry_run=False)` — replan-history bounding; the latest
+    immutable plan version per goal is never pruned (replay safety).
+  - `--dry-run` never mutates (byte-identical DB; emits no event); real
+    prunes emit a bounded `memory.pruned` audit event (counts + criteria
+    only, never content). Preferences and environment facts are already
+    bounded per key — no prune needed (stale facts are flagged, never
+    deleted). Pruning is storage hygiene with NO authority influence:
+    scheduler/task/goal authority, leases, ownership, reservations,
+    ceilings, weights, DWRR credit, and execution state stay
+    byte-identical (adversarial-tested); forged telemetry/metadata/ids and
+    oversized values fail closed.
+  - **Consolidation-fed beliefs:** `refresh_from_memory(limit=20,
+    include_consolidations=False)` optionally lifts merged consolidation
+    lessons into procedural beliefs with complete provenance
+    (`episode_ids` + `consolidation_ids`); default False preserves the
+    original behavior; idempotent, deterministic supersession,
+    informational only.
 - **Strategy-level learning:** `apply_guidance_to_steps` is non-mutating,
   registry-aware (ActionSpec.resource_param — no hardcoded `path`), and can
   substitute actions (different decomposition) with verification adopted from
   the registry. `PlanTransformation` retains original + transformed plans with
   per-decision provenance; audited via `planning.memory.transformation`; each
   transformed step carries its provenance.
-- CLI: `arion cognition beliefs|preferences|environment|snapshot|world|goals [--json]`.
+- CLI: `arion cognition beliefs|preferences|environment|snapshot|world|goals|prune-superseded|prune-plans [--json]`;
+  `arion memory prune [--older-than TS] [--max-episodes N] [--keep-importance F]
+  [--batch-size N] [--dry-run] [--json]` — exit 0 on success (incl. dry-run),
+  1 on invalid input (fail closed); deterministic output.
 
 ## World State → Long-Horizon Goals (ADR-015)
 
@@ -547,6 +602,377 @@ loop (ADR-016):
   offline): parallel reads, same-resource FIFO serialization, different-
   resource concurrency, blocked mutation not stalling reads, restart/cancel/
   shutdown with no orphan work.
+
+## Cross-Goal Durable Concurrency (ADR-025)
+
+- **Scope:** multiple goals/tasks share ONE bounded in-process scheduler
+  (`ArionEngine.run_tasks`/`run_goals`) with a global `max_concurrency`
+  (default 1 = historical behavior). Total running workers never exceed the
+  bound; independent tasks execute concurrently; a blocked/approval-pending/
+  recovery-gated goal consumes no worker and never stalls the others.
+- **Durable scheduler registry:** `arion/state/scheduler_work.py` +
+  `scheduler_work` table (typed store protocol, no raw SQLite from the
+  engine/CLI). States QUEUED/RUNNING/COMPLETED/FAILED/CANCELLED/ABANDONED
+  with legal transitions enforced by typed errors (fail closed); bounded
+  metadata only (ids, task/goal/step refs, scheduler + worker identity,
+  timestamps, lease, truncated error) — never threads/callables/stack
+  traces/capability outputs/model output/prompts/file contents/secrets.
+- **Restart/crash recovery:** engine construction reclaims expired RUNNING
+  leases (ABANDONED — no immortal RUNNING) and abandons dead schedulers'
+  QUEUED rows; tasks re-run the full fresh authorization/recovery path;
+  completed mutations are never replayed; stale mutation locks are reclaimed
+  through the existing lock store; approval, FIFO waiter positions and
+  mutation-lock state survive restarts (incl. a real-subprocess crash test).
+- **Fairness:** rounds rotate tasks round-robin with a per-task per-round
+  cap of `ceil(max_concurrency / active_tasks)` — a goal with many steps
+  cannot starve a goal with one (bounded window = one round). Strictly
+  scheduler coordination; never authorization.
+- **Safe parking:** a mutating step whose resource is locked by another
+  task registers a durable FIFO waiter and consumes NO worker; the durable
+  waiter row is the deadline authority (forged leases cannot extend waits).
+- **CLI:** `arion scheduler status|workers|queue|show <id>|reclaim <id>`
+  (bounded, metadata-only, secret-free, restart-safe, fails closed on
+  unknown ids; reclaim only abandons expired RUNNING leases).
+- **Authority boundary (unchanged and regression-tested):** scheduler
+  coordinates execution; the durable lock store coordinates mutation
+  ownership; only live authorization permits execution. Scheduler state is
+  never authorization state.
+- **Demo:** `scripts/demo_adr025_cross_goal_concurrency.py` (29 checks,
+  deterministic, offline): concurrent goals, same-resource FIFO writes,
+  approval-pending/recovery-gated goals not stalling others, multi-goal
+  restart without duplicate mutations, fairness.
+
+## Cross-Process Shared Scheduler (ADR-026)
+
+- **Scope:** multiple Arion engine processes share ONE scheduler/work
+  registry database. Every process gets a unique durable scheduler
+  REGISTRATION (lease + lazy heartbeat); `abandon_foreign_queued` now keys
+  on registration liveness, so a live peer's queue is never abandoned.
+- **Lease-based ownership:** every dispatched work item is atomically
+  CLAIMED (`BEGIN IMMEDIATE`: lazy stale reclaim + cross-process capacity +
+  QUEUED→RUNNING with a bounded worker lease). Heartbeats are
+  ownership-checked, monotonic (`now >= started_at`), bounded
+  (`expiry <= started_at + max_lease`) and stale-rejected; `mark_terminal`
+  from RUNNING requires the current owner (a stale owner can never
+  complete/fail work after expiry or reassignment).
+- **Atomic handoff:** `release_and_claim_next` completes one row and claims
+  the next in ONE transaction (release_and_select_next-style); racing
+  processes produce exactly one owner.
+- **Cross-process capacity + fair share:** optional durable
+  `global_max_concurrency` enforced inside every claim across ALL processes
+  (lazy in-transaction reclaim means a crashed process never permanently
+  consumes capacity). Fair-share admission (ceil(cap/active) per scheduler)
+  prevents a hot claimer from monopolizing capacity; unset cap preserves
+  ADR-025 behavior exactly.
+- **Crash recovery:** dead registrations → QUEUED rows abandoned; expired
+  leases → RUNNING rows reclaimed (no immortal RUNNING); stale mutation
+  locks reclaimed via the existing lock store; completed mutations never
+  replay; approval/recovery gates unchanged.
+- **Thread safety:** `SQLiteCognitiveStore`/`SQLiteMemoryStore` gained the
+  same RLock + `check_same_thread=False` guard as `SQLiteStorage`.
+- **Demo:** `scripts/demo_adr026_cross_process_scheduler.py` (33 checks,
+  deterministic, offline): registration/claim/heartbeat primitives,
+  two-process claim race, global capacity across engines, stopped-heartbeat
+  reclaim, stale-owner rejection, atomic handoff, crash recovery, multi-
+  goal restart without duplicate mutations. Real subprocess coverage in
+  `tests/test_multi_process_scheduler.py`.
+
+## Durable Per-Goal Capacity Shares + Weighted Fair Scheduling (ADR-027)
+
+- **Scope:** the ADR-026 cross-process scheduler becomes GOAL-AWARE. A
+  durable per-goal weight config (`scheduler_goal_weights`: goal_id,
+  positive bounded integer weight, enabled flag, updated_by/at) plus
+  durable DWRR credit (`scheduler_goal_state`) extend the atomic claim
+  transaction; unconfigured goals use the deterministic default weight 1
+  and no global cap ⇒ behavior identical to ADR-026.
+- **Weighted admission (deterministic DWRR inside `BEGIN IMMEDIATE`):**
+  contending goals = goals with QUEUED/RUNNING rows; when a claim is
+  attempted and NO contending goal holds credit, every contending enabled
+  goal is refilled by its weight (deficit bounded at max(weight, 2×cap)
+  and clamped at spend time); a claim is granted iff the goal's credit ≥ 1
+  (debited 1) after the global-cap and scheduler fair-share gates. A
+  weight-2 goal gets exactly 2× the claims of a weight-1 goal per round
+  under sustained contention; every contending goal claims at least once
+  per round (no starvation); idle goals reserve nothing; the global cap is
+  never exceeded.
+- **Dynamic policy:** weight changes apply to future refills only; RUNNING
+  work stays owned; no retroactive cancellation, no capacity duplication;
+  the durable deficit is the only fairness state (restart-safe, no
+  in-memory counter).
+- **Authority boundary:** weights are scheduler POLICY — planner output,
+  model output, memory, guidance, task metadata, worker input can never
+  establish or elevate a weight; forged deficits cannot exceed the global
+  cap, bypass the scheduler fair share, or grant ownership (heartbeat/
+  terminal/handoff stay owner-checked).
+- **CLI:** `arion scheduler weights`, `scheduler weight set <goal> <w>
+  [--disable] [--by]`, `scheduler weight remove|enable|disable <goal>`.
+- **Demo:** `scripts/demo_adr027_weighted_scheduler.py` (31 checks,
+  deterministic, offline): default/equal/2:1/2:1:1/low-weight progress/
+  cap enforcement/cross-process/dynamic change/restart/adversarial.
+
+## Scheduler observability / telemetry (ADR-028)
+
+- **Scope:** the existing bounded audit abstraction (`AuditEvent` +
+  `audit_events`) is extended — no second event system — with a durable,
+  bounded, queryable telemetry layer for the scheduler: registration/
+  liveness, queue admission (`work.queued`, atomic with the row insert),
+  work claims and denials (with reason codes), heartbeats,
+  lease expiry/reclaim, ownership handoff, scheduler abandonment,
+  global-cap and fair-share decisions, goal-weight/DWRR refill decisions,
+  terminal completion/failure, shutdown, and config changes.
+- **Storage:** `scheduler_events(id, ts, scheduler_id, worker_id, goal_id,
+  task_id, work_id, step_index, event_type, reason, success, detail,
+  schema_version)` with five covering indexes. `detail` is sanitized at
+  write time (whitelist of scalar keys, strings ≤ 200 chars, non-scalars
+  dropped, `schema_version` injected). Duplicate event ids are
+  `INSERT OR IGNORE` — idempotent, observational-only appends never error
+  the caller. No secrets, model prompts, planner output, credentials,
+  task payloads, or full memory ever enter an event.
+- **Atomicity:** every event commits inside the same `BEGIN IMMEDIATE`
+  transaction as the transition it describes (`_sech_insert_in_tx`), so a
+  rolled-back transition leaves no phantom success event; a crash between
+  transition and event is impossible. Claim success commits `work.claimed`
+  (+ optional `goal_weight.refill` with weight/credit_before/credit_after)
+  atomically; denials carry a specific kind (`capacity.denied`,
+  `scheduler_share.denied`, `goal_weight.denied`) plus a reason code.
+- **Observational only — never authority:** telemetry records are never
+  consulted as permission to execute, claim, complete, extend a lease,
+  bypass approval/recovery/dependencies/mutation locks, change capacity,
+  or change goal weights. Forged, deleted, or duplicated events have zero
+  effect on execution semantics; the durable registry rows and the
+  transactional claim path remain the only authorities. Tests prove a
+  forged claim creates no ownership, a forged completion/heartbeat never
+  completes or extends, a forged reclaim/refill never re-queues or
+  refills, delete-all leaves behavior identical, and duplicated events
+  never duplicate execution.
+- **Query API (read-only, bounded, fail-closed):** `scheduler_events(...)`
+  (oldest-first, `limit` clamped to [1, 1000], filters by goal/scheduler/
+  work/type/since), `scheduler_event_count()`, `oldest_scheduler_event()`,
+  `recent_scheduler_events(...)`, and `scheduler_status()` — a point-in-
+  time observation (counts, active/stale schedulers, running/queued by
+  scheduler and goal, weights, DWRR credit, recent reclaim/failure
+  counts) that is never a cached authority. No unbounded `SELECT *`.
+- **Retention:** `prune_scheduler_events(cutoff, batch_size ≤ 5000)` runs
+  bounded SELECT-then-DELETE batches, never touches scheduler authority
+  tables, and never silently deletes recent events (cutoff is caller
+  supplied and explicit).
+- **CLI:** `arion scheduler watch [--json] [--goal G] [--scheduler S]
+  [--work W] [--type T] [--since TS] [--limit N] [--follow]` — human rows
+  plus stable machine-readable JSON (`[{id,ts,kind,detail}]`); `--follow`
+  is a bounded read-only poller (no registration, no heartbeat) with a
+  Ctrl-C clean exit.
+- **Crash/restart:** events are durable across reopen; a crash after a
+  durable claim leaves `work.claimed` committed and the stale lease is
+  reclaimed with `work.reclaimed` committed atomically in the same
+  transaction; history replays oldest-first; an active heartbeat is
+  distinguishable from an abandoned scheduler.
+- **Demo:** `scripts/demo_adr028_scheduler_observability.py` (28 checks,
+  deterministic, offline): registration, claims, heartbeats, completion/
+  failure, capacity vs fair-share denials, DWRR refill, atomic reclaim,
+  handoff, abandonment, restart history, rollback-no-phantom, forged
+  telemetry powerless, retention, CLI JSON.
+
+## Per-goal weighted capacity reservation (ADR-029)
+
+- **Concept — weight ≠ reservation:** a weight is relative scheduling
+  opportunity among contending goals (DWRR); a reservation is a minimum
+  guarantee — the goal may reserve a bounded floor of concurrent RUNNING
+  slots **while it has runnable work** (idle goals reserve nothing).
+  Unit: `reservation = minimum number of concurrent runnable execution
+  slots for that goal`. Weights keep their exact ADR-027 semantics.
+- **Data:** `scheduler_goal_reservations(goal_id, reservation, enabled,
+  updated_at, updated_by)` — integer `[0, 10000]`, default 0 for
+  unconfigured goals, fail-closed validation, mirroring the weight-config
+  conventions. Config API: `set/get/list/remove_goal_reservation`,
+  `set_goal_reservation_enabled` (all transactional, event-emitting).
+- **Oversubscription policy — REJECT, never normalize:** with a global
+  cap configured, the sum of ENABLED reservations may never exceed the
+  cap; `set_goal_reservation` / `set_goal_reservation_enabled(True)` /
+  `set_scheduler_global_max` fail closed with a typed error on any change
+  that would make the policy impossible. With no cap configured,
+  reservations are accepted (unbounded capacity) and the admission gate
+  is a no-op, exactly like the DWRR gate.
+- **Admission order (inside `BEGIN IMMEDIATE`):** 1) reclaim stale;
+  2) global capacity; 3) scheduler fair share; 4) **reservation gate**
+  (floor path: the claiming goal is below its floor → grant, with DWRR
+  accounting kept honest — the claim flows through the DWRR gate and the
+  floor overrides only a credit denial, never the weight-disabled hard
+  gate, never gates 1–3; protection path: the claim would consume a free
+  slot needed by another runnable reserved goal → `reservation.denied`,
+  row stays QUEUED); 5) DWRR weighted admission; 6) ownership.
+- **Guarantee (exact, durable):** for an enabled reserved goal G with
+  runnable work, global capacity ≥ R and the claiming scheduler eligible
+  under fair share, no other goal can consume a free slot while G is
+  below R and the remaining free slots cannot cover G's deficit
+  (`free − 1 < outstanding` denies). RUNNING work is never cancelled to
+  satisfy a floor. After all floors are satisfied, remaining capacity
+  follows ADR-027 weighted fairness exactly (proven 5:1 with a reserved
+  floor in place).
+- **Dynamic semantics:** config changes apply to future claims only;
+  RUNNING work is never retroactively cancelled/re-owned; oversubscribing
+  changes fail closed; reservations + DWRR deficit survive restart.
+- **Cross-process:** all gates read only durable rows inside
+  `BEGIN IMMEDIATE`; real-subprocess tests prove the floor holds across
+  processes, racing processes cannot bypass the protection, stale
+  scheduler reclaim does not permanently consume reserved capacity, and
+  reservations never exceed the global cap.
+- **Observability (ADR-028 extension):** new kinds
+  `goal_reservation_changed`, `reservation.denied`, `reservation.satisfied`
+  (atomic with their transitions; observational only). `scheduler_status()`
+  adds `goal_reservations`, `reserved_capacity`, `reservation_satisfied`,
+  `reservation_pressure` (deterministic from durable rows). CLI:
+  `arion scheduler reservations`, `reservation set|remove|enable|disable`
+  (human + `--json`, bounded validation, persistence).
+- **Security boundary:** reservations are scheduler POLICY only — no
+  planner/model/task metadata path exists; forged reservation events,
+  forged satisfied/denied telemetry, forged capacity counts / DWRR
+  deficits / queue positions / stale ownership have zero effect (the
+  gates read authority tables only); one goal can never use another
+  goal's reservation; reservations never establish execution authority.
+- **Demo:** `scripts/demo_adr029_reserved_capacity.py` (32 checks,
+  deterministic, offline): default 0, single/multiple floors, protection,
+  high-weight vs reserved, DWRR interaction, idle/runnable-again,
+  cross-process, dynamic changes, restart/reclaim, telemetry, forged
+  attempts, CLI/status/watch.
+
+## Reservation-aware capacity planning & scheduler status (ADR-030)
+
+- **Nature:** a READ-ONLY projection over durable scheduler state —
+  observability/planning only. It never claims, heartbeats, registers,
+  writes reservations/weights/capacity/DWRR credit, establishes
+  ownership, completes work, reclaims leases, or bypasses approvals. A
+  forged planning result has zero execution effect; the authoritative
+  claim transaction always wins; the ADR-029 claim path is unchanged.
+- **Capacity arithmetic:** `available = max(cap − running, 0)`; with NO
+  global cap, `available`/`unreserved` are explicit `None` (unbounded)
+  sentinels — never an invented finite capacity.
+- **Configured vs active reservations:** `reserved_capacity` = sum of
+  ENABLED reservations over all configured goals (configuration view);
+  `active_reserved_capacity` = sum over enabled reserved goals WITH
+  queued work (idle floors consume nothing — identical to the claim
+  gate's idle-goal rule); `reservation_pressure` = Σ max(0, R − running)
+  over runnable reserved goals; `unreserved = max(cap − running −
+  active_reserved, 0)`.
+- **Feasibility (read-only):** `reservation_feasibility(proposed=None)`
+  evaluates the current or a full proposed configuration:
+  feasible iff no cap OR `proposed_total ≤ cap`; returns totals, exact
+  `overflow`, `affected_goals`, `reason ∈ {ok, no_global_cap,
+  oversubscribed}`; never mutates config.
+- **Simulation (dry-run):** `simulate_reservation_change(goal_id, new)`
+  and `simulate_reservation_config(proposed)` compute current/proposed
+  totals, remaining capacity, feasibility, overflow, and a deterministic
+  `pressure_delta` (increase/decrease/unchanged vs the ADR-029 pressure
+  formula). Repeated runs leave reservations, weights, DWRR credit,
+  events, and ownership byte-identical.
+- **Admission explanations (projection, not a gate):** per-goal
+  `state ∈ {idle, weight_disabled, reserved_floor, reservation_waiting,
+  global_capacity_exhausted, scheduler_share_limited, eligible,
+  goal_weight_limited, unknown}` — derived from the same durable tables
+  and constants as the claim path (incl. the DWRR refill-round rule and
+  the ceil(cap/active) fair share), computed WITHOUT running the gates
+  (which mutate credit). Every explanation carries: "Eligible based on
+  current snapshot; admission is still authoritative at claim time."
+- **Store API:** `capacity_snapshot()` (typed snapshot: scalars,
+  below/at/above lists, per-goal projections, config views),
+  `explain_goal_eligibility()`, `reservation_feasibility()`,
+  `simulate_reservation_change()`, `simulate_reservation_config()`,
+  `reservation_check()`.
+- **CLI:** `arion scheduler status` upgraded to the planning layout
+  (human) + additive JSON (old keys preserved); `scheduler reservations
+  --check [--json]` (exit 0 feasible / 1 infeasible, read-only);
+  `scheduler reservation plan <goal> <n> [--json]` (dry-run, never
+  persists, invalid input exits 1).
+- **JSON schema:** semantic field names, no SQLite internals; `null`
+  for unbounded (no cap), `0`/`[]` for zero/empty, deterministic
+  ordering (goals sorted by id); bounded (ids/counts/enums only).
+- **Cross-process:** snapshots/plans are plain reads over the shared
+  registry — they may be stale the instant they return, and they can
+  never mutate authority even while subprocess workers claim, heartbeat,
+  complete, or reclaim.
+- **Security boundary:** planning reads authority tables only — forged
+  telemetry (reservation/satisfied/denied/refill/queue/capacity events),
+  fake goal ids, and planner/model/task metadata cannot alter planning
+  inputs, create reservations, change DWRR, establish ownership, or make
+  an infeasible config executable; malformed/oversized inputs fail
+  closed.
+- **Demo:** `scripts/demo_adr030_capacity_planning.py` (35 checks,
+  deterministic, offline): empty/cap/running snapshots, configured vs
+  active reservations, idle/below/satisfied goals, feasibility,
+  increase/decrease simulation, status JSON, check JSON, no-mutation
+  proof, forged telemetry, cross-process observation, restart.
+
+## Per-goal concurrency ceilings (ADR-031)
+
+- **Concept — three independent policy dimensions:** weight = relative
+  opportunity (DWRR); floor = minimum protected capacity while runnable
+  (ADR-029); **ceiling = maximum concurrent capacity for one goal**.
+  Ceilings never create ownership, never reserve capacity, never bypass
+  existing gates, never establish execution authority.
+- **Data:** `scheduler_goal_ceilings(goal_id, ceiling, enabled,
+  updated_at, updated_by)` — integer `[1, 10000]` when configured;
+  **default `None` = unbounded** (never an invented huge integer; `0` is
+  rejected — use remove/disable for unbounded). API mirrors the
+  reservation registry; config writes emit `goal_ceiling_changed`
+  atomically.
+- **Floor + ceiling compatibility:** when both are enabled, `R <= C`
+  (enforced atomically in ALL four write directions — set ceiling, set
+  floor, enable ceiling, enable floor; failed writes leave no partial
+  state or event). `sum(ceilings)` does NOT need to fit the global cap
+  (maximums, not reservations); ADR-029's floor oversubscription rule is
+  unchanged. Under valid config, a below-floor goal is never at its
+  ceiling (`running < R <= C`) — the impossible state is unconstructible.
+- **Admission gate (final order in `BEGIN IMMEDIATE`):** 1) stale
+  reclaim; 2) global capacity; 3) scheduler fair share; 4) reservation
+  floor/protection; 5) **goal ceiling** (`ceiling.denied`, row stays
+  QUEUED, NO DWRR credit consumed, NO refill); 6) DWRR weighted
+  admission; 7) ownership. Enforced in both the specific-row and
+  `claim_next` paths, so the floor path can never bypass it. Core
+  invariant: `running_G <= C` at every committed state — never bypassed
+  by floors, races, multiple processes, stale reclaim, restart, or
+  handoff.
+- **DWRR interaction (no stranded credit):** a goal AT its enabled
+  ceiling cannot spend credit, so the refill-round check skips it (like
+  weight-disabled goals) — peers keep getting refill rounds and
+  progress; the ceiling-limited goal's durable credit is never destroyed
+  and becomes spendable again below the ceiling.
+- **Dynamic changes:** increase permits new claims immediately; decrease
+  never cancels RUNNING work (binds future claims until running falls
+  below C); disable/remove = unbounded for future claims; values persist
+  across restart; pair changes validate atomically.
+- **Cross-process:** real-subprocess tests prove 2+ processes cannot
+  collectively exceed a ceiling, the final-slot race has exactly one
+  owner, stale reclaim frees a ceiling slot, restart preserves it, and
+  cap/floors/share/DWRR stay authoritative.
+- **Telemetry:** `goal_ceiling_changed`, `ceiling.denied` (goal, work,
+  running, ceiling, reason `goal_ceiling`); `scheduler watch` renders
+  them; forged ceiling events have zero effect.
+- **Status/planning (ADR-030 extension):** per-goal `ceiling`
+  (`None` = unbounded), `ceiling_enabled`, `ceiling_headroom =
+  max(C − running, 0)` (None when unbounded); aggregates
+  `ceiling_limited_goal_count`, `goals_at_ceiling`,
+  `recent_ceiling_denials`; explanation state `goal_ceiling_limited`
+  (outranks credit states, carries the claim-time disclaimer).
+  `reservation_feasibility` validates `floor <= ceiling` (reason
+  `floor_exceeds_ceiling`); `simulate_reservation_change` reports
+  `floor_ceiling_valid`; new `simulate_ceiling_change` and
+  `simulate_goal_policy(goal_id, reservation=, ceiling=, weight=)`
+  dry-runs — all provably mutation-free.
+- **CLI:** `arion scheduler ceilings`; `ceiling set|remove|enable|
+  disable <goal>` (human + `--json`, `--by`, fail-closed validation);
+  `ceiling plan <goal> <n>` (dry-run, never persists, invalid → exit 1);
+  `scheduler status` rows and `reservations --check` expose ceilings.
+- **Security boundary:** forged ceiling config/changed/denied events,
+  task metadata, planner/model output, fake goal ids, queue positions,
+  running counts, DWRR credit, heartbeat/reclaim events cannot change a
+  ceiling, exceed it, transfer it, or bypass it; global capacity remains
+  authoritative. Policy influences admission; policy never establishes
+  execution authority.
+- **Demo:** `scripts/demo_adr031_goal_ceilings.py` (32 checks,
+  deterministic, offline): unbounded default, set/get/remove,
+  enforcement + exact boundary, multiple goals, cross-process race,
+  high/low weight, increase/decrease/disable, restart, stale reclaim,
+  floor+ceiling valid/invalid, telemetry, status, planning, forged
+  events.
 
 ## Structured intelligence boundary (ADR-011)
 

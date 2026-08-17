@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import Any
 
 from arion.cognition.progress import DeterministicProgressEvaluator, ProgressEvaluator, ProgressResult
-from arion.cognition.strategy import StrategySelector
+from arion.cognition.strategy import STRATEGY_NAMES, StrategySelector
 from arion.state.models import (
     GOAL_TRANSITIONS,
     Goal,
@@ -108,6 +108,18 @@ class GoalManager:
             "goal_version": goal.version,
             "actor": actor,
         })
+        # ADR-015 addendum (Phase A): TERMINAL transitions mark the active
+        # (latest) plan version's outcome - succeeded on completion, failed
+        # on failure. Informational, best-effort, idempotent (UNIQUE
+        # goal_id+plan_version); never breaks the state machine.
+        if to_state in (GoalStatus.COMPLETED.value, GoalStatus.FAILED.value):
+            latest = self.latest_plan(goal_id)
+            if latest is not None:
+                outcome = ("succeeded" if to_state == GoalStatus.COMPLETED.value
+                           else "failed")
+                self._record_strategy_outcome(
+                    goal_id, latest["plan_version"],
+                    latest.get("strategy", ""), outcome, reason)
         return goal
 
     def pause(self, goal_id: str, reason: str = "explicit_pause") -> Goal:
@@ -293,6 +305,13 @@ class GoalManager:
             "reason": reason,
             "created_at": utcnow(),
         }
+        # ADR-015 addendum (Phase A): the new plan version SUPERSEDES the
+        # previous one. Informational, best-effort, idempotent - never
+        # breaks the authoritative plan-versioning path.
+        if latest is not None:
+            self._record_strategy_outcome(
+                goal_id, latest["plan_version"],
+                latest.get("strategy", ""), "superseded", reason)
         # The goal's CURRENT strategy follows the latest plan version
         # (persisted, restart-safe, still purely informational).
         goal = self.get_goal(goal_id)
@@ -314,6 +333,84 @@ class GoalManager:
             if task.goal_id == goal_id and task.plan_version == plan_version:
                 return True
         return False
+
+    def readopt_plan(self, goal_id: str, from_version: int) -> dict[str, Any]:
+        """Re-adopt a stored historical plan version (ADR-016 addendum).
+
+        Creates a NEW immutable plan version whose (strategy, plan_summary)
+        are copied from the stored historical version `from_version`,
+        through the EXISTING record_plan_version funnel - so replay
+        idempotency, the monotonic version counter, the goal.strategy
+        follow, the plan.versioned event, and the ADR-015 strategy-outcome
+        supersede (previous latest -> 'superseded' with reason
+        'replan_rollback_v<N>') all behave exactly as for any replan.
+        History is NEVER mutated; the new version's reason is exactly
+        `replan_rollback_v<from_version>` (provenance-carrying).
+
+        Fail closed (ValueError) when:
+        - the goal does not exist;
+        - the goal is terminal (COMPLETED or CANCELLED - no outgoing
+          transitions); FAILED stays eligible (GOAL_TRANSITIONS allows
+          FAILED -> ACTIVE);
+        - from_version is not a positive integer;
+        - the goal has no plan history;
+        - from_version does not exist in THIS goal's plan history (never
+          existed, or pruned by ADR-014 - pruned versions are
+          indistinguishable from never-existing and are NOT resurrected);
+        - from_version is the latest plan version (nothing to re-adopt);
+        - the stored plan's strategy is not a known STRATEGY_NAME or its
+          plan_summary is malformed/oversized (raw-SQL-forged rows fail
+          closed).
+
+        Idempotent: repeating the identical re-adoption (no task yet)
+        returns the existing rollback version via the replay guard; if a
+        task implements that version, a genuinely NEW version is created
+        (existing record_plan_version semantics). Re-adoption only RECORDS
+        - stored-plan execution is a separate phase.
+        """
+        if (isinstance(from_version, bool) or not isinstance(from_version, int)
+                or from_version < 1):
+            raise ValueError(
+                f"from_version must be a positive integer, got "
+                f"{from_version!r} (fail closed)")
+        goal = self.get_goal(goal_id)
+        if goal is None:
+            raise ValueError(f"goal not found: {goal_id!r} (fail closed)")
+        if goal.status_value in (GoalStatus.COMPLETED.value,
+                                 GoalStatus.CANCELLED.value):
+            raise ValueError(
+                f"goal {goal_id} is terminal ({goal.status_value}); "
+                f"re-adoption is not allowed (fail closed)")
+        history = self.plan_history(goal_id)
+        if not history:
+            raise ValueError(
+                f"goal {goal_id} has no plan history to re-adopt (fail closed)")
+        source = next((p for p in history
+                       if p["plan_version"] == from_version), None)
+        if source is None:
+            raise ValueError(
+                f"plan version {from_version} does not exist for goal "
+                f"{goal_id} (never existed or pruned; fail closed)")
+        latest = history[-1]
+        if from_version == latest["plan_version"]:
+            raise ValueError(
+                f"plan version {from_version} is already the active plan "
+                f"for goal {goal_id} (fail closed)")
+        strategy = source.get("strategy", "") or ""
+        if strategy not in STRATEGY_NAMES:
+            raise ValueError(
+                f"stored plan {from_version} has unknown strategy "
+                f"{strategy!r}; cannot re-adopt (fail closed)")
+        summary = source.get("plan_summary")
+        if (not isinstance(summary, list)
+                or not all(isinstance(s, dict) for s in summary)
+                or len(summary) > 500):
+            raise ValueError(
+                f"stored plan {from_version} has a malformed or oversized "
+                f"plan_summary; cannot re-adopt (fail closed)")
+        return self.record_plan_version(
+            goal_id, strategy, [dict(s) for s in summary],
+            reason=f"replan_rollback_v{from_version}")
 
     def task_history(self, goal_id: str) -> list[Task]:
         return [t for t in self.storage.list_tasks() if t.goal_id == goal_id]
@@ -406,9 +503,11 @@ class GoalManager:
                      environment: dict, guidance: list) -> Any:
         """Select (and persist) the goal's current strategy with provenance."""
         previous = [p.get("strategy", "") for p in self.plan_history(goal_id)]
+        outcome_history = self.strategy_outcomes(limit=50)
         strategy = self.strategy_selector.select(
             goal_description, beliefs, environment, guidance,
             previous_strategies=[s for s in previous if s],
+            outcome_history=outcome_history,
         )
         goal = self.get_goal(goal_id)
         if goal is not None and goal.strategy != strategy.name:
@@ -443,6 +542,179 @@ class GoalManager:
     # ------------------------------------------------------------------ #
     # Events
     # ------------------------------------------------------------------ #
+
+    # ---- strategy outcomes (ADR-015 addendum, Phase A) ----
+
+    def peek_evaluate(self, goal_id: str) -> ProgressResult | None:
+        """READ-ONLY progress evaluation (ADR-016 addendum Phase D).
+
+        Computes the same deterministic ProgressResult as evaluate()
+        WITHOUT persisting progress_metadata / last_evaluated_at /
+        updated_at and WITHOUT emitting progress.evaluated /
+        goal.evaluated. The authoritative lifecycle (engine run_goal)
+        keeps using the mutating evaluate(); this public seam serves
+        read-only CLI inspection. Returns None when the goal is missing.
+        """
+        goal = self.get_goal(goal_id)
+        if goal is None:
+            return None
+        tasks = self.task_history(goal_id)
+        latest_plan = self.latest_plan(goal_id)
+        try:
+            world_changes = self._relevant_world_changes(goal)
+        except Exception:
+            world_changes = []
+        world_state = (self.world_monitor.current_state()
+                       if self.world_monitor is not None else None)
+        return self.progress_evaluator.evaluate(
+            goal, tasks, latest_plan, world_changes, world_state)
+
+    def diff_plans(self, goal_id: str, version_a: int,
+                   version_b: int) -> dict[str, Any]:
+        """Deterministic, read-only structural diff of two stored plan
+        versions (ADR-016 addendum Phase C).
+
+        Compares strategy, reason, and step structure (index/capability/
+        action only - NEVER params/intent/free-text content). Stable JSON
+        schema: {goal_id, version_a, version_b, strategy_a, strategy_b,
+        reason_a, reason_b, steps_a, steps_b, added, removed, kept,
+        identical}. Purely observational: no DB writes, no events, no
+        planner, no execution. Fail closed (ValueError) on nonexistent
+        goal, nonexistent/pruned/malformed versions, or invalid version
+        argument types. Identical versions -> explicit empty diff.
+        """
+        if (isinstance(version_a, bool) or not isinstance(version_a, int)
+                or version_a < 1 or isinstance(version_b, bool)
+                or not isinstance(version_b, int) or version_b < 1):
+            raise ValueError(
+                f"versions must be positive integers, got {version_a!r} and "
+                f"{version_b!r} (fail closed)")
+        if self.get_goal(goal_id) is None:
+            raise ValueError(f"goal not found: {goal_id!r} (fail closed)")
+        history = self.plan_history(goal_id)
+        pa = next((p for p in history if p["plan_version"] == version_a), None)
+        pb = next((p for p in history if p["plan_version"] == version_b), None)
+        if pa is None or pb is None:
+            raise ValueError(
+                f"plan version(s) {version_a}/{version_b} do not exist for "
+                f"goal {goal_id} (never existed or pruned; fail closed)")
+
+        def _sig(step: dict[str, Any]) -> tuple:
+            # structural identity: index + capability + action only
+            return (step.get("index"), step.get("capability"),
+                    step.get("action"))
+
+        sa = [_sig(s) for s in (pa.get("plan_summary") or [])]
+        sb = [_sig(s) for s in (pb.get("plan_summary") or [])]
+        ka = {s: i for i, s in enumerate(sa)}
+        kb = {s: i for i, s in enumerate(sb)}
+        kept = sorted(i for i, s in enumerate(sa) if s in kb)
+        added = sorted(i for i, s in enumerate(sb) if s not in ka)
+        removed = sorted(i for i, s in enumerate(sa) if s not in kb)
+        return {
+            "goal_id": goal_id,
+            "version_a": version_a,
+            "version_b": version_b,
+            "strategy_a": pa.get("strategy", ""),
+            "strategy_b": pb.get("strategy", ""),
+            "reason_a": (pa.get("reason") or "")[:100],
+            "reason_b": (pb.get("reason") or "")[:100],
+            "steps_a": len(sa),
+            "steps_b": len(sb),
+            "added": added,
+            "removed": removed,
+            "kept": kept,
+            "identical": (sa == sb and pa.get("strategy") == pb.get("strategy")),
+        }
+
+    def _record_strategy_outcome(self, goal_id: str, plan_version: int,
+                                 strategy: str, outcome: str,
+                                 reason: str) -> bool:
+        """Write one informational strategy-outcome row, best-effort.
+
+        Called ONLY from the authoritative GoalManager lifecycle funnels
+        (record_plan_version / transition) and the repair pass. Returns
+        True when the write was a durable change (new row or value
+        change); emits the bounded `strategy.outcome` audit event then.
+        Idempotent replays return False and emit NOTHING. A failure here
+        must never break the authoritative state machine, so exceptions
+        are swallowed (returning False) - the deterministic repair pass
+        re-derives missing rows from authoritative goal/plan state.
+        """
+        if self.cognitive_store is None:
+            return False
+        try:
+            goal = self.get_goal(goal_id)
+            description = goal.description if goal is not None else ""
+            changed = self.cognitive_store.record_strategy_outcome(
+                goal_id, description, strategy, plan_version, outcome,
+                reason=reason)
+            if changed:
+                self._emit("strategy.outcome", goal_id=goal_id, detail={
+                    "goal_id": goal_id,
+                    "plan_version": plan_version,
+                    "strategy": strategy,
+                    "outcome": outcome,
+                    "reason": reason[:200],
+                })
+            return changed
+        except Exception:
+            return False  # informational: never breaks the goal lifecycle
+
+    def strategy_outcomes(self, goal_id: str | None = None,
+                          limit: int = 200) -> list[dict[str, Any]]:
+        """Bounded, read-only strategy-outcome history (deterministic order:
+        goal_id, plan_version). Informational only."""
+        if self.cognitive_store is None:
+            return []
+        return self.cognitive_store.list_strategy_outcomes(goal_id=goal_id,
+                                                           limit=limit)
+
+    def repair_strategy_outcomes(self) -> int:
+        """Backfill MISSING strategy-outcome rows from AUTHORITATIVE state.
+
+        Sources of truth: goals.status (terminal) + goal_plans (version
+        order). For every plan version with a HIGHER version number the row
+        is `superseded` (reason = the higher version's reason); the LATEST
+        version of a COMPLETED goal is `succeeded`; of a FAILED goal is
+        `failed`. Active/paused/blocked/cancelled latest versions and goals
+        without plans get NO row. Existing rows are NEVER overwritten.
+        Idempotent; deterministic; informational only.
+        """
+        if self.cognitive_store is None:
+            return 0
+        written = 0
+        for goal in self.list_goals():
+            plans = self.plan_history(goal.id)
+            if not plans:
+                continue
+            for i, plan in enumerate(plans):
+                version = int(plan["plan_version"])
+                if self.cognitive_store.get_strategy_outcome(goal.id, version) \
+                        is not None:
+                    continue  # existing rows are never overwritten
+                strategy = plan.get("strategy", "") or ""
+                if strategy not in STRATEGY_NAMES:
+                    continue  # no valid strategy to record (fail closed)
+                if i < len(plans) - 1:
+                    next_reason = plans[i + 1].get("reason", "") or ""
+                    if self._record_strategy_outcome(
+                            goal.id, version, strategy, "superseded",
+                            next_reason):
+                        written += 1
+                elif goal.status_value == GoalStatus.COMPLETED.value:
+                    if self._record_strategy_outcome(
+                            goal.id, version, strategy, "succeeded",
+                            "all_work_complete"):
+                        written += 1
+                elif goal.status_value == GoalStatus.FAILED.value:
+                    if self._record_strategy_outcome(
+                            goal.id, version, strategy, "failed",
+                            goal.last_replan_reason or "goal_failed"):
+                        written += 1
+                else:
+                    continue
+        return written
 
     def _emit(self, kind: str, goal_id: str | None, detail: dict[str, Any]) -> None:
         if self.events is None:

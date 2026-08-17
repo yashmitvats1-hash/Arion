@@ -45,8 +45,17 @@ class MemoryRetriever:
         outcome: str | None = None,
         failure_category: str | None = None,
         tag: str | None = None,
+        capabilities: set[str] | None = None,
     ) -> list[Episode]:
-        """Return the top-k episodes ranked by relevance (score, then recency)."""
+        """Return the top-k episodes ranked by relevance (score, then recency).
+
+        `capabilities` (optional) is the query-aware precision seam
+        (ADR-013 addendum): when the CALLER knows which capabilities the
+        current task may use (the planner's requirement heuristic), a
+        capability tag counts as a relevance signal ONLY if it matches one
+        of them. Without it, capability tags remain a relevance signal
+        (original ADR-012 semantics preserved for direct callers).
+        """
         candidates = self.store.search_episodes(
             EpisodeFilter(outcome=outcome, capability=capability, failure_category=failure_category,
                           tag=tag, limit=max(50, top_k * 4))
@@ -58,10 +67,17 @@ class MemoryRetriever:
             overlap = goal_tokens & _tokens(episode.goal)
             # shared capabilities (episodes carry capability tags)
             cap_tags = {t for t in episode.tags if "." in t}
-            # RELEVANCE GATE: an episode must share at least one goal token or
-            # capability with the current goal to be retrieved at all. An
+            # RELEVANCE GATE: an episode must share at least one goal token
+            # or capability with the current goal to be retrieved at all. An
             # unrelated episode (even recent or high-importance) is excluded.
-            if not overlap and not cap_tags:
+            # With caller-supplied `capabilities`, capability relevance is
+            # precise: the episode's capability tags must match one of the
+            # task's likely capabilities (an http task never receives
+            # filesystem memory just because a tag looks like a capability).
+            if capabilities is not None:
+                if not overlap and not (cap_tags & capabilities):
+                    continue
+            elif not overlap and not cap_tags:
                 continue
             score = 0.0
             score += 2.0 * len(overlap)
@@ -85,14 +101,21 @@ def build_planning_context(
     retriever: MemoryRetriever,
     goal: str,
     budget: ContextBudget | None = None,
+    capabilities: set[str] | None = None,
 ) -> PlanningContext:
-    """Bounded, deterministic context: relevant episodes + recent reflections."""
+    """Bounded, deterministic context: relevant episodes + recent reflections.
+
+    `capabilities` (optional): the caller's knowledge of which capabilities
+    this task may use (the engine passes the planner's requirement
+    heuristic). Enables the query-aware capability relevance gate.
+    """
     budget = budget or ContextBudget()
 
     # relevant episodes, ranked (score desc, recency tie-break) and bounded.
     # Recency is a tie-breaker within relevance - an irrelevant episode is
     # never included just because it is recent.
-    episodes = retriever.retrieve(goal, top_k=budget.max_episodes)
+    episodes = retriever.retrieve(goal, top_k=budget.max_episodes,
+                                  capabilities=capabilities)
 
     # recent reflections (prefer linked to selected episodes, then recent)
     reflections: list = []
