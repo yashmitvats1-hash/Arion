@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Any
 
 from arion.cognition.models import Belief, EnvironmentFact, Preference
-from arion.state.models import utcnow
+from arion.cognition.strategy import STRATEGY_NAMES, STRATEGY_OUTCOME_STATES
+from arion.state.models import new_id, utcnow
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS beliefs (
@@ -69,6 +70,20 @@ CREATE TABLE IF NOT EXISTS goal_plans (
     PRIMARY KEY (goal_id, plan_version)
 );
 CREATE INDEX IF NOT EXISTS idx_goal_plans_goal ON goal_plans(goal_id);
+CREATE TABLE IF NOT EXISTS strategy_outcomes (
+    outcome_id       TEXT PRIMARY KEY,
+    goal_id          TEXT NOT NULL,
+    goal_description TEXT NOT NULL,
+    strategy         TEXT NOT NULL,
+    plan_version     INTEGER NOT NULL,
+    outcome          TEXT NOT NULL,
+    reason           TEXT NOT NULL DEFAULT '',
+    episode_id       TEXT,
+    created_at       TEXT NOT NULL,
+    UNIQUE(goal_id, plan_version)
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_outcomes_goal
+    ON strategy_outcomes(goal_id);
 """
 
 _BELIEF_COLS = ["belief_id", "category", "statement", "confidence", "importance",
@@ -76,6 +91,8 @@ _BELIEF_COLS = ["belief_id", "category", "statement", "confidence", "importance"
 _PREF_COLS = ["preference_id", "key", "value", "user", "source", "provenance", "created_at", "updated_at"]
 _FACT_COLS = ["fact_id", "key", "value", "source", "version", "observed_at", "created_at", "updated_at"]
 _GOAL_PLAN_COLS = ["goal_id", "plan_version", "strategy", "plan_summary", "reason", "created_at"]
+_OUTCOME_COLS = ["outcome_id", "goal_id", "goal_description", "strategy",
+                 "plan_version", "outcome", "reason", "episode_id", "created_at"]
 
 
 def _threadsafe(method):
@@ -319,6 +336,102 @@ class SQLiteCognitiveStore:
         ).fetchall()
         return _goal_plan_from_row(rows[0]) if rows else None
 
+    # ---- strategy outcomes (ADR-015 addendum, Phase A) ----
+
+    @_threadsafe
+    def record_strategy_outcome(self, goal_id: str, goal_description: str,
+                                strategy: str, plan_version: int,
+                                outcome: str, reason: str = "",
+                                episode_id: str | None = None) -> None:
+        """Record one durable strategy outcome (INFORMATIONAL only).
+
+        Exactly one row per (goal_id, plan_version) - UNIQUE invariant.
+        Idempotent: re-recording the same (goal_id, plan_version) replaces
+        the row in place and PRESERVES the original created_at. Fail closed
+        on unknown strategy names, unknown outcome states, non-positive
+        plan versions, empty ids, and non-string fields. goal_description
+        is bounded to 300 chars, reason to 200 chars.
+        """
+        if not isinstance(goal_id, str) or not goal_id.strip():
+            raise ValueError(
+                f"goal_id must be a non-empty string, got {goal_id!r} (fail closed)")
+        if not isinstance(goal_description, str):
+            raise ValueError(
+                f"goal_description must be a string, got {goal_description!r} "
+                f"(fail closed)")
+        if strategy not in STRATEGY_NAMES:
+            raise ValueError(
+                f"strategy must be one of {STRATEGY_NAMES}, got {strategy!r} "
+                f"(fail closed)")
+        if (isinstance(plan_version, bool) or not isinstance(plan_version, int)
+                or plan_version < 1):
+            raise ValueError(
+                f"plan_version must be a positive integer, got {plan_version!r} "
+                f"(fail closed)")
+        if outcome not in STRATEGY_OUTCOME_STATES:
+            raise ValueError(
+                f"outcome must be one of {STRATEGY_OUTCOME_STATES}, got "
+                f"{outcome!r} (fail closed)")
+        if not isinstance(reason, str):
+            raise ValueError(
+                f"reason must be a string, got {reason!r} (fail closed)")
+        if episode_id is not None and (not isinstance(episode_id, str)
+                                       or not episode_id):
+            raise ValueError(
+                f"episode_id must be a non-empty string or None, got "
+                f"{episode_id!r} (fail closed)")
+        existing = self.get_strategy_outcome(goal_id, plan_version)
+        created_at = existing["created_at"] if existing else utcnow()
+        self._conn.execute(
+            "INSERT OR REPLACE INTO strategy_outcomes "
+            f"({', '.join(_OUTCOME_COLS)}) VALUES ({', '.join('?' * len(_OUTCOME_COLS))})",
+            (
+                new_id("sout"),
+                goal_id,
+                goal_description[:300],
+                strategy,
+                int(plan_version),
+                outcome,
+                reason[:200],
+                episode_id,
+                created_at,
+            ),
+        )
+        self._conn.commit()
+
+    @_threadsafe
+    def get_strategy_outcome(self, goal_id: str,
+                             plan_version: int) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT " + ", ".join(_OUTCOME_COLS) + " FROM strategy_outcomes "
+            "WHERE goal_id=? AND plan_version=?",
+            (goal_id, int(plan_version)),
+        ).fetchone()
+        return _strategy_outcome_from_row(row) if row else None
+
+    @_threadsafe
+    def list_strategy_outcomes(self, goal_id: str | None = None,
+                               limit: int = 200) -> list[dict[str, Any]]:
+        if goal_id is not None:
+            rows = self._conn.execute(
+                "SELECT " + ", ".join(_OUTCOME_COLS) + " FROM strategy_outcomes "
+                "WHERE goal_id=? ORDER BY goal_id, plan_version LIMIT ?",
+                (goal_id, max(1, limit)),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT " + ", ".join(_OUTCOME_COLS) + " FROM strategy_outcomes "
+                "ORDER BY goal_id, plan_version LIMIT ?",
+                (max(1, limit),),
+            ).fetchall()
+        return [_strategy_outcome_from_row(r) for r in rows]
+
+    @_threadsafe
+    def count_strategy_outcomes(self) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM strategy_outcomes"
+        ).fetchone()[0]
+
     # ---- cognitive archival/pruning (ADR-014 addendum) ----
 
     @_threadsafe
@@ -490,6 +603,10 @@ class SQLiteCognitiveStore:
     @_threadsafe
     def close(self) -> None:
         self._conn.close()
+
+
+def _strategy_outcome_from_row(row: tuple[Any, ...]) -> dict[str, Any]:
+    return {c: v for c, v in zip(_OUTCOME_COLS, row)}
 
 
 def _goal_plan_from_row(row: tuple[Any, ...]) -> dict[str, Any]:

@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import Any
 
 from arion.cognition.progress import DeterministicProgressEvaluator, ProgressEvaluator, ProgressResult
-from arion.cognition.strategy import StrategySelector
+from arion.cognition.strategy import STRATEGY_NAMES, StrategySelector
 from arion.state.models import (
     GOAL_TRANSITIONS,
     Goal,
@@ -108,6 +108,18 @@ class GoalManager:
             "goal_version": goal.version,
             "actor": actor,
         })
+        # ADR-015 addendum (Phase A): TERMINAL transitions mark the active
+        # (latest) plan version's outcome - succeeded on completion, failed
+        # on failure. Informational, best-effort, idempotent (UNIQUE
+        # goal_id+plan_version); never breaks the state machine.
+        if to_state in (GoalStatus.COMPLETED.value, GoalStatus.FAILED.value):
+            latest = self.latest_plan(goal_id)
+            if latest is not None:
+                outcome = ("succeeded" if to_state == GoalStatus.COMPLETED.value
+                           else "failed")
+                self._record_strategy_outcome(
+                    goal_id, latest["plan_version"],
+                    latest.get("strategy", ""), outcome, reason)
         return goal
 
     def pause(self, goal_id: str, reason: str = "explicit_pause") -> Goal:
@@ -293,6 +305,13 @@ class GoalManager:
             "reason": reason,
             "created_at": utcnow(),
         }
+        # ADR-015 addendum (Phase A): the new plan version SUPERSEDES the
+        # previous one. Informational, best-effort, idempotent - never
+        # breaks the authoritative plan-versioning path.
+        if latest is not None:
+            self._record_strategy_outcome(
+                goal_id, latest["plan_version"],
+                latest.get("strategy", ""), "superseded", reason)
         # The goal's CURRENT strategy follows the latest plan version
         # (persisted, restart-safe, still purely informational).
         goal = self.get_goal(goal_id)
@@ -443,6 +462,83 @@ class GoalManager:
     # ------------------------------------------------------------------ #
     # Events
     # ------------------------------------------------------------------ #
+
+    # ---- strategy outcomes (ADR-015 addendum, Phase A) ----
+
+    def _record_strategy_outcome(self, goal_id: str, plan_version: int,
+                                 strategy: str, outcome: str,
+                                 reason: str) -> None:
+        """Write one informational strategy-outcome row, best-effort.
+
+        Called ONLY from the authoritative GoalManager lifecycle funnels
+        (record_plan_version / transition). A failure here must never break
+        the authoritative state machine, so exceptions are swallowed -
+        the deterministic repair pass re-derives missing rows from
+        authoritative goal/plan state.
+        """
+        if self.cognitive_store is None:
+            return
+        try:
+            goal = self.get_goal(goal_id)
+            description = goal.description if goal is not None else ""
+            self.cognitive_store.record_strategy_outcome(
+                goal_id, description, strategy, plan_version, outcome,
+                reason=reason)
+        except Exception:
+            pass  # informational: never breaks the goal lifecycle
+
+    def strategy_outcomes(self, goal_id: str | None = None,
+                          limit: int = 200) -> list[dict[str, Any]]:
+        """Bounded, read-only strategy-outcome history (deterministic order:
+        goal_id, plan_version). Informational only."""
+        if self.cognitive_store is None:
+            return []
+        return self.cognitive_store.list_strategy_outcomes(goal_id=goal_id,
+                                                           limit=limit)
+
+    def repair_strategy_outcomes(self) -> int:
+        """Backfill MISSING strategy-outcome rows from AUTHORITATIVE state.
+
+        Sources of truth: goals.status (terminal) + goal_plans (version
+        order). For every plan version with a HIGHER version number the row
+        is `superseded` (reason = the higher version's reason); the LATEST
+        version of a COMPLETED goal is `succeeded`; of a FAILED goal is
+        `failed`. Active/paused/blocked/cancelled latest versions and goals
+        without plans get NO row. Existing rows are NEVER overwritten.
+        Idempotent; deterministic; informational only.
+        """
+        if self.cognitive_store is None:
+            return 0
+        written = 0
+        for goal in self.list_goals():
+            plans = self.plan_history(goal.id)
+            if not plans:
+                continue
+            for i, plan in enumerate(plans):
+                version = int(plan["plan_version"])
+                if self.cognitive_store.get_strategy_outcome(goal.id, version) \
+                        is not None:
+                    continue  # existing rows are never overwritten
+                strategy = plan.get("strategy", "") or ""
+                if strategy not in STRATEGY_NAMES:
+                    continue  # no valid strategy to record (fail closed)
+                if i < len(plans) - 1:
+                    next_reason = plans[i + 1].get("reason", "") or ""
+                    self.cognitive_store.record_strategy_outcome(
+                        goal.id, goal.description[:300], strategy, version,
+                        "superseded", reason=next_reason)
+                elif goal.status_value == GoalStatus.COMPLETED.value:
+                    self.cognitive_store.record_strategy_outcome(
+                        goal.id, goal.description[:300], strategy, version,
+                        "succeeded", reason="all_work_complete")
+                elif goal.status_value == GoalStatus.FAILED.value:
+                    self.cognitive_store.record_strategy_outcome(
+                        goal.id, goal.description[:300], strategy, version,
+                        "failed", reason=goal.last_replan_reason or "goal_failed")
+                else:
+                    continue
+                written += 1
+        return written
 
     def _emit(self, kind: str, goal_id: str | None, detail: dict[str, Any]) -> None:
         if self.events is None:

@@ -26,6 +26,21 @@ from typing import Any
 from arion.memory.guidance import MemoryGuidance
 from arion.state.models import new_id, utcnow
 
+# The deterministic strategy vocabulary (ADR-015). Outcome rows and CLI
+# surfaces validate against these names (fail closed on anything else).
+STRATEGY_NAMES = (
+    "direct",
+    "avoid_known_failures",
+    "defer_retry",
+    "capability_verified",
+    "blocked_missing_capability",
+)
+
+# The durable strategy-outcome lifecycle (ADR-015 addendum, Phase A):
+# a plan version is superseded by the next version, or ends as succeeded /
+# failed with its goal. Exactly one outcome row per (goal_id, plan_version).
+STRATEGY_OUTCOME_STATES = ("superseded", "succeeded", "failed")
+
 
 @dataclass
 class Strategy:

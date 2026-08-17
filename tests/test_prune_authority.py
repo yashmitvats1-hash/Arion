@@ -312,7 +312,7 @@ def test_scheduler_behavior_byte_identical_after_delete_all_memory(tmp_path):
     exclude = (all_t - set(_AUTHORITY)) | {"episodic_memories", "reflections",
                                            "beliefs", "goal_plans",
                                            "consolidations", "environment_facts",
-                                           "preferences"}
+                                           "preferences", "strategy_outcomes"}
     assert _dump(control, exclude=exclude) == _dump(pruned, exclude=exclude)
     # subsequent scheduler behavior identical
     assert _probe(control) == _probe(pruned)
