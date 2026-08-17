@@ -23,8 +23,32 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import re
+
 from arion.memory.guidance import MemoryGuidance
 from arion.state.models import new_id, utcnow
+
+# Goal-context similarity (ADR-015 addendum Phase B): same token-overlap
+# formula as consolidation's _similar_goal (overlap / min-length >= 0.5),
+# but with a MINIMAL function-word stoplist - the consolidation stopwords
+# include goal verbs (inspect/repository/summarize/read...), which would
+# make strategy-context matching inert for typical goal descriptions.
+_CTX_STOP = {"a", "an", "the", "this", "that", "of", "in", "on", "for",
+             "to", "and", "or", "with", "my", "your", "please", "can",
+             "you", "me", "i", "it", "is", "are"}
+
+
+def _goal_context_similar(a: str, b: str, threshold: float = 0.5) -> bool:
+    """Deterministic token-overlap similarity of two goal descriptions."""
+    def _tokens(text: str) -> set[str]:
+        return {t for t in re.findall(r"[a-z0-9_]+", (text or "").lower())
+                if t not in _CTX_STOP and len(t) > 1}
+
+    ta, tb = _tokens(a), _tokens(b)
+    if not ta or not tb:
+        return a.strip().lower() == b.strip().lower()
+    overlap = len(ta & tb)
+    return overlap / min(len(ta), len(tb)) >= threshold
 
 # The deterministic strategy vocabulary (ADR-015). Outcome rows and CLI
 # surfaces validate against these names (fail closed on anything else).
@@ -40,6 +64,11 @@ STRATEGY_NAMES = (
 # a plan version is superseded by the next version, or ends as succeeded /
 # failed with its goal. Exactly one outcome row per (goal_id, plan_version).
 STRATEGY_OUTCOME_STATES = ("superseded", "succeeded", "failed")
+
+# Bounded outcome history considered by the post-rule preference layer:
+# the first N rows of the store's deterministic (goal_id, plan_version)
+# listing. No timestamps, no wall clock (ADR-015 addendum Phase B).
+_OUTCOME_HISTORY_MAX = 20
 
 
 @dataclass
@@ -64,6 +93,68 @@ class Strategy:
         }
 
 
+def _validate_outcome_row(row: Any, index: int) -> None:
+    """Fail-closed validation of one outcome_history row (Phase B)."""
+    if not isinstance(row, dict):
+        raise ValueError(
+            f"outcome_history[{index}] must be a dict, got {type(row).__name__} "
+            f"(fail closed)")
+    for key in ("outcome_id", "goal_id", "goal_description", "strategy",
+                "plan_version", "outcome", "reason", "episode_id", "created_at"):
+        if key not in row:
+            raise ValueError(
+                f"outcome_history[{index}] is missing key {key!r} (fail closed)")
+    if not isinstance(row["outcome_id"], str) or not row["outcome_id"]:
+        raise ValueError(
+            f"outcome_history[{index}].outcome_id must be a non-empty string "
+            f"(fail closed)")
+    if not isinstance(row["goal_id"], str) or not row["goal_id"]:
+        raise ValueError(
+            f"outcome_history[{index}].goal_id must be a non-empty string "
+            f"(fail closed)")
+    if not isinstance(row["goal_description"], str):
+        raise ValueError(
+            f"outcome_history[{index}].goal_description must be a string "
+            f"(fail closed)")
+    if len(row["goal_description"]) > 300:
+        # Matches the store's write bound (Phase A); a raw-SQL forged
+        # oversized description must fail closed instead of matching many
+        # goal contexts (ADR-015 addendum Phase E - preference poisoning).
+        raise ValueError(
+            f"outcome_history[{index}].goal_description exceeds 300 chars "
+            f"(fail closed)")
+    if row["strategy"] not in STRATEGY_NAMES:
+        raise ValueError(
+            f"outcome_history[{index}].strategy must be one of {STRATEGY_NAMES}, "
+            f"got {row['strategy']!r} (fail closed)")
+    if (isinstance(row["plan_version"], bool)
+            or not isinstance(row["plan_version"], int)
+            or row["plan_version"] < 1):
+        raise ValueError(
+            f"outcome_history[{index}].plan_version must be a positive integer "
+            f"(fail closed)")
+    if row["outcome"] not in STRATEGY_OUTCOME_STATES:
+        raise ValueError(
+            f"outcome_history[{index}].outcome must be one of "
+            f"{STRATEGY_OUTCOME_STATES}, got {row['outcome']!r} (fail closed)")
+    if not isinstance(row["reason"], str):
+        raise ValueError(
+            f"outcome_history[{index}].reason must be a string (fail closed)")
+    if len(row["reason"]) > 200:
+        # Matches the store's write bound (Phase A); oversized reasons fail
+        # closed (ADR-015 addendum Phase E).
+        raise ValueError(
+            f"outcome_history[{index}].reason exceeds 200 chars (fail closed)")
+    if row["episode_id"] is not None and (not isinstance(row["episode_id"], str)
+                                          or not row["episode_id"]):
+        raise ValueError(
+            f"outcome_history[{index}].episode_id must be a non-empty string "
+            f"or None (fail closed)")
+    if not isinstance(row["created_at"], str):
+        raise ValueError(
+            f"outcome_history[{index}].created_at must be a string (fail closed)")
+
+
 class StrategySelector:
     """Deterministic, explainable strategy selection."""
 
@@ -74,6 +165,7 @@ class StrategySelector:
         environment: dict[str, Any] | list,
         guidance: list[MemoryGuidance] | None = None,
         previous_strategies: list[str] | None = None,
+        outcome_history: list[dict[str, Any]] | None = None,
     ) -> Strategy:
         guidance = guidance or []
         previous_strategies = previous_strategies or []
@@ -157,6 +249,23 @@ class StrategySelector:
                     provenance=provenance,
                 )
 
+        # Rule 5 (base): direct. BEFORE returning, the POST-RULE PREFERENCE
+        # LAYER (ADR-015 addendum Phase B) may upgrade the selection using
+        # durable outcome history. It only ever runs when the base rules
+        # would select `direct` (it never overrides a non-direct base).
+        if outcome_history is not None:
+            for i, row in enumerate(outcome_history):
+                _validate_outcome_row(row, i)
+            pref = self._prefer_from_history(
+                goal_description, guidance, outcome_history, provenance)
+            if pref is not None:
+                return Strategy(
+                    strategy_id=new_id("strat"),
+                    name=pref["name"],
+                    description=pref["description"],
+                    constraints=pref["constraints"],
+                    provenance=provenance,
+                )
         return Strategy(
             strategy_id=new_id("strat"),
             name="direct",
@@ -164,6 +273,67 @@ class StrategySelector:
             constraints={},
             provenance=provenance,
         )
+
+    def _prefer_from_history(self, goal_description: str,
+                             guidance: list[MemoryGuidance],
+                             outcome_history: list[dict[str, Any]],
+                             provenance: dict[str, list[str]]
+                             ) -> dict[str, Any] | None:
+        """Post-rule preference layer (ADR-015 addendum Phase B).
+
+        Runs ONLY when the base rules would select `direct` (it never
+        overrides a non-direct base result). Deterministic, bounded (first
+        _OUTCOME_HISTORY_MAX rows of the store's (goal_id, plan_version)
+        listing), no wall clock:
+
+        1. SUCCESS preference: a NON-direct strategy that `succeeded` for a
+           similar goal context may be preferred. Best = most successes,
+           tie-break by strategy name ascending. Direct successes are
+           no-ops (the base is already direct).
+        2. AVOIDANCE/escalation: when `direct` has >= 2 non-success rows
+           (failed OR superseded) for a similar goal context, escalate to
+           `defer_retry`. Avoid guidance is NOT consulted here: base==direct
+           implies rule 3 found no avoids, so the layer escalates to
+           defer_retry only.
+
+        Success evidence beats failure evidence (rule 1 wins over rule 2).
+        Insufficient or dissimilar history fabricates nothing (returns
+        None). Provenance (outcome_ids of the evidence rows) is filled
+        into `provenance` - informational only.
+        """
+        history = outcome_history[:_OUTCOME_HISTORY_MAX]
+        similar = [r for r in history
+                   if _goal_context_similar(goal_description,
+                                            r["goal_description"])]
+        # 1) success preference
+        successes: dict[str, list[str]] = {}
+        for r in similar:
+            if r["outcome"] == "succeeded" and r["strategy"] != "direct":
+                successes.setdefault(r["strategy"], []).append(r["outcome_id"])
+        if successes:
+            best = min(successes, key=lambda s: (-len(successes[s]), s))
+            provenance["outcome_ids"] = successes[best]
+            return {
+                "name": best,
+                "description": (
+                    f"historical outcomes show {best} succeeded for similar "
+                    f"goals ({len(successes[best])} success(es))"),
+                "constraints": {},
+            }
+        # 2) avoidance / escalation for a repeatedly non-successful `direct`
+        non_success = [r for r in similar
+                       if r["strategy"] == "direct"
+                       and r["outcome"] in ("failed", "superseded")]
+        if len(non_success) >= 2:
+            provenance["outcome_ids"] = [r["outcome_id"] for r in non_success]
+            return {
+                "name": "defer_retry",
+                "description": (
+                    "direct failed or was superseded repeatedly for similar "
+                    "goals; deferring instead of repeating"),
+                "constraints": {},
+            }
+        return None
 
 
 def _goal_related(goal: str, statement: str) -> bool:

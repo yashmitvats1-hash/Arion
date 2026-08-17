@@ -2356,8 +2356,15 @@ class ArionEngine:
                     beliefs = self.cognition.cognition.list_beliefs(limit=100) if self.cognition else []
                     env_state = self.world_monitor.current_state() if self.world_monitor else {}
                     guidance = list(getattr(context, "guidance", []) or [])
+                    outcome_history: list = []
+                    if self.goal_manager is not None:
+                        try:
+                            outcome_history = self.goal_manager.strategy_outcomes(limit=50)
+                        except Exception:
+                            outcome_history = []
                     strategy_name = self.strategy_selector.select(
-                        task.description, beliefs, env_state, guidance
+                        task.description, beliefs, env_state, guidance,
+                        outcome_history=outcome_history,
                     ).name
                 history = self.goal_manager.plan_history(task.goal_id)
                 reason = "initial_plan" if not history else (
@@ -3085,7 +3092,9 @@ class ArionEngine:
             # Strategy selection (ADR-015/016): deterministic, informational.
             # previous_strategies (from the goal's immutable plan history) lets
             # the selector escalate instead of blindly repeating a strategy
-            # that already failed (ADR-016). It can never authorize anything.
+            # that already failed (ADR-016). outcome_history (durable
+            # strategy_outcomes, bounded) feeds the post-rule preference
+            # layer (ADR-015 addendum Phase B). It can never authorize.
             if self.strategy_selector is not None:
                 try:
                     beliefs = self.cognition.cognition.list_beliefs(limit=100) if self.cognition else []
@@ -3095,9 +3104,16 @@ class ArionEngine:
                         previous_strategies = [
                             p.get("strategy", "") for p in self.goal_manager.plan_history(task.goal_id)
                         ]
+                    outcome_history: list = []
+                    if self.goal_manager is not None:
+                        try:
+                            outcome_history = self.goal_manager.strategy_outcomes(limit=50)
+                        except Exception:
+                            outcome_history = []
                     strategy = self.strategy_selector.select(
                         task.description, beliefs, env_state, ctx.guidance,
                         previous_strategies=[s for s in previous_strategies if s],
+                        outcome_history=outcome_history,
                     )
                     ctx.strategy = strategy
                     self._last_strategy = strategy

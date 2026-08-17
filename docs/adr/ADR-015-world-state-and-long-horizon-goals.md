@@ -96,8 +96,29 @@ authoritative), ADR-008 (offline testing).
 
 ## Phase-0 assessment + proposed increment: long-horizon strategy learning
 
-**Date:** 2026-08-17. **Phase 0 only** — state verification + inspection +
-design; NO implementation changes in this phase.
+**Date:** 2026-08-17.
+
+**Status:** Phases A–F IMPLEMENTED, tests-first (outcome recording →
+selection influence → observability/CLI → restart/crash + adversarial →
+pruning integration + lifecycle matrix → demo). Acceptance criterion F is
+IMPLEMENTED by `scripts/demo_adr015_strategy_learning.py` — 33 deterministic
+checks (fixed timestamps, no wall-clock assertions, byte-identical across
+three runs), proving the five base rules + empty-history identity, outcome
+recording, long-horizon learning (success preference, failure avoidance,
+precedence, dissimilar isolation), provenance, bounded 20-row window +
+prune exposure, restart/repair semantics, observability (bounded
+`strategy.outcome` events, non-content CLI JSON), and the authority
+boundary (forged memory/telemetry/outcome rows cannot manufacture
+authoritative state; scheduler weights/reservations/ceilings/config/
+ownership byte-identical). Phase E added two hardening details over the
+original design: the selector fails closed on outcome rows whose
+`goal_description` exceeds 300 chars or `reason` exceeds 200 chars
+(raw-SQL-forged oversized rows cannot poison context matching), and the
+`cognition strategies --json` CLI omits the free-text `goal_description`
+(design §8: "no content, ids + counts only"). Final verification: full
+suite **1178 passed, 2 skipped**; ADR-015 focused suite 118 ×3 stable;
+ADR-014/013 suites green; ADR-029 (76) / ADR-030 (49) / ADR-031 (59)
+green; all 20 demos green (incl. the new ADR-015 demo ×3).
 
 ### 0. State verification (exact)
 
@@ -334,9 +355,13 @@ outcome record.
   deterministic; `prune_goal_plans` prunes outcome rows with their plan
   versions (idempotent, dry-run byte-identical); scheduler state
   byte-identical after outcome pruning.
-- **F — demo + docs:** `scripts/demo_adr015_strategy_learning.py`
-  (25–35 deterministic checks, fixed timestamps); this ADR +
-  architecture.md updated.
+- **F — demo + docs:** IMPLEMENTED — `scripts/demo_adr015_strategy_learning.py`,
+  **33 deterministic checks** (fixed timestamps, no wall clock), run ×3 with
+  byte-identical output, covering the nine demo areas (initial selection,
+  outcome recording, long-horizon learning, provenance, bounded learning +
+  prune exposure, restart/repair, observability, authority boundary,
+  determinism). Docs: this ADR addendum carries the implementation status
+  and final verification numbers.
 
 ---
 

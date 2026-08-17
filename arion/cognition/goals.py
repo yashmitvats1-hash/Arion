@@ -425,9 +425,11 @@ class GoalManager:
                      environment: dict, guidance: list) -> Any:
         """Select (and persist) the goal's current strategy with provenance."""
         previous = [p.get("strategy", "") for p in self.plan_history(goal_id)]
+        outcome_history = self.strategy_outcomes(limit=50)
         strategy = self.strategy_selector.select(
             goal_description, beliefs, environment, guidance,
             previous_strategies=[s for s in previous if s],
+            outcome_history=outcome_history,
         )
         goal = self.get_goal(goal_id)
         if goal is not None and goal.strategy != strategy.name:
@@ -467,25 +469,37 @@ class GoalManager:
 
     def _record_strategy_outcome(self, goal_id: str, plan_version: int,
                                  strategy: str, outcome: str,
-                                 reason: str) -> None:
+                                 reason: str) -> bool:
         """Write one informational strategy-outcome row, best-effort.
 
         Called ONLY from the authoritative GoalManager lifecycle funnels
-        (record_plan_version / transition). A failure here must never break
-        the authoritative state machine, so exceptions are swallowed -
-        the deterministic repair pass re-derives missing rows from
-        authoritative goal/plan state.
+        (record_plan_version / transition) and the repair pass. Returns
+        True when the write was a durable change (new row or value
+        change); emits the bounded `strategy.outcome` audit event then.
+        Idempotent replays return False and emit NOTHING. A failure here
+        must never break the authoritative state machine, so exceptions
+        are swallowed (returning False) - the deterministic repair pass
+        re-derives missing rows from authoritative goal/plan state.
         """
         if self.cognitive_store is None:
-            return
+            return False
         try:
             goal = self.get_goal(goal_id)
             description = goal.description if goal is not None else ""
-            self.cognitive_store.record_strategy_outcome(
+            changed = self.cognitive_store.record_strategy_outcome(
                 goal_id, description, strategy, plan_version, outcome,
                 reason=reason)
+            if changed:
+                self._emit("strategy.outcome", goal_id=goal_id, detail={
+                    "goal_id": goal_id,
+                    "plan_version": plan_version,
+                    "strategy": strategy,
+                    "outcome": outcome,
+                    "reason": reason[:200],
+                })
+            return changed
         except Exception:
-            pass  # informational: never breaks the goal lifecycle
+            return False  # informational: never breaks the goal lifecycle
 
     def strategy_outcomes(self, goal_id: str | None = None,
                           limit: int = 200) -> list[dict[str, Any]]:
@@ -524,20 +538,22 @@ class GoalManager:
                     continue  # no valid strategy to record (fail closed)
                 if i < len(plans) - 1:
                     next_reason = plans[i + 1].get("reason", "") or ""
-                    self.cognitive_store.record_strategy_outcome(
-                        goal.id, goal.description[:300], strategy, version,
-                        "superseded", reason=next_reason)
+                    if self._record_strategy_outcome(
+                            goal.id, version, strategy, "superseded",
+                            next_reason):
+                        written += 1
                 elif goal.status_value == GoalStatus.COMPLETED.value:
-                    self.cognitive_store.record_strategy_outcome(
-                        goal.id, goal.description[:300], strategy, version,
-                        "succeeded", reason="all_work_complete")
+                    if self._record_strategy_outcome(
+                            goal.id, version, strategy, "succeeded",
+                            "all_work_complete"):
+                        written += 1
                 elif goal.status_value == GoalStatus.FAILED.value:
-                    self.cognitive_store.record_strategy_outcome(
-                        goal.id, goal.description[:300], strategy, version,
-                        "failed", reason=goal.last_replan_reason or "goal_failed")
+                    if self._record_strategy_outcome(
+                            goal.id, version, strategy, "failed",
+                            goal.last_replan_reason or "goal_failed"):
+                        written += 1
                 else:
                     continue
-                written += 1
         return written
 
     def _emit(self, kind: str, goal_id: str | None, detail: dict[str, Any]) -> None:

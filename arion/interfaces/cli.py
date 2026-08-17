@@ -122,6 +122,15 @@ def build_parser() -> argparse.ArgumentParser:
     cog_goals = cog_sub.add_parser("goals", help="long-horizon goal plan history", parents=[common, common_memory])
     cog_goals.add_argument("goal_id", help="goal id to inspect")
 
+    cog_strategies = cog_sub.add_parser(
+        "strategies",
+        help="list learned strategy outcomes (ADR-015; read-only, informational)",
+        parents=[common, common_memory])
+    cog_strategies.add_argument("--goal", default=None,
+                                help="filter to one goal id (default: all goals)")
+    cog_strategies.add_argument("--limit", type=int, default=200,
+                                help="max rows (default 200, bounded [1, 1000])")
+
     cog_prune_sup = cog_sub.add_parser(
         "prune-superseded",
         help="prune superseded belief history (ADR-014; ACTIVE beliefs are never pruned)",
@@ -1167,6 +1176,14 @@ def _goals_command(args, engine) -> int:
         if not summary.get("exists"):
             print(f"goal {args.goal_id} not found")
             return 1
+        # Additive ADR-015 addendum (Phase C): bounded, clearly-labeled
+        # strategy-learning summary - informational evidence, distinct from
+        # the authoritative goal state above. Existing keys/output preserved.
+        outcomes = gm.strategy_outcomes(args.goal_id, limit=1000)
+        outcome_counts = {"superseded": 0, "succeeded": 0, "failed": 0}
+        for r in outcomes:
+            outcome_counts[r["outcome"]] = outcome_counts.get(r["outcome"], 0) + 1
+        summary["strategy_outcomes"] = outcome_counts
         if args.json:
             _emit(summary)
             return 0
@@ -1180,6 +1197,10 @@ def _goals_command(args, engine) -> int:
                   + (f" (task {b.get('task_id')} step {b.get('step_index')})" if b.get("task_id") else ""))
         print(f"  progress: {summary['progress']}")
         print(f"  tasks: {summary['tasks']}")
+        print(f"  learned strategy outcomes (informational): "
+              f"{outcome_counts['succeeded']} succeeded, "
+              f"{outcome_counts['failed']} failed, "
+              f"{outcome_counts['superseded']} superseded")
         return 0
 
     if args.goals_command == "progress":
@@ -1332,6 +1353,31 @@ def _cognition_command(args, engine) -> int:
         for h in history:
             print(f"  v{h['plan_version']} strategy={h['strategy']} steps={len(h['plan_summary'])} at {h['created_at']}")
         print(f"progress: {gm.progress(args.goal_id)}")
+        return 0
+
+    if args.cognition_command == "strategies":
+        # Read-only inspection of learned strategy outcomes (ADR-015 addendum
+        # Phase C). Informational only - never mutates anything.
+        store = cognition.cognition
+        if args.goal is not None and args.goal == "":
+            print("error: --goal must be a non-empty goal id (fail closed)")
+            return 1
+        if not (1 <= args.limit <= 1000):
+            print(f"error: --limit must be within [1, 1000], got {args.limit} "
+                  f"(fail closed)")
+            return 1
+        rows = store.list_strategy_outcomes(goal_id=args.goal, limit=args.limit)
+        if args.json:
+            # ADR-015 design §8: "no content, ids + counts only" - the
+            # free-text goal_description stays in the durable row (context
+            # for selection) but is never emitted by the CLI (E4).
+            _emit([{k: v for k, v in r.items() if k != "goal_description"}
+                   for r in rows])
+            return 0
+        for r in rows:
+            print(f"{r['goal_id']}  v{r['plan_version']}  "
+                  f"{r['strategy']:<24} {r['outcome']:<11} "
+                  f"{(r['reason'] or '')[:120]}")
         return 0
 
     if args.cognition_command == "prune-superseded":

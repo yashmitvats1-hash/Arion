@@ -65,6 +65,7 @@ EVENT_KINDS = (
     "step.skipped",
     "world.state.changed",
     "strategy.selected",
+    "strategy.outcome",
     "capability.discovered",
     "capability.executed",
     "observation.recorded",

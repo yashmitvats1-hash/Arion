@@ -342,15 +342,18 @@ class SQLiteCognitiveStore:
     def record_strategy_outcome(self, goal_id: str, goal_description: str,
                                 strategy: str, plan_version: int,
                                 outcome: str, reason: str = "",
-                                episode_id: str | None = None) -> None:
+                                episode_id: str | None = None) -> bool:
         """Record one durable strategy outcome (INFORMATIONAL only).
 
         Exactly one row per (goal_id, plan_version) - UNIQUE invariant.
-        Idempotent: re-recording the same (goal_id, plan_version) replaces
-        the row in place and PRESERVES the original created_at. Fail closed
-        on unknown strategy names, unknown outcome states, non-positive
-        plan versions, empty ids, and non-string fields. goal_description
-        is bounded to 300 chars, reason to 200 chars.
+        Idempotent: re-recording the same (goal_id, plan_version, outcome,
+        reason, episode_id) is a NO-OP and PRESERVES the original
+        created_at. Returns True when a row was inserted or its values
+        changed (a durable change - callers may emit observability), False
+        for an idempotent replay. Fail closed on unknown strategy names,
+        unknown outcome states, non-positive plan versions, empty ids, and
+        non-string fields. goal_description is bounded to 300 chars, reason
+        to 200 chars.
         """
         if not isinstance(goal_id, str) or not goal_id.strip():
             raise ValueError(
@@ -381,9 +384,29 @@ class SQLiteCognitiveStore:
                 f"episode_id must be a non-empty string or None, got "
                 f"{episode_id!r} (fail closed)")
         existing = self.get_strategy_outcome(goal_id, plan_version)
-        created_at = existing["created_at"] if existing else utcnow()
-        self._conn.execute(
-            "INSERT OR REPLACE INTO strategy_outcomes "
+        if existing is not None:
+            if (existing["strategy"] == strategy
+                    and existing["outcome"] == outcome
+                    and existing["reason"] == reason[:200]
+                    and existing["episode_id"] == episode_id):
+                return False  # idempotent replay: no durable change
+            # durable value change: update IN PLACE, preserving the original
+            # outcome_id and created_at (history of the row's identity)
+            self._conn.execute(
+                "UPDATE strategy_outcomes SET goal_description=?, strategy=?, "
+                "outcome=?, reason=?, episode_id=? "
+                "WHERE goal_id=? AND plan_version=?",
+                (goal_description[:300], strategy, outcome, reason[:200],
+                 episode_id, goal_id, int(plan_version)),
+            )
+            self._conn.commit()
+            return True
+        # Missing row: CREATE. Cross-process safety (ADR-015 Phase D): if two
+        # writers both read "missing", the FIRST writer wins - the second
+        # INSERT OR IGNORE is a no-op (rowcount 0 -> False), so the winner's
+        # outcome_id + created_at survive and no duplicate event is emitted.
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO strategy_outcomes "
             f"({', '.join(_OUTCOME_COLS)}) VALUES ({', '.join('?' * len(_OUTCOME_COLS))})",
             (
                 new_id("sout"),
@@ -394,10 +417,11 @@ class SQLiteCognitiveStore:
                 outcome,
                 reason[:200],
                 episode_id,
-                created_at,
+                utcnow(),
             ),
         )
         self._conn.commit()
+        return cur.rowcount == 1
 
     @_threadsafe
     def get_strategy_outcome(self, goal_id: str,
@@ -579,6 +603,14 @@ class SQLiteCognitiveStore:
                     (gid, *chunk),
                 )
                 removed += cur.rowcount
+                # ADR-015 addendum Phase D: coupled strategy outcomes never
+                # outlive their plan version - removed in the SAME bounded
+                # batch (informational; the plan row is the authority).
+                self._conn.execute(
+                    f"DELETE FROM strategy_outcomes WHERE goal_id=? AND "
+                    f"plan_version IN ({placeholders})",
+                    (gid, *chunk),
+                )
         self._conn.commit()
         return removed
 
