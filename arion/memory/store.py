@@ -145,6 +145,40 @@ class SQLiteMemoryStore:
             self._conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_task_unique "
                 "ON episodic_memories(task_id)")
+            # ADR-013 addendum (reflection invariant): at most ONE
+            # reflection per episode, enforced at the DB level. Older
+            # databases may hold duplicates from the pre-invariant learning
+            # race; merge them (a bug-artifact merge, never archival
+            # pruning): keep the episode's LINKED reflection, else the
+            # NEWEST row, and repair a link that pointed at a losing
+            # duplicate. The unique index then guarantees the invariant
+            # cross-process from here on.
+            dup = self._conn.execute(
+                "SELECT 1 FROM (SELECT episode_id FROM reflections"
+                " GROUP BY episode_id HAVING COUNT(*) > 1 LIMIT 1)").fetchone()
+            if dup is not None:
+                episode_ids = [r[0] for r in self._conn.execute(
+                    "SELECT DISTINCT episode_id FROM reflections").fetchall()]
+                for ep_id in episode_ids:
+                    rows = self._conn.execute(
+                        "SELECT reflection_id FROM reflections WHERE episode_id=?"
+                        " ORDER BY created_at DESC, rowid DESC", (ep_id,)).fetchall()
+                    ids = {r[0] for r in rows}
+                    linked = self._conn.execute(
+                        "SELECT reflection_id FROM episodic_memories"
+                        " WHERE episode_id=?", (ep_id,)).fetchone()
+                    keep = linked[0] if linked and linked[0] in ids else rows[0][0]
+                    if linked and linked[0] != keep:
+                        self._conn.execute(
+                            "UPDATE episodic_memories SET reflection_id=?"
+                            " WHERE episode_id=?", (keep, ep_id))
+                    if len(rows) > 1:
+                        self._conn.execute(
+                            "DELETE FROM reflections WHERE episode_id=?"
+                            " AND reflection_id<>?", (ep_id, keep))
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_reflections_episode_unique "
+                "ON reflections(episode_id)")
             self._conn.commit()
         except sqlite3.Error:
             self._conn.rollback()
@@ -153,32 +187,122 @@ class SQLiteMemoryStore:
     # ---- episodes ----
 
     @_threadsafe
-    def record_episode(self, episode: Episode) -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO episodic_memories "
-            f"({', '.join(_EPISODE_COLS)}) VALUES ({', '.join('?' * len(_EPISODE_COLS))})",
-            (
-                episode.episode_id,
-                episode.task_id,
-                episode.goal_id,
-                episode.goal,
-                json.dumps(episode.plan_summary),
-                json.dumps(episode.actions),
-                json.dumps(episode.resources),
-                episode.outcome,
-                json.dumps(episode.verification),
-                json.dumps(episode.failures),
-                json.dumps(episode.authorization),
-                json.dumps(episode.recovery),
-                json.dumps(episode.tags),
-                float(episode.importance),
-                episode.reflection_id,
-                episode.lifecycle,
-                episode.created_at,
-                episode.updated_at,
-            ),
-        )
-        self._conn.commit()
+    def record_episode(self, episode: Episode) -> Episode | None:
+        """Record/refresh an episode; returns the CANONICAL durable episode.
+
+        DURABLE IDENTITY CLAIM (one episode per task, and a reflection link
+        that a re-record can never clobber - ADR-013 addendum). The whole
+        claim runs inside one BEGIN IMMEDIATE transaction, so concurrent
+        threads AND separate processes serialize correctly:
+
+        - a fresh task claims the episode slot: the FIRST writer wins the
+          identity; a racing worker that minted its own episode_id for the
+          same task LOSES and is returned the canonical row (its content is
+          dropped - never a second row, never a replaced identity);
+        - re-recording the SAME episode id refreshes content in place while
+          PRESERVING the durable reflection link (a fresh build with
+          reflection_id=None can no longer orphan a linked reflection) and
+          never regressing the learning lifecycle;
+        - the canonical row is re-read and returned so every subsequent
+          operation (reflection claim, link, lifecycle) targets the
+          durable identity.
+        """
+        try:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            canonical = self._canonical_episode_row(episode)
+            if canonical is None:
+                self._conn.execute(
+                    "INSERT INTO episodic_memories "
+                    f"({', '.join(_EPISODE_COLS)}) VALUES ({', '.join('?' * len(_EPISODE_COLS))})",
+                    (
+                        episode.episode_id,
+                        episode.task_id,
+                        episode.goal_id,
+                        episode.goal,
+                        json.dumps(episode.plan_summary),
+                        json.dumps(episode.actions),
+                        json.dumps(episode.resources),
+                        episode.outcome,
+                        json.dumps(episode.verification),
+                        json.dumps(episode.failures),
+                        json.dumps(episode.authorization),
+                        json.dumps(episode.recovery),
+                        json.dumps(episode.tags),
+                        float(episode.importance),
+                        episode.reflection_id,
+                        episode.lifecycle,
+                        episode.created_at,
+                        episode.updated_at,
+                    ),
+                )
+            elif canonical.episode_id == episode.episode_id:
+                # same identity: refresh content, PRESERVE the durable
+                # reflection link + created_at, never regress lifecycle.
+                self._conn.execute(
+                    "UPDATE episodic_memories SET "
+                    "task_id=COALESCE(?, task_id), goal_id=?, goal=?,"
+                    " plan_summary=?, actions=?, resources=?, outcome=?,"
+                    " verification=?, failures=?, authorization=?, recovery=?,"
+                    " tags=?, importance=?, updated_at=?,"
+                    " reflection_id=COALESCE(?, reflection_id),"
+                    " lifecycle=(CASE WHEN (CASE ? WHEN 'consolidated' THEN 2"
+                    " WHEN 'reflected' THEN 1 ELSE 0 END) >"
+                    " (CASE lifecycle WHEN 'consolidated' THEN 2"
+                    " WHEN 'reflected' THEN 1 ELSE 0 END)"
+                    " THEN ? ELSE lifecycle END)"
+                    " WHERE episode_id=?",
+                    (
+                        episode.task_id,
+                        episode.goal_id,
+                        episode.goal,
+                        json.dumps(episode.plan_summary),
+                        json.dumps(episode.actions),
+                        json.dumps(episode.resources),
+                        episode.outcome,
+                        json.dumps(episode.verification),
+                        json.dumps(episode.failures),
+                        json.dumps(episode.authorization),
+                        json.dumps(episode.recovery),
+                        json.dumps(episode.tags),
+                        float(episode.importance),
+                        episode.updated_at,
+                        episode.reflection_id,
+                        episode.lifecycle,
+                        episode.lifecycle,
+                        episode.episode_id,
+                    ),
+                )
+            # else: lost the identity race (canonical belongs to the same
+            # task under a different id) - adopt the canonical row as-is.
+            row = self._conn.execute(
+                "SELECT " + ", ".join(_EPISODE_COLS)
+                + " FROM episodic_memories WHERE episode_id=?",
+                (canonical.episode_id if canonical is not None else episode.episode_id,),
+            ).fetchone()
+            self._conn.commit()
+            return _episode_from_row(row) if row else None
+        except sqlite3.Error:
+            self._conn.rollback()
+            raise
+
+    def _canonical_episode_row(self, episode: Episode) -> Episode | None:
+        """The durable canonical episode for this episode's task (preferred)
+        or id, or None when the slot is unclaimed."""
+        if episode.task_id:
+            row = self._conn.execute(
+                "SELECT " + ", ".join(_EPISODE_COLS)
+                + " FROM episodic_memories WHERE task_id=?",
+                (episode.task_id,),
+            ).fetchone()
+            if row is not None:
+                return _episode_from_row(row)
+        row = self._conn.execute(
+            "SELECT " + ", ".join(_EPISODE_COLS)
+            + " FROM episodic_memories WHERE episode_id=?",
+            (episode.episode_id,),
+        ).fetchone()
+        return _episode_from_row(row) if row else None
 
     @_threadsafe
     def get_episode(self, episode_id: str) -> Episode | None:
@@ -250,25 +374,74 @@ class SQLiteMemoryStore:
     # ---- reflections ----
 
     @_threadsafe
-    def record_reflection(self, reflection: Reflection) -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO reflections "
-            f"({', '.join(_REFLECTION_COLS)}) VALUES ({', '.join('?' * len(_REFLECTION_COLS))})",
-            (
-                reflection.reflection_id,
-                reflection.episode_id,
-                reflection.what_happened,
-                reflection.what_worked,
-                reflection.what_failed,
-                reflection.why,
-                reflection.lesson,
-                reflection.recommendation,
-                reflection.confidence,
-                float(reflection.importance),
-                reflection.created_at,
-            ),
-        )
-        self._conn.commit()
+    def record_reflection(self, reflection: Reflection) -> Reflection | None:
+        """Persist a reflection; returns the CANONICAL durable reflection.
+
+        ONE REFLECTION PER EPISODE (ADR-013 addendum), durable across
+        threads and processes (whole claim inside BEGIN IMMEDIATE, backed
+        by the unique index on reflections.episode_id):
+
+        - re-recording the SAME reflection_id refreshes its content in
+          place (the historical INSERT OR REPLACE semantics);
+        - a NEW reflection_id for an episode that already has one LOSES
+          the claim: nothing is stored and the durable first-writer row is
+          returned, so concurrent learners adopt the canonical reflection
+          instead of duplicating it.
+        """
+        try:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            cur = self._conn.execute(
+                "UPDATE reflections SET what_happened=?, what_worked=?,"
+                " what_failed=?, why=?, lesson=?, recommendation=?,"
+                " confidence=?, importance=?, created_at=?"
+                " WHERE reflection_id=?",
+                (
+                    reflection.what_happened,
+                    reflection.what_worked,
+                    reflection.what_failed,
+                    reflection.why,
+                    reflection.lesson,
+                    reflection.recommendation,
+                    reflection.confidence,
+                    float(reflection.importance),
+                    reflection.created_at,
+                    reflection.reflection_id,
+                ),
+            )
+            if cur.rowcount == 0:
+                try:
+                    self._conn.execute(
+                        "INSERT INTO reflections "
+                        f"({', '.join(_REFLECTION_COLS)}) VALUES ({', '.join('?' * len(_REFLECTION_COLS))})",
+                        (
+                            reflection.reflection_id,
+                            reflection.episode_id,
+                            reflection.what_happened,
+                            reflection.what_worked,
+                            reflection.what_failed,
+                            reflection.why,
+                            reflection.lesson,
+                            reflection.recommendation,
+                            reflection.confidence,
+                            float(reflection.importance),
+                            reflection.created_at,
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    # the episode's single reflection slot is already taken:
+                    # first writer wins - the canonical row is returned below
+                    pass
+            row = self._conn.execute(
+                "SELECT " + ", ".join(_REFLECTION_COLS)
+                + " FROM reflections WHERE episode_id=?",
+                (reflection.episode_id,),
+            ).fetchone()
+            self._conn.commit()
+            return _reflection_from_row(row) if row else None
+        except sqlite3.Error:
+            self._conn.rollback()
+            raise
 
     @_threadsafe
     def get_reflection(self, reflection_id: str) -> Reflection | None:

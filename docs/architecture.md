@@ -171,6 +171,17 @@ Memory is INFORMATIONAL — it never authorizes (`Memory ≠ Authority`):
   merge, never archival pruning). Episodes carry a durable `lifecycle`
   state: `recorded` → `reflected` → `consolidated`; `recorded` is the
   retryable state, so a crash mid-learning resumes instead of duplicating.
+- **One reflection per episode (addendum):** the reflection claim is
+  DURABLE, not check-then-act — a DB-level UNIQUE index on
+  `reflections(episode_id)` plus first-writer-wins claims inside
+  `BEGIN IMMEDIATE`: `record_reflection` re-records the same id as an
+  in-place refresh but a NEW id for an already-reflected episode loses and
+  RETURNS the canonical row (losers adopt it); `record_episode` claims the
+  episode slot atomically (a racing minted id is never stored) and a
+  re-record preserves the durable `reflection_id` link (no clobber). A
+  crash between insert and link self-heals on the next pass. Legacy
+  duplicate reflections are merged at init (keep the linked row, else the
+  newest; repair links aimed at losers).
 - **Catch-up learning:** `engine.learn_from_terminal_tasks()` is an
   idempotent, restart-safe pass that records episodes for every terminal
   task that lacks one — recovering experience lost when a process crashed

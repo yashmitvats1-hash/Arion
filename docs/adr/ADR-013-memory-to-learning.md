@@ -153,3 +153,82 @@ episodes, reflections, or consolidation records for the same experience.
 Learning failure never rolls back execution, and execution never depends on
 learning (memory remains strictly informational; the scheduler/authorization
 contracts are untouched).
+
+## Addendum: Durable one-reflection-per-episode invariant
+
+**Status: Approved & implemented (tests-first, 2026-08-18).**
+
+### Defect (observed in CI)
+
+The episode-idempotency fix above made *episodes* unique per task, but the
+*reflection* claim was still check-then-act in `_record_memory`:
+
+```
+Worker A: observe episode.reflection_id is None
+Worker B: observe episode.reflection_id is None     (both pass the guard)
+Worker A: INSERT reflection row A
+Worker B: INSERT reflection row B                    (no episode-keyed uniqueness)
+```
+
+Two concurrent learners (threads, catch-up workers, or subprocesses) could
+each persist their own reflection for the same episode — violating the
+documented "exactly one reflection" lifecycle and intermittently failing
+`test_concurrent_learning_workers_do_not_double_apply` (`len(refs) == 1`).
+A contributing defect: `record_episode` used `INSERT OR REPLACE`, so a
+re-record with `reflection_id=None` transiently *clobbered* the durable
+reflection link (and a task-id conflict silently replaced the winner's
+episode row, orphaning the loser's reflection).
+
+### Decision
+
+The invariant is enforced by STORAGE, not process-local coordination
+(memory remains stdlib-only; no new subsystem):
+
+1. **DB-level uniqueness:** `CREATE UNIQUE INDEX idx_reflections_episode_unique
+   ON reflections(episode_id)` — the structural cross-process backstop,
+   exactly mirroring `idx_episodes_task_unique` for episodes.
+2. **First-writer-wins claims inside `BEGIN IMMEDIATE`:**
+   - `record_reflection` re-records the SAME id as an in-place content
+     refresh (historical `INSERT OR REPLACE` semantics preserved), but a
+     NEW id for an episode that already has a reflection loses the claim;
+     the durable canonical row is returned so the loser ADOPTS it.
+   - `record_episode` claims the episode slot atomically: a fresh task's
+     first writer wins the identity; a racing minted id is never stored;
+     a same-id re-record refreshes content while PRESERVING the durable
+     `reflection_id` link (`COALESCE`) and never regressing the lifecycle
+     state. It returns the canonical episode, which the engine adopts.
+3. **Engine adoption:** `_record_memory` uses the canonical episode and
+   canonical reflection for linking/lifecycle/events; only the worker that
+   actually created the reflection emits `reflection.created`.
+4. **Crash safety:** the claim is "insert row, then link". A crash between
+   the two leaves an unlinked-but-durable reflection; the next pass
+   (restart/catch-up) re-runs `record_reflection`, loses the insert claim,
+   discovers the canonical row and links it — no duplicates, no stranding.
+5. **Legacy migration (init-time, bug-artifact merge — never archival
+   pruning):** duplicate reflections per episode are merged BEFORE the
+   unique index is created, keeping the episode's LINKED reflection (else
+   the newest by `created_at`), repairing any link that pointed at a
+   losing duplicate. Orphaned reflections (no episode row) are left in
+   place: they cannot violate the per-episode invariant and memory is
+   never deleted outside the explicit prune seam.
+
+### Guarantees
+
+- At most one reflection row exists per episode — across threads, workers,
+  processes, restarts, repeated `_record_memory`/`learn_from_terminal_tasks`
+  calls, and crash/retry interleavings (unique index is the backstop; the
+  transactional claim makes adoption the common case).
+- Exactly one episode per task (unchanged), whose durable reflection link
+  can no longer be clobbered by a re-record.
+- Existing semantics preserved: reflection validation + deterministic
+  fallback, provenance, consolidation, belief derivation, event/audit
+  behavior, and same-id reflection content refresh.
+
+### Tests
+
+`tests/test_reflection_invariant.py` (tests-first; every invariant test
+fails against the vulnerable implementation): deterministic barrier-
+synchronized `_record_memory` race, storage-level first-writer-wins +
+loser adoption, link-preservation on re-record, same-id refresh, legacy
+migration (linked/newest/link-repair), idempotent replays and catch-up —
+plus the existing real-subprocess cross-process race test.
