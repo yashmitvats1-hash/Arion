@@ -341,3 +341,77 @@ ADR-013…031 demos + ADR-014 demo, explicit ADR-029/030/031 focused
 re-runs, memory/cognition suites, cross-process + adversarial + restart,
 repeated stability runs. Scheduler contract must remain byte-identical
 (additive-only diff to authority code).
+
+## Addendum: durable belief identity / versioning / supersession
+
+**Status:** Approved & implemented (2026-08-18)
+
+### Defect
+
+Two divergent belief-write paths predated this addendum:
+
+- `CognitiveState._persist_belief` intended to version + supersede, but
+  did the read/decide/insert/supersede as separate non-atomic calls
+  (check-then-act);
+- `ArionEngine._derive_beliefs` bypassed the facade and wrote straight
+  to `SQLiteCognitiveStore.record_belief`, so a higher-confidence
+  revision never superseded the active row, versions stayed at 1, and
+  concurrent workers could both pass the check and insert competing
+  ACTIVE beliefs. The raw beliefs table had no durable backstop for
+  logical identity `(category, statement)`.
+
+### Invariant (now durable)
+
+For each logical belief identity `(category, statement)`:
+
+- at most one row has `superseded_at IS NULL` at any committed state
+  (storage-level partial unique index, cross-process);
+- revisions have monotonic integer versions;
+- a STRICTLY higher-confidence observation becomes a new versioned row
+  at `max(existing versions) + 1` and atomically supersedes the
+  previously active revision(s) (history preserved);
+- an equal/lower-confidence observation ADOPTS the canonical active
+  revision — no new row, no version bump, no `belief.derived` event;
+- repeated learning, restart, concurrent threads, independent SQLite
+  connections and separate processes all converge to one valid
+  topology.
+
+### Design
+
+`SQLiteCognitiveStore.persist_belief(belief) -> BeliefPersistResult`
+is the ONE authoritative funnel. Identity lookup, confidence
+comparison, version allocation, supersession and insert all run inside
+one `BEGIN IMMEDIATE` transaction; a partial unique index
+`idx_beliefs_active_identity ON beliefs(category, statement) WHERE
+superseded_at IS NULL` is the cross-process structural backstop. The
+old active row is superseded BEFORE the new active row is inserted so
+the partial index is satisfied at every committed state. Integrity
+contention is retried deterministically a bounded number of times so a
+racing loser adopts the canonical row, and after committing the
+canonical active row is re-read so callers always observe the
+post-commit topology.
+
+`CognitiveState.persist_belief` (formerly `_persist_belief`) and
+`ArionEngine._derive_beliefs` both route through this funnel; the
+engine emits `belief.derived` only when `created=True`, so duplicate
+observations never produce duplicate events. The facade mutates the
+caller's `Belief` to match the canonical durable row.
+
+### Legacy migration
+
+`SQLiteCognitiveStore.__init__` runs an idempotent
+`_repair_belief_invariant` BEFORE creating the partial unique index:
+for lineages with multiple ACTIVE rows (the pre-fix bug artifact),
+the highest-confidence row (ties: newest `created_at`, then highest
+`rowid`) is kept canonical; the other active rows are deterministically
+superseded; versions across the lineage are renumbered monotonically so
+the canonical active row holds the highest version. No row is deleted
+(historical evidence preserved); reopening is a no-op once valid.
+
+### Tests
+
+`tests/test_belief_invariant.py` covers engine/facade parity,
+higher-confidence supersession, equal/lower idempotency, monotonic
+chains, deterministic concurrent races (barrier-synchronized),
+independent SQLite connections, real subprocess concurrency, repeated
+engine learning, catch-up, and legacy-state repair.

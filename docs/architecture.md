@@ -293,7 +293,17 @@ Learning`.
   progress — goals span sessions with traceable history.
 - **Cognitive hardening:** Belief/Preference/EnvironmentFact validation;
   belief updates are append-only + versioned (revisions supersede prior rows,
-  history never rewritten); planning context carries `strategy` +
+  history never rewritten); the identity/confidence/version/supersession
+  decision for beliefs is DURABLE, not check-then-act — a partial UNIQUE
+  INDEX on `(category, statement) WHERE superseded_at IS NULL` plus
+  first-writer-wins claims inside `BEGIN IMMEDIATE`
+  (`SQLiteCognitiveStore.persist_belief`): a STRICTLY higher-confidence
+  observation becomes a new version and atomically supersedes the prior
+  active revision, an equal/lower observation adopts the canonical active
+  row (no new row, no duplicate `belief.derived` event), and concurrent
+  threads/processes cannot commit two active revisions; legacy duplicate
+  active rows are deterministically repaired at init before the index is
+  created (ADR-014 addendum); planning context carries `strategy` +
   `environment` (bounded) alongside memories.
 - **Invariant (tested):** stale/poisoned beliefs, model instructions,
   preference manipulation, world-state facts, and memory-derived strategy
