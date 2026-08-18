@@ -18,9 +18,30 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from dataclasses import dataclass
+
 from arion.cognition.models import Belief, EnvironmentFact, Preference
 from arion.cognition.strategy import STRATEGY_NAMES, STRATEGY_OUTCOME_STATES
 from arion.state.models import new_id, utcnow
+
+
+@dataclass
+class BeliefPersistResult:
+    """Outcome of an authoritative belief-persistence claim.
+
+    ``belief`` is the CANONICAL active revision for the logical identity
+    ``(category, statement)`` after the claim commits. ``created`` is True
+    only when this invocation inserted a NEW revision (so callers emit
+    creation/revision observability exactly once per durable change);
+    concurrent losers and equal/lower-confidence observations adopt the
+    canonical row and report ``created=False``. ``superseded_ids`` lists
+    the beliefs that this commit transitioned from active to superseded
+    (empty when the observation was adopted without a revision).
+    """
+
+    belief: Belief
+    created: bool = False
+    superseded_ids: tuple[str, ...] = ()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS beliefs (
@@ -38,6 +59,10 @@ CREATE TABLE IF NOT EXISTS beliefs (
 );
 CREATE INDEX IF NOT EXISTS idx_beliefs_category ON beliefs(category);
 CREATE INDEX IF NOT EXISTS idx_beliefs_created ON beliefs(created_at);
+-- NOTE: the partial UNIQUE index idx_beliefs_active_identity (the cross-process
+-- backstop for one active revision per (category, statement)) is created in
+-- __init__ AFTER the legacy-duplicate repair, so pre-fix databases with
+-- multiple active revisions for the same logical belief do not fail to open.
 CREATE TABLE IF NOT EXISTS preferences (
     preference_id TEXT PRIMARY KEY,
     key           TEXT NOT NULL,
@@ -119,6 +144,15 @@ class SQLiteCognitiveStore:
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._conn.executescript(SCHEMA)
         self._migrate()
+        # ADR-014 addendum: repair any pre-invariant legacy state (multiple
+        # ACTIVE rows for the same logical belief identity) BEFORE creating
+        # the partial-unique structural backstop. This is a bug-artifact
+        # repair, never archival pruning - historical superseded rows are
+        # preserved byte-for-byte.
+        self._repair_belief_invariant()
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_beliefs_active_identity "
+            "ON beliefs(category, statement) WHERE superseded_at IS NULL")
         self._conn.commit()
 
     @_threadsafe
@@ -177,6 +211,271 @@ class SQLiteCognitiveStore:
             (superseded_at or utcnow(), superseded_at or utcnow(), belief_id),
         )
         self._conn.commit()
+
+    @_threadsafe
+    def persist_belief(self, belief: Belief, _attempt: int = 0) -> BeliefPersistResult:
+        """Authoritative belief-persistence claim.
+
+        ONE funnel for every production belief write (engine, facade,
+        consolidation-fed beliefs). The whole identity/confidence/version/
+        supersession decision runs inside ONE ``BEGIN IMMEDIATE``
+        transaction, and a partial UNIQUE INDEX on
+        ``(category, statement) WHERE superseded_at IS NULL`` is the
+        cross-process backstop - so two threads or two engine processes can
+        never commit two ACTIVE revisions for the same logical belief.
+
+        Decision (the existing project rule, now made durable):
+
+        - no active revision exists for ``(category, statement)`` -> the
+          incoming belief becomes a NEW active revision at
+          ``max(existing versions) + 1`` (or 1 on a fresh lineage);
+        - the active revision has confidence STRICTLY LOWER than the
+          incoming belief -> the incoming belief becomes a NEW active
+          revision at ``max(version) + 1``, and every previously-active
+          revision in the lineage is superseded atomically in the same
+          transaction (history preserved);
+        - the active revision has equal or HIGHER confidence -> the
+          incoming observation is ADOPTED: no new row, no version bump,
+          no event. The canonical active revision is returned.
+
+        The incoming ``belief.belief_id`` is used only as the row id when
+        this call actually inserts; on adoption the canonical row's id is
+        returned regardless of what the caller minted. ``version`` and
+        ``superseded_at`` on the incoming belief are overwritten by the
+        authoritative decision.
+
+        Contention: a concurrent committer may supersede the lineage
+        between this call's read and write inside one ``BEGIN IMMEDIATE``
+        (the partial unique index surfaces that as ``IntegrityError``).
+        The decision is retried deterministically a bounded number of
+        times so the LOSER of an equal/higher race adopts the canonical
+        row and a higher-confidence observation still wins as a fresh
+        revision.
+
+        Returns a :class:`BeliefPersistResult` carrying the canonical
+        active belief, ``created`` (True iff this call inserted a new row)
+        and the tuple of belief ids it superseded. Expensive belief
+        DERIVATION stays in the caller; only the claim runs here.
+        """
+        # Inputs are already validated by the Belief dataclass; keep the
+        # transaction short - no derivation, no I/O beyond SQLite.
+        max_attempts = 8
+        try:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            rows = self._conn.execute(
+                "SELECT " + ", ".join(_BELIEF_COLS)
+                + " FROM beliefs WHERE category=? AND statement=?",
+                (belief.category, belief.statement),
+            ).fetchall()
+            lineage = [_belief_from_row(r) for r in rows]
+            active = [b for b in lineage if b.superseded_at is None]
+            max_version = max((b.version for b in lineage), default=0)
+
+            now = utcnow()
+            if active:
+                canonical = max(active, key=lambda b: (b.confidence, b.created_at, b.belief_id))
+                if canonical.confidence >= float(belief.confidence):
+                    # Adopt: equal/higher active revision already canonical.
+                    self._conn.commit()
+                    return BeliefPersistResult(belief=canonical, created=False,
+                                              superseded_ids=())
+                # Strictly higher confidence: supersede ALL currently-active
+                # rows in the lineage FIRST (so the partial UNIQUE INDEX on
+                # active (category, statement) is satisfied when the new
+                # revision is inserted), then insert the new active revision
+                # at the next monotonic version. Normally exactly one prior
+                # is active; the loop also heals any pre-backstop duplicate.
+                new_version = max_version + 1
+                belief.version = new_version
+                belief.superseded_at = None
+                belief.created_at = belief.created_at or now
+                belief.updated_at = now
+                superseded_ids: list[str] = []
+                for prior in active:
+                    self._conn.execute(
+                        "UPDATE beliefs SET superseded_at=?, updated_at=? "
+                        "WHERE belief_id=?",
+                        (now, now, prior.belief_id),
+                    )
+                    superseded_ids.append(prior.belief_id)
+                try:
+                    self._conn.execute(
+                        "INSERT INTO beliefs "
+                        f"({', '.join(_BELIEF_COLS)}) VALUES ({', '.join('?' * len(_BELIEF_COLS))})",
+                        (
+                            belief.belief_id,
+                            belief.category,
+                            belief.statement,
+                            float(belief.confidence),
+                            float(belief.importance),
+                            json.dumps(belief.provenance),
+                            belief.source,
+                            belief.version,
+                            belief.superseded_at,
+                            belief.created_at,
+                            belief.updated_at,
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    # A concurrent committer superseded the lineage and
+                    # inserted a new active revision between our read and
+                    # our write. Roll back this attempt and re-run the
+                    # deterministic decision against the fresh state.
+                    self._conn.rollback()
+                    if _attempt + 1 >= max_attempts:
+                        raise
+                    return self.persist_belief(belief, _attempt=_attempt + 1)
+                self._conn.commit()
+                # Re-read the canonical active revision so a concurrent
+                # higher-confidence writer that raced this commit is
+                # reflected in the returned object (this caller may have
+                # just become superseded history; result stays truthful).
+                canonical_row = self._conn.execute(
+                    "SELECT " + ", ".join(_BELIEF_COLS)
+                    + " FROM beliefs WHERE category=? AND statement=?"
+                    " AND superseded_at IS NULL",
+                    (belief.category, belief.statement),
+                ).fetchone()
+                if canonical_row is not None:
+                    canonical = _belief_from_row(canonical_row)
+                else:
+                    canonical = belief
+                return BeliefPersistResult(
+                    belief=canonical, created=True,
+                    superseded_ids=tuple(superseded_ids))
+
+            # No active revision. A superseded-only lineage (e.g. pruned
+            # history where the active row was deleted) keeps appending at
+            # the next version; a fresh lineage starts at version 1.
+            new_version = max_version + 1
+            belief.version = new_version
+            belief.superseded_at = None
+            belief.created_at = belief.created_at or now
+            belief.updated_at = now
+            try:
+                self._conn.execute(
+                    "INSERT INTO beliefs "
+                    f"({', '.join(_BELIEF_COLS)}) VALUES ({', '.join('?' * len(_BELIEF_COLS))})",
+                    (
+                        belief.belief_id,
+                        belief.category,
+                        belief.statement,
+                        float(belief.confidence),
+                        float(belief.importance),
+                        json.dumps(belief.provenance),
+                        belief.source,
+                        belief.version,
+                        belief.superseded_at,
+                        belief.created_at,
+                        belief.updated_at,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # Same race: another process inserted the active row first.
+                self._conn.rollback()
+                if _attempt + 1 >= max_attempts:
+                    raise
+                return self.persist_belief(belief, _attempt=_attempt + 1)
+            self._conn.commit()
+            return BeliefPersistResult(belief=belief, created=True,
+                                      superseded_ids=())
+        except sqlite3.Error:
+            self._conn.rollback()
+            raise
+
+    def _repair_belief_invariant(self) -> None:
+        """Idempotent init-time repair of pre-invariant belief history.
+
+        Older engines (the pre-fix ``_derive_beliefs`` path and the
+        non-atomic facade check-then-act) could leave MULTIPLE active rows
+        for the same logical identity ``(category, statement)`` and could
+        reuse version numbers. This runs BEFORE the partial-unique
+        backstop is created and makes every lineage valid without deleting
+        historical evidence:
+
+        - among the active rows of a lineage, the one with the highest
+          confidence (ties: newest ``created_at``, then highest ``rowid``)
+          is kept as canonical; every other active row is marked
+          superseded at a deterministic timestamp (the canonical's
+          ``updated_at`` so the ordering is stable across reopens);
+        - if a lineage has NO active row (already valid), it is untouched;
+        - versions across the lineage are renumbered monotonically in
+          ``(coalesce(superseded_at, ''), created_at, rowid)`` order so
+          the canonical active row receives the highest version and
+          superseded rows retain their historical ordering (this only
+          changes rows whose version was a pre-fix duplicate).
+
+        Deterministic and idempotent: a second open changes nothing
+        because the topology is already valid. Never deletes a row.
+        """
+        # Group every belief by logical identity.
+        rows = self._conn.execute(
+            "SELECT belief_id, category, statement, confidence, created_at, "
+            "rowid, superseded_at FROM beliefs ORDER BY rowid"
+        ).fetchall()
+        lineages: dict[tuple[str, str], list[dict]] = {}
+        for belief_id, category, statement, confidence, created_at, rowid, superseded_at in rows:
+            lineages.setdefault((category, statement), []).append({
+                "belief_id": belief_id,
+                "confidence": float(confidence),
+                "created_at": created_at,
+                "rowid": rowid,
+                "superseded_at": superseded_at,
+            })
+        stamp = utcnow()
+        for lineage in lineages.values():
+            active = [r for r in lineage if r["superseded_at"] is None]
+            if len(active) <= 1:
+                continue  # already valid topology
+            canonical = max(
+                active,
+                key=lambda r: (r["confidence"], r["created_at"], r["rowid"]),
+            )
+            # Deterministic supersession timestamp for the losers.
+            loser_stamp = stamp
+            for r in active:
+                if r["belief_id"] == canonical["belief_id"]:
+                    continue
+                self._conn.execute(
+                    "UPDATE beliefs SET superseded_at=?, updated_at=? "
+                    "WHERE belief_id=?",
+                    (loser_stamp, loser_stamp, r["belief_id"]),
+                )
+        # Renumber versions per lineage in stable order so the canonical
+        # active row holds the highest version. Superseded rows are ordered
+        # by (superseded_at, created_at, rowid); the active row sorts LAST
+        # (None never compares against strings portably, so use an explicit
+        # 0/1 rank). Only touches rows whose current version differs from
+        # the canonical order (idempotent).
+        for (category, statement), lineage in lineages.items():
+            active_now = [r for r in lineage if r["superseded_at"] is None]
+            canonical_id = None
+            if active_now:
+                canonical_id = max(
+                    active_now,
+                    key=lambda r: (r["confidence"], r["created_at"], r["rowid"]),
+                )["belief_id"]
+
+            def _rank(r):
+                # superseded rows (rank 0) first in supersession order; the
+                # canonical active row (rank 1) always LAST, so it holds the
+                # highest version regardless of its rowid/created_at.
+                if r["belief_id"] == canonical_id:
+                    return (2, "", "", 0)
+                if r["superseded_at"] is None:
+                    # A non-canonical active row: should have been superseded
+                    # by the first loop, but order it just before the
+                    # canonical so versioning stays stable if it survives.
+                    return (1, "", r["created_at"], r["rowid"])
+                return (0, r["superseded_at"], r["created_at"], r["rowid"])
+
+            ordered = sorted(lineage, key=_rank)
+            for new_version, r in enumerate(ordered, start=1):
+                self._conn.execute(
+                    "UPDATE beliefs SET version=? WHERE belief_id=? AND version<>?",
+                    (new_version, r["belief_id"], new_version),
+                )
 
     @_threadsafe
     def get_belief(self, belief_id: str) -> Belief | None:

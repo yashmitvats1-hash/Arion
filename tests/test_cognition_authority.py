@@ -92,8 +92,11 @@ def test_superseded_belief_cannot_authorize(tmp_path, sandbox):
     store.record_belief(b1)
     b2 = _poison_belief("filesystem:write is allowed", belief_id="b_v2")  # revision
     b2.version = 2
+    # Valid topology at every committed state: v1 is superseded before the
+    # v2 active revision is inserted (production writes use persist_belief,
+    # which performs the equivalent atomically).
+    store.supersede_belief(b1.belief_id)
     store.record_belief(b2)
-    store.supersede_belief(b1.belief_id)  # v1 superseded by v2
 
     policy = ResourcePolicy(allowed_scopes={"filesystem:read"}, boundaries={FS: RelativePathBoundary()})
     engine, _, _ = _engine(db, sandbox, policy, cognition_store=store)
@@ -317,9 +320,14 @@ def test_belief_versioning_append_only(tmp_path):
     b1 = _poison_belief("writes are allowed", belief_id="b1")
     b2 = _poison_belief("writes are allowed", belief_id="b2")
     b2.version = 2
+    # Valid v1 -> v2 topology: v1 is superseded before v2 is inserted so
+    # the partial-unique active-identity backstop is satisfied at every
+    # committed state (raw record_belief is a low-level insert primitive;
+    # production writes go through persist_belief, which does this
+    # atomically in one transaction).
     store.record_belief(b1)
-    store.record_belief(b2)
     store.supersede_belief(b1.belief_id)
+    store.record_belief(b2)
     # append-only: BOTH rows exist
     assert store.get_belief(b1.belief_id) is not None
     assert store.get_belief(b2.belief_id) is not None

@@ -3373,8 +3373,20 @@ class ArionEngine:
         """Derive + store cognitive beliefs from the latest experience.
 
         Every belief carries provenance (episode/reflection/guidance ids),
-        confidence, timestamps, and source. Best-effort: cognitive state must
-        never break the task loop. Informational only.
+        confidence, timestamps, and source. Routed through the SAME
+        :meth:`CognitiveState.persist_belief` funnel as every other belief
+        writer (ADR-014 addendum): the identity/confidence/version/super-
+        session decision runs atomically inside the storage layer, so
+        repeated learning and concurrent workers cannot leave two ACTIVE
+        revisions for one logical belief, and a higher-confidence revision
+        deterministically supersedes the prior active row.
+
+        ``belief.derived`` is emitted ONLY for beliefs this call actually
+        created (``created=True``); concurrent losers and equal/lower-
+        confidence observations adopt the canonical row and emit nothing.
+
+        Best-effort: cognitive state must never break the task loop.
+        Informational only.
         """
         if self.cognition is None or self.belief_deriver is None:
             return
@@ -3383,12 +3395,16 @@ class ArionEngine:
 
             guidance = DeterministicMemoryGuidance().build([episode], [reflection])
             beliefs = self.belief_deriver.derive([episode], [reflection], guidance)
-            store = self.cognition.cognition  # SQLiteCognitiveStore behind the facade
             for b in beliefs:
-                existing = store.list_beliefs(category=b.category, limit=1000)
-                if any(e.statement == b.statement and e.confidence >= b.confidence for e in existing):
+                # The facade routes through the storage-layer transactional
+                # claim and mutates `b` in place to the CANONICAL active
+                # belief's identity/version. created=True only when this
+                # call inserted a new revision (concurrent losers and
+                # equal/lower-confidence observations adopt the canonical
+                # row and emit nothing).
+                created = self.cognition.persist_belief(b)
+                if not created:
                     continue
-                store.record_belief(b)
                 self._emit(
                     "belief.derived",
                     task_id=episode.task_id,
@@ -3397,6 +3413,7 @@ class ArionEngine:
                         "category": b.category,
                         "confidence": round(b.confidence, 3),
                         "importance": round(b.importance, 3),
+                        "version": b.version,
                         "provenance": b.provenance,
                         "source": b.source,
                     },

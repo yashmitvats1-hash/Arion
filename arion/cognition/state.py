@@ -32,11 +32,15 @@ class CognitiveState:
         self.deriver = deriver or DeterministicBeliefDeriver()
 
     def derive_and_store(self, episodes: list, reflections: list, guidance: list) -> int:
-        """Derive beliefs and store them (append-only + versioned).
+        """Derive beliefs and store them under the durable invariant.
 
-        A revision with a higher confidence for the same (category, statement)
-        supersedes the prior belief (history preserved). Returns the number of
-        NEW beliefs stored.
+        A revision with a STRICTLY higher confidence for the same
+        ``(category, statement)`` atomically supersedes the prior active
+        belief (history preserved, version bumped); equal/lower confidence
+        observations adopt the canonical active revision without writing.
+        Returns the number of NEW belief revisions stored (the count of
+        durable changes - concurrent losers and idempotent observations
+        are not counted).
         """
         beliefs = self.deriver.derive(episodes, reflections, guidance)
         new_count = 0
@@ -45,28 +49,33 @@ class CognitiveState:
                 new_count += 1
         return new_count
 
-    def _persist_belief(self, b: Belief) -> bool:
-        """Store one belief under the shared versioning rule.
+    def persist_belief(self, b: Belief) -> bool:
+        """Authoritative belief persistence (see ``SQLiteCognitiveStore.persist_belief``).
 
-        Same (category, statement) with a HIGHER confidence: record the new
-        version and supersede the prior rows (history preserved). Equal or
-        lower confidence: skip. Returns True when a NEW belief row was stored.
+        Routes through the storage-layer transactional claim so the facade
+        and the engine cannot diverge. Returns True only when this call
+        inserted a NEW revision (a durable change); False when the
+        observation was adopted by an equal/higher canonical active belief.
         """
-        existing = self.cognition.list_beliefs(category=b.category, limit=1000)
-        match = [e for e in existing if e.statement == b.statement]
-        if match:
-            best = max(match, key=lambda e: e.confidence)
-            if best.confidence >= b.confidence:
-                return False  # already known at >= confidence
-            # higher-confidence revision: store new version, supersede old
-            b.version = max(e.version for e in match) + 1
-            self.cognition.record_belief(b)
-            for e in match:
-                if e.superseded_at is None:
-                    self.cognition.supersede_belief(e.belief_id)
-            return True
-        self.cognition.record_belief(b)
-        return True
+        result = self.cognition.persist_belief(b)
+        canonical = result.belief
+        # Reflect the canonical row's authoritative identity/version back
+        # onto the caller's object (id/version/timestamps are decided
+        # durably inside the transaction; a concurrent higher-confidence
+        # writer may have superseded our insert).
+        b.belief_id = canonical.belief_id
+        b.version = canonical.version
+        b.superseded_at = canonical.superseded_at
+        b.confidence = canonical.confidence
+        b.importance = canonical.importance
+        b.provenance = canonical.provenance
+        b.source = canonical.source
+        b.created_at = canonical.created_at
+        b.updated_at = canonical.updated_at
+        return result.created
+
+    # Backwards-compatible alias for the previous private seam.
+    _persist_belief = persist_belief
 
     def refresh_from_memory(self, limit: int = 20,
                             include_consolidations: bool = False) -> int:

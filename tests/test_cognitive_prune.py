@@ -99,10 +99,15 @@ def test_prune_superseded_invalid_older_than_fails_closed(tmp_path):
 
 def test_active_beliefs_never_pruned(tmp_path):
     store = SQLiteCognitiveStore(tmp_path / "c.db")
-    # active lineage (2 active revisions, no superseded rows)
-    store.record_belief(_belief("active-old", "semantic", "active stmt",
+    # Two DISTINCT active beliefs (each (category, statement) has exactly
+    # one active revision, per the durable belief-identity invariant): one
+    # unversioned lineage and one at v2 with a superseded predecessor.
+    store.record_belief(_belief("active-old", "semantic", "active stmt A",
                                 created_at=_iso_plus(T0, 0)))
-    store.record_belief(_belief("active-new", "semantic", "active stmt",
+    store.record_belief(_belief("active-superseded", "semantic", "active stmt B",
+                                created_at=_iso_plus(T0, 50),
+                                superseded_at=_iso_plus(T0, 60)))
+    store.record_belief(_belief("active-new", "semantic", "active stmt B",
                                 confidence=0.9, version=2,
                                 created_at=_iso_plus(T0, 100)))
     # dead lineage: older superseded version + newest superseded version
@@ -116,10 +121,13 @@ def test_active_beliefs_never_pruned(tmp_path):
     assert store.count_beliefs() == 2
 
     removed = store.prune_superseded_beliefs(older_than=_iso_plus(T0, 200))
-    assert removed == 1  # dead-old (beyond keep_versions=1, older than cutoff)
-    assert store.count_beliefs() == 2          # active count unchanged
+    # dead-old is pruned (oldest superseded of the "old stmt" lineage beyond
+    # keep_versions=1); active-superseded is the newest kept superseded row
+    # of the "active stmt B" lineage and is retained.
+    assert removed == 1
+    assert store.count_beliefs() == 2          # active count unchanged (2 distinct active statements)
     active = [b.belief_id for b in store.list_beliefs(limit=100)]
-    assert active == ["active-new", "active-old"]
+    assert set(active) == {"active-new", "active-old"}
     assert store.get_belief("active-old") is not None
     assert store.get_belief("active-new") is not None
     store.close()
