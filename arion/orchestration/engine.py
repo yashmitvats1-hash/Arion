@@ -3189,11 +3189,17 @@ class ArionEngine:
     def _record_memory(self, task: Task) -> None:
         """Record a structured episode + reflection for a terminal task.
 
-        IDEMPOTENT (ADR-013 addendum): exactly one episode per task. If an
-        episode already exists for this task, the pass reuses it - an
-        existing reflection means the whole pass already completed, so
-        nothing is duplicated; a recorded-but-unreflected episode (crash
-        mid-learning) resumes from reflection onward. Runs best-effort:
+        IDEMPOTENT (ADR-013 addendum): exactly one episode per task and ONE
+        REFLECTION PER EPISODE, both enforced DURABLY at the storage layer
+        (task-keyed and episode-keyed unique indexes; first-writer-wins
+        claims inside BEGIN IMMEDIATE), so concurrent threads, concurrent
+        workers/processes, restarts and crash-retries can duplicate
+        neither. If an episode already exists for this task, the pass
+        reuses it; an existing reflection means the whole pass already
+        completed, so nothing is duplicated; a recorded-but-unreflected
+        episode (crash mid-learning) resumes from reflection onward - a
+        racing worker that loses the reflection claim adopts the canonical
+        reflection instead of creating a second one. Runs best-effort:
         memory failure never changes task outcome. Stores structured
         summaries only - never secrets, credentials, raw prompts, or raw
         model responses.
@@ -3229,7 +3235,17 @@ class ArionEngine:
                     episode.episode_id, "recorded")
             except Exception:
                 pass
-            self.memory.record_episode(episode)
+            # DURABLE EPISODE CLAIM (one episode per task, ADR-013
+            # addendum): record_episode returns the CANONICAL durable
+            # episode for the task - first writer wins the identity, a
+            # racing minted id is never stored, and a re-record preserves
+            # the durable reflection link. Adopt the canonical identity so
+            # every subsequent operation (reflection claim, link,
+            # lifecycle) targets the durable row.
+            minted_id = episode.episode_id
+            stored_episode = self.memory.record_episode(episode)
+            if stored_episode is not None:
+                episode = stored_episode
             self._emit(
                 "memory.episode.recorded",
                 task_id=task.id,
@@ -3238,7 +3254,8 @@ class ArionEngine:
                     "outcome": episode.outcome,
                     "tags": episode.tags[:20],
                     "importance": round(episode.importance, 2),
-                    "reused": existing is not None,
+                    "reused": existing is not None
+                    or episode.episode_id != minted_id,
                 },
             )
 
@@ -3258,7 +3275,20 @@ class ArionEngine:
                 )
             if reflection is None:
                 reflection = DeterministicReflector().reflect(episode)
-            self.memory.record_reflection(reflection)
+            # DURABLE REFLECTION CLAIM (one reflection per episode, ADR-013
+            # addendum): the store keeps the FIRST reflection inserted for
+            # the episode; a concurrent worker that already reflected wins
+            # and this pass ADOPTS the canonical reflection instead of
+            # duplicating it (idempotent across threads, workers and
+            # restarts).
+            created_reflection = True
+            try:
+                canonical = self.memory.record_reflection(reflection)
+                if canonical is not None and canonical.reflection_id != reflection.reflection_id:
+                    reflection = canonical  # another worker's reflection won
+                    created_reflection = False
+            except Exception:
+                canonical = None  # best-effort memory: link our own reflection
             try:
                 self.memory.link_reflection(episode.episode_id, reflection.reflection_id)
             except Exception:
@@ -3268,11 +3298,12 @@ class ArionEngine:
                     episode.episode_id, "reflected")
             except Exception:
                 pass
-            self._emit(
-                "reflection.created",
-                task_id=task.id,
-                detail={"reflection_id": reflection.reflection_id, "episode_id": episode.episode_id},
-            )
+            if created_reflection:
+                self._emit(
+                    "reflection.created",
+                    task_id=task.id,
+                    detail={"reflection_id": reflection.reflection_id, "episode_id": episode.episode_id},
+                )
 
             # Cognitive state: derive + store beliefs (semantic/procedural)
             # with full provenance (ADR-014). Informational only.
