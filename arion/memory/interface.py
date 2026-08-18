@@ -51,7 +51,15 @@ class MemoryStore(Protocol):
 
     # ---- consolidations ----
 
-    def record_consolidation(self, record: Any) -> None: ...
+    def record_consolidation(self, record: Any):
+        """Persist a consolidation under the ONE-CONSOLIDATION-PER-SOURCE-SET
+        invariant (durable, cross-process, ORDER-INDEPENDENT source identity):
+        re-recording the same id refreshes content in place but never mutates
+        the immutable source-set identity; a NEW id for a source set that
+        already has one loses the claim and the canonical first-writer row is
+        RETURNED so the loser ADOPTS it. Implementations may return None when
+        they cannot determine the canonical row - callers must tolerate None."""
+        ...
     def list_consolidations(self, limit: int = 50) -> list: ...
 
     # ---- archival / pruning seam (ADR-014) ----

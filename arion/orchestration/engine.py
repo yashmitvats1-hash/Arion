@@ -3405,7 +3405,14 @@ class ArionEngine:
             pass
 
     def _consolidate(self, task_id: str) -> None:
-        """Run deterministic consolidation; emit memory.consolidated per record."""
+        """Run deterministic consolidation; emit memory.consolidated per record.
+
+        ADR-013 addendum: the consolidator returns ONLY records this invocation
+        actually created - a worker that merely ADOPTS a concurrent peer's
+        canonical consolidation (same source set already persisted durably)
+        returns nothing, so `memory.consolidated` is emitted ONLY for real
+        creations and a racing learner can never emit a duplicate event.
+        """
         try:
             from arion.memory.consolidation import MemoryConsolidator
 
