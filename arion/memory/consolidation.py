@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from arion.memory.models import Episode
-from arion.memory.store import ConsolidationRecord
+from arion.memory.store import ConsolidationRecord, canonical_source_key
 from arion.state.models import new_id, utcnow
 
 _STOP = {"a", "an", "the", "this", "that", "of", "in", "on", "for", "to", "and", "or",
@@ -107,17 +107,27 @@ class MemoryConsolidator:
         """Scan recent episodes, write consolidation records, return them.
 
         Never deletes history; provenance is preserved in each record.
+
+        The durable invariant is "one canonical source-episode set -> at most
+        one consolidation". The source-set identity is ORDER-INDEPENDENT
+        (canonical_source_key), and STORAGE enforces uniqueness on it - this
+        method only REPORT records this invocation actually created. A worker
+        whose concurrent claim loses (a peer already persisted the same
+        source set) ADOPTS the canonical row silently and is not reported, so
+        sequential callers see the historical behavior while concurrent
+        learners cannot duplicate a consolidation.
         """
         episodes = self.store.list_recent(limit=limit)
         candidates = find_consolidation_candidates(episodes, min_similar=self.min_similar)
-        # idempotency: skip groups already consolidated (same source episode set)
-        existing = {frozenset(r.source_episode_ids) for r in self.store.list_consolidations(limit=10000)}
+        # idempotency: skip groups already consolidated (same canonical source
+        # set); the ORDER-INDEPENDENT key makes permutations collapse onto it.
+        existing = {canonical_source_key(r.source_episode_ids) for r in self.store.list_consolidations(limit=10000)}
         records: list[ConsolidationRecord] = []
         for group in candidates:
-            if frozenset(e.episode_id for e in group) in existing:
-                continue
             group_sorted = sorted(group, key=lambda e: e.created_at)
             source_ids = [e.episode_id for e in group_sorted]
+            if canonical_source_key(source_ids) in existing:
+                continue
             lessons: list[str] = []
             for ep in group_sorted:
                 ref = self.store.get_reflection(ep.reflection_id) if ep.reflection_id else None
@@ -132,8 +142,14 @@ class MemoryConsolidator:
                 importance=round(min(1.0, sum(e.importance for e in group_sorted) / len(group_sorted) + 0.1 * (len(group) - 1)), 2),
                 created_at=utcnow(),
             )
-            self.store.record_consolidation(record)
-            records.append(record)
+            # Durable claim: if a concurrent worker already persisted this
+            # source set, the storage layer returns the CANONICAL row and
+            # this candidate loses the race - it is NOT reported as created.
+            canonical = self.store.record_consolidation(record)
+            if canonical is not None and canonical.consolidation_id == record.consolidation_id:
+                records.append(record)
+            elif canonical is not None:
+                existing.add(canonical_source_key(canonical.source_episode_ids))
         return records
 
 

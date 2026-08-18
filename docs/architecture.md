@@ -182,6 +182,24 @@ Memory is INFORMATIONAL — it never authorizes (`Memory ≠ Authority`):
   crash between insert and link self-heals on the next pass. Legacy
   duplicate reflections are merged at init (keep the linked row, else the
   newest; repair links aimed at losers).
+- **One consolidation per source set (addendum):** the consolidation claim is
+  DURABLE, not check-then-act — a canonical, ORDER-INDEPENDENT source-set
+  identity (`canonical_source_key = json.dumps(sorted(ids))`, so
+  `[A,B,C] == [C,A,B]`) is keyed by a DB-level UNIQUE index on
+  `consolidations.source_key` plus first-writer-wins claims inside
+  `BEGIN IMMEDIATE`: `record_consolidation` re-records the same id as an
+  in-place refresh but never mutates the immutable source-set identity, and a
+  NEW id for an already-consolidated source set loses and RETURNS the
+  canonical row (losers adopt it). The consolidator reports only records it
+  actually created, so the engine emits `memory.consolidated` only for real
+  creations (a racing learner never emits a duplicate event). Legacy duplicate
+  consolidations are merged at init (keep the newest by `created_at`, rowid)
+  before the unique index is created; malformed keys stay NULL (SQLite allows
+  multiple NULLs in a unique index) rather than blocking it.
+- **NULL `task_id` preservation (rider):** the init-time episode task-dedup is
+  guarded with `task_id IS NOT NULL`, so a task-less episode (`task_id IS
+  NULL`) is no longer silently deleted at store initialization while ordinary
+  per-task dedup is unchanged.
 - **Catch-up learning:** `engine.learn_from_terminal_tasks()` is an
   idempotent, restart-safe pass that records episodes for every terminal
   task that lacks one — recovering experience lost when a process crashed

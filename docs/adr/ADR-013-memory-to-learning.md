@@ -232,3 +232,97 @@ synchronized `_record_memory` race, storage-level first-writer-wins +
 loser adoption, link-preservation on re-record, same-id refresh, legacy
 migration (linked/newest/link-repair), idempotent replays and catch-up —
 plus the existing real-subprocess cross-process race test.
+
+## Addendum: Durable one-consolidation-per-source-set invariant
+
+**Status: Approved & implemented (tests-first, 2026-08-18).**
+
+### Defect (observed in CI)
+
+The reflection fix made *reflections* unique per episode, but the
+*consolidation* claim was still check-then-act in `MemoryConsolidator`:
+
+```
+Worker A: list_consolidations() -> source set absent
+Worker B: list_consolidations() -> source set absent     (both pass the guard)
+Worker A: INSERT consolidation A  (id A)
+Worker B: INSERT consolidation B  (id B)                  (no set-keyed uniqueness)
+```
+
+The `consolidations` table only keyed uniqueness on `consolidation_id`, so two
+concurrent learners (threads, catch-up workers, or subprocesses) could each
+persist their own consolidation for the same source-episode set — and because
+consolidations are NEVER pruned (they are the permanent merged summary), this
+duplicated history permanently and produced duplicate `memory.consolidated`
+creation events at the engine level.
+
+### Decision
+
+The invariant is enforced by STORAGE, not process-local coordination (memory
+remains stdlib-only; no new subsystem), mirroring the reflection fix:
+
+1. **Canonical source identity (order-independent):** `canonical_source_key`
+   maps a source-episode set to a deterministic key
+   (`json.dumps(sorted(ids))`), so `[A,B,C]`, `[C,A,B]` and `[B,C,A]` all
+   resolve to the same consolidation identity regardless of ordering.
+2. **DB-level uniqueness:** a `consolidations.source_key` column + `CREATE
+   UNIQUE INDEX idx_consolidations_source_key ON consolidations(source_key)`
+   — the structural cross-process backstop, exactly mirroring the episode and
+   reflection unique indexes.
+3. **First-writer-wins claims inside `BEGIN IMMEDIATE`:**
+   - `record_consolidation` re-records the SAME id as an in-place content
+     refresh but NEVER mutates the immutable source-set identity
+     (`source_key`/`source_episode_ids`);
+   - a NEW id for a source set that already has one loses the claim; the
+     durable canonical row is RETURNED so the loser ADOPTS it (the method now
+     returns `ConsolidationRecord | None` instead of `None`, and the
+     interface protocol documents this);
+   - the expensive consolidation COMPUTATION stays outside the short write
+     transaction — only the claim runs inside it.
+4. **Consolidator behavior:** `MemoryConsolidator.consolidate()` skips groups
+   already present by canonical source key (sequential idempotency), submits
+   each candidate through the storage claim, and reports ONLY records this
+   invocation actually created. A worker that merely adopts a concurrent
+   peer's canonical consolidation returns nothing — converging silently.
+5. **Event behavior:** the engine emits `memory.consolidated` ONLY for records
+   actually created by the invocation, so a racing learner can never emit a
+   duplicate creation event.
+6. **Legacy migration (init-time, bug-artifact merge — never archival
+   pruning):** the `source_key` column is added if missing, backfilled from
+   the stored source episode ids, and duplicate rows sharing a source key are
+   merged BEFORE the unique index is created (keep the newest by `created_at`,
+   `rowid`). Malformed legacy rows that cannot produce a valid canonical key
+   are left `NULL` (SQLite allows multiple NULLs in a unique index) rather
+   than blocking it. The migration is idempotent across reopens.
+
+### Narrow rider: `task_id IS NULL` data loss
+
+The init-time episode task-dedup used `episode_id NOT IN (SELECT ... WHERE
+m2.task_id = episodic_memories.task_id ...)`. Because a SQL NULL comparison
+is never true, the subquery matched no row for a task-less episode
+(`task_id IS NULL`), leaving `NOT IN` true and silently DELETING valid
+task-less episodes at store initialization. Fixed by guarding the deletion
+with `task_id IS NOT NULL`: ordinary per-task dedup is unchanged, while
+`task_id NULL` episodes are preserved.
+
+### Guarantees
+
+- At most one consolidation row exists per canonical source-episode set —
+  across threads, workers, processes, restarts, repeated learning and
+  catch-up passes, and crash/retry interleavings (unique index is the
+  backstop; the transactional claim makes adoption the common case).
+- The source-set identity is order-independent and immutable during refresh.
+- Exactly one `memory.consolidated` creation event per new consolidation.
+- `task_id IS NULL` episodes survive SQLite store initialization; non-NULL
+  task dedup still works.
+
+### Tests
+
+`tests/test_consolidation_invariant.py` (tests-first; 9 of the invariant
+tests fail against the vulnerable implementation): order-independent source
+identity, sequential idempotency, storage-level first-writer-wins + loser
+adoption, same-id refresh WITHOUT source-identity mutation, deterministic
+barrier-synchronized consolidation race, independent-connection cross-process
+claim, concurrent engine `_record_memory` race (exactly one consolidation +
+one creation event), legacy duplicate merge, distinct sets stay distinct,
+idempotent reopen, and NULL-`task_id` preservation / non-NULL dedup.

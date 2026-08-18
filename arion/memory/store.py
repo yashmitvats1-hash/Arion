@@ -63,6 +63,7 @@ CREATE INDEX IF NOT EXISTS idx_reflections_episode ON reflections(episode_id);
 CREATE INDEX IF NOT EXISTS idx_reflections_created ON reflections(created_at);
 CREATE TABLE IF NOT EXISTS consolidations (
     consolidation_id TEXT PRIMARY KEY,
+    source_key       TEXT,
     source_episode_ids TEXT NOT NULL,
     category TEXT NOT NULL,
     merged_lesson TEXT NOT NULL,
@@ -73,12 +74,25 @@ CREATE TABLE IF NOT EXISTS consolidations (
 """
 
 
+def canonical_source_key(source_episode_ids) -> str:
+    """Deterministic, ORDER-INDEPENDENT identity for a source episode set.
+
+    The same set of episode ids always produces the same key regardless of
+    input ordering - e.g. [A,B,C], [C,A,B] and [B,C,A] all resolve to
+    '["A","B","C"]'. This is the durable identity on which the
+    one-consolidation-per-source-set invariant is keyed (ADR-013 addendum).
+    """
+    ids = sorted(str(i) for i in (source_episode_ids or []))
+    return json.dumps(ids)
+
+
 class ConsolidationRecord:
     """An explicit, explainable consolidation of similar episodes."""
 
-    def __init__(self, consolidation_id, source_episode_ids, category, merged_lesson, count, importance, created_at):
+    def __init__(self, consolidation_id, source_episode_ids, category, merged_lesson, count, importance, created_at, source_key=None):
         self.consolidation_id = consolidation_id
         self.source_episode_ids = source_episode_ids
+        self.source_key = source_key
         self.category = category
         self.merged_lesson = merged_lesson
         self.count = count
@@ -89,6 +103,7 @@ class ConsolidationRecord:
         return {
             "consolidation_id": self.consolidation_id,
             "source_episode_ids": self.source_episode_ids,
+            "source_key": self.source_key,
             "category": self.category,
             "merged_lesson": self.merged_lesson,
             "count": self.count,
@@ -137,8 +152,18 @@ class SQLiteMemoryStore:
         # deleted otherwise). Then enforce the invariant at the DB level as
         # the cross-process backstop.
         try:
+            # Guard the task-dedup with `task_id IS NOT NULL`: a NULL
+            # comparison in SQL is never true, so without this guard the
+            # subquery `m2.task_id = episodic_memories.task_id` matches no
+            # row for a task-less episode (task_id IS NULL), leaving the
+            # `NOT IN (...)` predicate true and silently DELETING valid
+            # task-less episodes at initialization. The guard keeps ordinary
+            # per-task dedup for non-NULL task_id values unchanged while
+            # preserving NULL-task_id episodes (which the task-keyed unique
+            # index already allows multiple of).
             self._conn.execute(
-                "DELETE FROM episodic_memories WHERE episode_id NOT IN ("
+                "DELETE FROM episodic_memories WHERE task_id IS NOT NULL "
+                "AND episode_id NOT IN ("
                 "SELECT episode_id FROM episodic_memories m2 WHERE "
                 "m2.task_id = episodic_memories.task_id ORDER BY updated_at "
                 "DESC, rowid DESC LIMIT 1)")
@@ -179,6 +204,60 @@ class SQLiteMemoryStore:
             self._conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_reflections_episode_unique "
                 "ON reflections(episode_id)")
+            # ADR-013 addendum (consolidation invariant): at most ONE
+            # consolidation per canonical source-episode set, enforced at
+            # the DB level. Add the canonical source_key column if the
+            # existing database predates it, backfill canonical source keys
+            # from the stored source episode ids, then MERGE legacy
+            # duplicates that share a source key (keep the newest row by
+            # created_at, rowid - a bug-artifact merge, never archival
+            # pruning). Only after duplicates are repaired is the unique
+            # index created, so it is the structural cross-process backstop
+            # from here on. Malformed legacy rows that cannot produce a
+            # valid canonical key are left NULL (SQLite allows multiple NULLs
+            # in a unique index) rather than blocking it.
+            cols = [r[1] for r in self._conn.execute(
+                "PRAGMA table_info(consolidations)").fetchall()]
+            if "source_key" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE consolidations ADD COLUMN source_key TEXT")
+            for (cid,) in self._conn.execute(
+                "SELECT consolidation_id FROM consolidations "
+                "WHERE source_key IS NULL").fetchall():
+                row = self._conn.execute(
+                    "SELECT source_episode_ids FROM consolidations "
+                    "WHERE consolidation_id=?", (cid,)).fetchone()
+                key = None
+                try:
+                    ids = json.loads(row[0])
+                    if isinstance(ids, list):
+                        key = canonical_source_key(ids)
+                except (ValueError, TypeError):
+                    key = None
+                self._conn.execute(
+                    "UPDATE consolidations SET source_key=? "
+                    "WHERE consolidation_id=?", (key, cid))
+            dup = self._conn.execute(
+                "SELECT 1 FROM (SELECT source_key FROM consolidations "
+                "WHERE source_key IS NOT NULL GROUP BY source_key "
+                "HAVING COUNT(*)>1 LIMIT 1)").fetchone()
+            if dup is not None:
+                keys = [r[0] for r in self._conn.execute(
+                    "SELECT DISTINCT source_key FROM consolidations "
+                    "WHERE source_key IS NOT NULL").fetchall()]
+                for key in keys:
+                    rows = self._conn.execute(
+                        "SELECT consolidation_id FROM consolidations "
+                        "WHERE source_key=? ORDER BY created_at DESC, "
+                        "rowid DESC", (key,)).fetchall()
+                    keep = rows[0][0]
+                    if len(rows) > 1:
+                        self._conn.execute(
+                            "DELETE FROM consolidations WHERE source_key=? "
+                            "AND consolidation_id<>?", (key, keep))
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_consolidations_source_key "
+                "ON consolidations(source_key)")
             self._conn.commit()
         except sqlite3.Error:
             self._conn.rollback()
@@ -477,37 +556,99 @@ class SQLiteMemoryStore:
     # ---- consolidations ----
 
     @_threadsafe
-    def record_consolidation(self, record: ConsolidationRecord) -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO consolidations "
-            "(consolidation_id, source_episode_ids, category, merged_lesson, count, importance, created_at) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (
-                record.consolidation_id,
-                json.dumps(record.source_episode_ids),
-                record.category,
-                record.merged_lesson,
-                record.count,
-                float(record.importance),
-                record.created_at,
-            ),
-        )
-        self._conn.commit()
+    def record_consolidation(self, record: ConsolidationRecord) -> ConsolidationRecord | None:
+        """Durable claim for a consolidation's canonical source-episode set.
+
+        ONE CONSOLIDATION PER SOURCE SET (ADR-013 addendum), durable across
+        threads and processes (whole claim inside BEGIN IMMEDIATE, backed by
+        the unique index on consolidations.source_key):
+
+        - re-recording the SAME consolidation_id refreshes its content in
+          place (the historical refresh semantics) but NEVER mutates the
+          immutable source-set identity (source_key / source_episode_ids);
+        - a NEW consolidation_id for a source set that already has one LOSES
+          the claim: nothing is stored and the durable first-writer row is
+          returned, so concurrent learners ADOPT the canonical consolidation
+          instead of duplicating it.
+
+        The expensive consolidation COMPUTATION stays outside this short
+        transaction - only the claim runs here. Returns the CANONICAL durable
+        consolidation (the caller's own when it won, the first-writer's when
+        it lost), or None when the row cannot be determined.
+        """
+        source_key = canonical_source_key(record.source_episode_ids)
+        try:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            cur = self._conn.execute(
+                "UPDATE consolidations SET category=?, merged_lesson=?, "
+                "count=?, importance=?, created_at=? WHERE consolidation_id=?",
+                (
+                    record.category,
+                    record.merged_lesson,
+                    record.count,
+                    float(record.importance),
+                    record.created_at,
+                    record.consolidation_id,
+                ),
+            )
+            won = cur.rowcount > 0
+            if not won:
+                try:
+                    self._conn.execute(
+                        "INSERT INTO consolidations "
+                        "(consolidation_id, source_key, source_episode_ids, "
+                        "category, merged_lesson, count, importance, created_at) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (
+                            record.consolidation_id,
+                            source_key,
+                            json.dumps(record.source_episode_ids),
+                            record.category,
+                            record.merged_lesson,
+                            record.count,
+                            float(record.importance),
+                            record.created_at,
+                        ),
+                    )
+                    won = True
+                except sqlite3.IntegrityError:
+                    # the source set's single consolidation slot is already
+                    # taken: first writer wins - the canonical row is read
+                    # below and returned so the loser ADOPTS it
+                    won = False
+            # Canonical row: when THIS invocation owns the consolidation (a
+            # same-id refresh or a fresh first insert) it is keyed by its own
+            # consolidation_id (whose immutable source_key may differ from a
+            # tampered re-record). When it LOST the claim, the canonical row
+            # is the first-writer's, keyed by the source set.
+            if won:
+                row = self._conn.execute(
+                    "SELECT consolidation_id, source_key, source_episode_ids, "
+                    "category, merged_lesson, count, importance, created_at "
+                    "FROM consolidations WHERE consolidation_id=?",
+                    (record.consolidation_id,),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT consolidation_id, source_key, source_episode_ids, "
+                    "category, merged_lesson, count, importance, created_at "
+                    "FROM consolidations WHERE source_key=?", (source_key,),
+                ).fetchone()
+            self._conn.commit()
+            return _consolidation_from_row(row) if row else None
+        except sqlite3.Error:
+            self._conn.rollback()
+            raise
 
     @_threadsafe
     def list_consolidations(self, limit: int = 50) -> list[ConsolidationRecord]:
         rows = self._conn.execute(
-            "SELECT consolidation_id, source_episode_ids, category, merged_lesson, count, importance, created_at "
+            "SELECT consolidation_id, source_key, source_episode_ids, category, merged_lesson, count, importance, created_at "
             "FROM consolidations ORDER BY created_at DESC LIMIT ?",
             (max(1, limit),),
         ).fetchall()
-        out = []
-        for r in rows:
-            out.append(ConsolidationRecord(
-                consolidation_id=r[0], source_episode_ids=json.loads(r[1]), category=r[2],
-                merged_lesson=r[3], count=r[4], importance=r[5], created_at=r[6],
-            ))
-        return out
+        return [_consolidation_from_row(r) for r in rows]
 
     @_threadsafe
     def prune(self, older_than: str | None = None, max_episodes: int | None = None,
@@ -632,3 +773,16 @@ def _episode_from_row(row: tuple[Any, ...]) -> Episode:
 def _reflection_from_row(row: tuple[Any, ...]) -> Reflection:
     d = {c: v for c, v in zip(_REFLECTION_COLS, row)}
     return Reflection.from_dict(d)
+
+
+def _consolidation_from_row(row: tuple[Any, ...]) -> ConsolidationRecord:
+    return ConsolidationRecord(
+        consolidation_id=row[0],
+        source_key=row[1],
+        source_episode_ids=json.loads(row[2]),
+        category=row[3],
+        merged_lesson=row[4],
+        count=row[5],
+        importance=row[6],
+        created_at=row[7],
+    )
