@@ -691,3 +691,85 @@ byte-identical output across 3 consecutive runs, exit 0):
   (HEAD `769f6c0`, PR #1 open/mergeable); finalization = one commit of
   docs/tests/demo (or per-phase commits) + push + PR head update, subject
   to the next binding instruction.
+
+---
+
+## Addendum: durable goal-plan version allocation
+
+**Status:** Approved & implemented (2026-08-18)
+
+### Defect
+
+Plan versioning was a best-effort read-decide-write sequence:
+
+```
+latest_plan() → compute latest.version + 1 → record_goal_plan()
+```
+
+and `record_goal_plan` used `INSERT OR REPLACE` keyed by
+`(goal_id, plan_version)`. Two concurrent replanners could both read
+version N, both allocate N+1, and the second writer would silently
+replace the first. That corrupted the supposedly immutable goal-plan
+lineage. The defect was reproduced with independent SQLite connections,
+barrier-synchronized threads, and real subprocesses sharing the same
+database.
+
+### Invariant (now durable)
+
+Goal plans are immutable and versioned. For each `goal_id`:
+
+- allocation is append-only and monotonic at `MAX(plan_version) + 1`;
+- an existing `(goal_id, plan_version)` row is never overwritten
+  (plain `INSERT`; the primary key is the cross-process backstop);
+- divergent concurrent replans all survive as distinct versions
+  (`v1`, `v2`, `v3`, …);
+- identical concurrent replans of an unimplemented latest plan
+  converge: one caller creates, the other adopts the canonical row;
+- an equivalent replan after a task already references/implements
+  the latest plan creates a NEW version;
+- only the creator of a new version emits `plan.versioned`;
+- dense numbering is NOT required — pruning may leave gaps
+  (before prune: 1, 2, 3; after prune: 2, 3; next claim: 4).
+  Versions are never renumbered merely to make them dense.
+
+### Design
+
+`SQLiteCognitiveStore.claim_goal_plan(...) -> GoalPlanClaimResult`
+is the ONE authoritative funnel. Inside one `BEGIN IMMEDIATE`
+transaction it reads the current plan lineage, evaluates
+replay/adoption semantics (identical latest + version not in the
+caller-supplied `implemented_versions` snapshot), allocates
+`MAX(plan_version) + 1`, and inserts with a plain `INSERT`.
+`IntegrityError` is retried a bounded number of times so a
+divergent loser takes the next free version and an identical
+loser adopts the canonical latest plan.
+
+`record_goal_plan` remains a low-level primitive for tests and
+historical seeding. It now uses plain `INSERT` and refuses a
+destructive overwrite (`IntegrityError` on a colliding version).
+Production allocation routes through `claim_goal_plan`.
+
+`GoalManager.record_plan_version` no longer owns non-atomic
+version allocation. It supplies the implementing-task snapshot
+and delegates to the store funnel. Informational follow-up
+(predecessor `superseded` strategy outcome, `goal.strategy`
+follow, `plan.versioned`) runs only when `created=True`. A crash
+after the plan insert but before the outcome write does not
+corrupt the plan lineage; the missing outcome is repairable
+through the existing `repair_strategy_outcomes` mechanism.
+
+`readopt_plan` continues to go through `record_plan_version`, so
+re-adoption inherits the durable claim (replay of an identical
+unimplemented rollback still adopts; a rollback after a task
+implements the latest equivalent creates a new version).
+
+### Tests
+
+`tests/test_plan_invariant.py` covers in-process and real-subprocess
+divergent concurrent claims, identical concurrent adoption, repeated
+concurrent monotonic allocation (including post-prune gaps), replay
+deduplication, equivalent replan after a task references the previous
+plan, destructive overwrite refusal, exactly one `plan.versioned`
+event per created version and across identical concurrent claims,
+strategy-outcome crash/repair, `readopt_plan` parity, and
+`diff_plans` / stored-plan fast-path compatibility.

@@ -26,6 +26,23 @@ from arion.state.models import new_id, utcnow
 
 
 @dataclass
+class GoalPlanClaimResult:
+    """Outcome of an authoritative goal-plan version claim.
+
+    ``plan`` is the CANONICAL plan row after the claim commits (either the
+    newly inserted version or the adopted latest equivalent). ``created``
+    is True only when this invocation inserted a NEW immutable plan
+    version, so callers emit ``plan.versioned`` exactly once per durable
+    change. Concurrent losers of an identical claim, and replay of an
+    unimplemented latest plan, adopt the canonical row and report
+    ``created=False``.
+    """
+
+    plan: dict
+    created: bool = False
+
+
+@dataclass
 class BeliefPersistResult:
     """Outcome of an authoritative belief-persistence claim.
 
@@ -611,12 +628,128 @@ class SQLiteCognitiveStore:
     @_threadsafe
     def record_goal_plan(self, goal_id: str, plan_version: int, strategy: str,
                          plan_summary: list[dict], reason: str = "") -> None:
+        """Low-level insert of an explicit plan version.
+
+        Production allocation MUST go through :meth:`claim_goal_plan`.
+        This primitive never overwrites: a colliding ``(goal_id,
+        plan_version)`` raises ``sqlite3.IntegrityError`` (the primary
+        key is the structural backstop). Used by tests and historical
+        seeding that already know the version they want.
+        """
         self._conn.execute(
-            "INSERT OR REPLACE INTO goal_plans "
+            "INSERT INTO goal_plans "
             f"({', '.join(_GOAL_PLAN_COLS)}) VALUES ({', '.join('?' * len(_GOAL_PLAN_COLS))})",
             (goal_id, plan_version, strategy, json.dumps(plan_summary), reason, utcnow()),
         )
         self._conn.commit()
+
+    @_threadsafe
+    def claim_goal_plan(self, goal_id: str, strategy: str,
+                        plan_summary: list[dict], reason: str = "",
+                        implemented_versions: set[int] | frozenset[int] | None = None,
+                        _attempt: int = 0) -> GoalPlanClaimResult:
+        """Authoritative goal-plan version claim.
+
+        ONE funnel for every production plan-version write. The whole
+        lineage/replay/adoption/allocation decision runs inside ONE
+        ``BEGIN IMMEDIATE`` transaction, and the existing primary key
+        ``(goal_id, plan_version)`` is the cross-process structural
+        backstop — so two threads or two engine processes can never
+        silently replace an immutable plan row.
+
+        Decision (the existing project rule, now made durable):
+
+        - the latest plan matches ``(strategy, plan_summary, reason)``
+          AND that version is not in ``implemented_versions`` (no task
+          implements it) -> ADOPT the canonical latest plan (no new
+          row, no version bump, no event);
+        - otherwise insert a NEW immutable row at
+          ``MAX(plan_version) + 1`` using a plain ``INSERT``. Gaps from
+          pruning are valid; versions are append-only and monotonic,
+          never renumbered, never overwritten.
+
+        ``implemented_versions`` is the caller's snapshot of plan
+        versions that already have an implementing task. It is part of
+        the durable decision so an equivalent replan after a task
+        references the latest plan still creates a new version, while
+        identical concurrent claimants of an unimplemented latest
+        plan converge on one canonical row.
+
+        Contention: a concurrent committer may insert the same next
+        version between this call's read and write. That surfaces as
+        ``IntegrityError``; the decision is retried deterministically a
+        bounded number of times so a divergent loser allocates the
+        next free version and an identical loser adopts the canonical
+        latest plan.
+
+        Returns a :class:`GoalPlanClaimResult` carrying the canonical
+        plan and ``created`` (True iff this call inserted a new row).
+        """
+        implemented = set(implemented_versions or ())
+        max_attempts = 8
+        try:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            rows = self._conn.execute(
+                "SELECT " + ", ".join(_GOAL_PLAN_COLS)
+                + " FROM goal_plans WHERE goal_id=? ORDER BY plan_version",
+                (goal_id,),
+            ).fetchall()
+            lineage = [_goal_plan_from_row(r) for r in rows]
+            latest = lineage[-1] if lineage else None
+            max_version = max((int(p["plan_version"]) for p in lineage), default=0)
+
+            if latest is not None:
+                same = (
+                    latest.get("strategy") == strategy
+                    and latest.get("plan_summary") == plan_summary
+                    and latest.get("reason") == reason
+                )
+                if same and int(latest["plan_version"]) not in implemented:
+                    # Adopt: identical unimplemented latest is canonical.
+                    self._conn.commit()
+                    return GoalPlanClaimResult(plan=latest, created=False)
+
+            new_version = max_version + 1
+            created_at = utcnow()
+            try:
+                self._conn.execute(
+                    "INSERT INTO goal_plans "
+                    f"({', '.join(_GOAL_PLAN_COLS)}) VALUES ({', '.join('?' * len(_GOAL_PLAN_COLS))})",
+                    (goal_id, new_version, strategy, json.dumps(plan_summary),
+                     reason, created_at),
+                )
+            except sqlite3.IntegrityError:
+                # A concurrent committer allocated this version first.
+                # Roll back and re-run the deterministic decision
+                # against the fresh lineage (adopt if identical,
+                # otherwise MAX+1 again).
+                self._conn.rollback()
+                if _attempt + 1 >= max_attempts:
+                    raise
+                return self.claim_goal_plan(
+                    goal_id, strategy, plan_summary, reason,
+                    implemented_versions=implemented,
+                    _attempt=_attempt + 1,
+                )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT " + ", ".join(_GOAL_PLAN_COLS)
+                + " FROM goal_plans WHERE goal_id=? AND plan_version=?",
+                (goal_id, new_version),
+            ).fetchone()
+            plan = _goal_plan_from_row(row) if row is not None else {
+                "goal_id": goal_id,
+                "plan_version": new_version,
+                "strategy": strategy,
+                "plan_summary": plan_summary,
+                "reason": reason,
+                "created_at": created_at,
+            }
+            return GoalPlanClaimResult(plan=plan, created=True)
+        except sqlite3.Error:
+            self._conn.rollback()
+            raise
 
     @_threadsafe
     def list_goal_plans(self, goal_id: str) -> list[dict[str, Any]]:

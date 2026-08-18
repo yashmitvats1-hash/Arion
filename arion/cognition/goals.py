@@ -277,37 +277,44 @@ class GoalManager:
     ) -> dict[str, Any]:
         """Record a NEW (immutable) plan version for a goal.
 
-        Replay-safe: if the LATEST plan version already matches
-        (strategy, plan_summary, reason) AND no task implements it yet, the
-        existing version is returned instead of creating a duplicate. A task
-        that failed against the latest version triggers a genuinely NEW
-        version (same or different steps) - previous plans are never mutated.
+        Delegates version allocation to the authoritative store funnel
+        ``claim_goal_plan`` (one ``BEGIN IMMEDIATE`` transaction,
+        ``MAX(plan_version)+1``, plain INSERT — never
+        ``INSERT OR REPLACE``). Replay-safe: if the LATEST plan version
+        already matches (strategy, plan_summary, reason) AND no task
+        implements it yet, the existing version is adopted instead of
+        creating a duplicate. A task that already references the latest
+        equivalent plan triggers a genuinely NEW version. Previous plans
+        are never mutated. Only the creator of a new version emits
+        ``plan.versioned``.
 
         Returns the plan record {goal_id, plan_version, strategy, plan_summary,
         reason, created_at}.
         """
-        latest = self.latest_plan(goal_id)
-        if latest is not None:
-            same = (
-                latest.get("strategy") == strategy
-                and latest.get("plan_summary") == plan_summary
-                and latest.get("reason") == reason
-            )
-            if same and not self._any_task_for_plan(goal_id, latest["plan_version"]):
-                return latest  # replay of the record step: no duplicate version
-        version = self.next_plan_version(goal_id)
-        self.cognitive_store.record_goal_plan(goal_id, version, strategy, plan_summary, reason)
-        record = {
-            "goal_id": goal_id,
-            "plan_version": version,
-            "strategy": strategy,
-            "plan_summary": plan_summary,
-            "reason": reason,
-            "created_at": utcnow(),
+        # Version allocation is NOT owned here. The store claim is the
+        # single authoritative write path (BEGIN IMMEDIATE + MAX+1 +
+        # plain INSERT). This method only supplies the implementing-task
+        # snapshot, then applies informational follow-up (strategy
+        # outcome, goal.strategy, plan.versioned) when a NEW version was
+        # actually created.
+        implemented_versions = {
+            t.plan_version
+            for t in self.storage.list_tasks()
+            if t.goal_id == goal_id and t.plan_version is not None
         }
+        latest = self.latest_plan(goal_id)
+        result = self.cognitive_store.claim_goal_plan(
+            goal_id, strategy, plan_summary, reason,
+            implemented_versions=implemented_versions,
+        )
+        record = result.plan
+        if not result.created:
+            return record  # replay / identical concurrent adopt: no event
         # ADR-015 addendum (Phase A): the new plan version SUPERSEDES the
         # previous one. Informational, best-effort, idempotent - never
-        # breaks the authoritative plan-versioning path.
+        # breaks the authoritative plan-versioning path. A crash between
+        # the plan insert and this outcome write is healed by
+        # repair_strategy_outcomes (the plan lineage is already durable).
         if latest is not None:
             self._record_strategy_outcome(
                 goal_id, latest["plan_version"],
@@ -321,7 +328,7 @@ class GoalManager:
             self.storage.save_goal(goal)
         self._emit("plan.versioned", goal_id=goal_id, detail={
             "goal_id": goal_id,
-            "plan_version": version,
+            "plan_version": record["plan_version"],
             "strategy": strategy,
             "reason": reason[:200],
             "steps": len(plan_summary),
