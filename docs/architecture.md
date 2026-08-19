@@ -325,7 +325,15 @@ Learn → Replan`, owned by an authoritative, restart-safe `GoalManager`.
   never inferred from a single successful task.
 - **Plan versioning + replanning:** every replan appends a NEW immutable plan
   version (monotonic, replay-safe; reasons like `replan_task_failed`,
-  `replan_world_changed`). `run_goal` is a per-call long-horizon cycle: it
+  `replan_world_changed`). Version allocation is DURABLE, not check-then-act
+  — `SQLiteCognitiveStore.claim_goal_plan` assigns `MAX(plan_version)+1`
+  inside one `BEGIN IMMEDIATE` transaction (plain INSERT; the
+  `(goal_id, plan_version)` primary key is the cross-process backstop).
+  Divergent concurrent replans all survive as distinct versions; identical
+  concurrent claims adopt one canonical plan when no task implements it; an
+  equivalent replan after a task references the latest plan creates a new
+  version. Gaps from pruning are valid (dense numbering is not required).
+  `run_goal` is a per-call long-horizon cycle: it
   returns ACTIVE when a task fails (failure persisted), replanning is bounded
   by `max_replans` across calls. Superseded-plan failures never block
   completion once the newer plan is fully handled.
