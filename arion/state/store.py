@@ -240,6 +240,8 @@ class Storage(Protocol):
     """Persistence contract used by orchestration and observability."""
 
     def save_goal(self, goal: Goal) -> None: ...
+    def cas_goal(self, goal: Goal, expected_version: int) -> bool: ...
+    def cas_goal_fields(self, goal_id: str, expected_version: int, fields: dict) -> bool: ...
     def load_goal(self, goal_id: str) -> Goal | None: ...
     def list_goals(self, status: str | None = None) -> list[Goal]: ...
 
@@ -307,6 +309,12 @@ class SQLiteStorage:
 
     @_threadsafe
     def save_goal(self, goal: Goal) -> None:
+        """Create or seed a goal row (INSERT OR REPLACE).
+
+        Production lifecycle / metadata writes MUST go through
+        :meth:`cas_goal`. This primitive is for creation and explicit
+        seeding only — it does not protect against lost updates.
+        """
         import json as _json
 
         goal.updated_at = utcnow()
@@ -330,6 +338,135 @@ class SQLiteStorage:
             ),
         )
         self._conn.commit()
+
+    @_threadsafe
+    def cas_goal(self, goal: Goal, expected_version: int) -> bool:
+        """Compare-and-swap the authoritative goal row.
+
+        The write is protected by the version::
+
+            UPDATE goals SET ... WHERE id=? AND version=?
+
+        Returns True iff this writer committed (rowcount == 1). A stale
+        writer whose ``expected_version`` no longer matches the durable
+        row returns False and mutates nothing. ``goal.version`` MUST be
+        ``expected_version + 1`` (one increment per successful write).
+
+        Uses one ``BEGIN IMMEDIATE`` transaction so independent
+        connections / processes cannot interleave the version check and
+        the write.
+        """
+        import json as _json
+
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int):
+            raise ValueError(
+                f"expected_version must be an int, got {expected_version!r} "
+                f"(fail closed)")
+        if expected_version < 1:
+            raise ValueError(
+                f"expected_version must be >= 1, got {expected_version!r} "
+                f"(fail closed)")
+        if goal.version != expected_version + 1:
+            raise ValueError(
+                f"cas_goal requires goal.version == expected_version + 1 "
+                f"(got {goal.version} vs {expected_version}+1; fail closed)")
+
+        now = utcnow()
+        goal.updated_at = now
+        try:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            cur = self._conn.execute(
+                "UPDATE goals SET description=?, source=?, status=?, version=?, "
+                "strategy=?, blockers=?, progress_metadata=?, last_evaluated_at=?, "
+                "last_replan_reason=?, updated_at=? "
+                "WHERE id=? AND version=?",
+                (
+                    goal.description,
+                    goal.source,
+                    goal.status_value,
+                    goal.version,
+                    goal.strategy,
+                    _json.dumps(goal.blockers),
+                    _json.dumps(goal.progress_metadata),
+                    goal.last_evaluated_at,
+                    goal.last_replan_reason,
+                    now,
+                    goal.id,
+                    expected_version,
+                ),
+            )
+            if cur.rowcount != 1:
+                self._conn.rollback()
+                return False
+            self._conn.commit()
+            return True
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_threadsafe
+    def cas_goal_fields(self, goal_id: str, expected_version: int,
+                        fields: dict) -> bool:
+        """Column-scoped compare-and-swap.
+
+        UPDATE only the supplied columns WHERE id=? AND version=?.
+        Lifecycle writers pass ``version`` (expected+1) so a stale
+        writer cannot clobber a newer row. Metadata writers may omit
+        ``version`` so a progress/strategy patch cannot bump the CAS
+        token or overwrite status/blockers.
+        """
+        import json as _json
+
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int):
+            raise ValueError(
+                f"expected_version must be an int, got {expected_version!r} "
+                f"(fail closed)")
+        if expected_version < 1:
+            raise ValueError(
+                f"expected_version must be >= 1, got {expected_version!r} "
+                f"(fail closed)")
+        allowed = {
+            "description", "source", "status", "version", "strategy",
+            "blockers", "progress_metadata", "last_evaluated_at",
+            "last_replan_reason", "updated_at",
+        }
+        if not fields or not isinstance(fields, dict):
+            raise ValueError("cas_goal_fields requires a non-empty fields dict")
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(
+                f"cas_goal_fields unknown column(s) {sorted(unknown)} (fail closed)")
+        if "version" in fields and fields["version"] != expected_version + 1:
+            raise ValueError(
+                f"cas_goal_fields version must be expected+1 "
+                f"(got {fields['version']} vs {expected_version}+1; fail closed)")
+
+        values = dict(fields)
+        if "blockers" in values:
+            values["blockers"] = _json.dumps(values["blockers"])
+        if "progress_metadata" in values:
+            values["progress_metadata"] = _json.dumps(values["progress_metadata"])
+        if "updated_at" not in values:
+            values["updated_at"] = utcnow()
+        cols = list(values)
+        assignments = ", ".join(f"{c}=?" for c in cols)
+        params = [values[c] for c in cols] + [goal_id, expected_version]
+        try:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            cur = self._conn.execute(
+                f"UPDATE goals SET {assignments} WHERE id=? AND version=?",
+                params,
+            )
+            if cur.rowcount != 1:
+                self._conn.rollback()
+                return False
+            self._conn.commit()
+            return True
+        except Exception:
+            self._conn.rollback()
+            raise
 
     @_threadsafe
     def load_goal(self, goal_id: str) -> Goal | None:

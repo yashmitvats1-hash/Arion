@@ -850,28 +850,16 @@ class ArionEngine:
 
         The blocker is the durable, explainable surface of a lock-wait/timeout
         session; its metadata (deadline/attempts/next_retry/reason) must track
-        the latest retry - set_blocked alone is idempotent by key and would
-        keep stale metadata."""
+        the latest retry. ``GoalManager.set_blocked`` upserts by key
+        (preserving ``added_at``) and CAS-retries so a concurrent lifecycle
+        writer cannot be clobbered.
+        """
         if not goal_id or self.goal_manager is None:
             return
         try:
-            gm = self.goal_manager
-            goal = gm.get_goal(goal_id)
-            if goal is None:
-                return
-            blockers = list(goal.blockers or [])
-            idx = next((i for i, b in enumerate(blockers)
-                        if (b.get("key") or b.get("type")) == "lock_contention"), None)
-            if idx is None:
-                gm.set_blocked(goal_id, {"type": "lock_contention", **fields},
-                               reason="lock_contention")
-                return
-            kept = dict(blockers[idx])
-            blockers[idx] = {"key": "lock_contention", "type": "lock_contention",
-                             **fields, "added_at": kept.get("added_at", utcnow())}
-            goal.blockers = blockers
-            goal.updated_at = utcnow()
-            self.storage.save_goal(goal)
+            self.goal_manager.set_blocked(
+                goal_id, {"type": "lock_contention", **fields},
+                reason="lock_contention")
         except Exception:
             pass
 
@@ -2438,11 +2426,7 @@ class ArionEngine:
                     # history is the source of truth; this mirrors the reason
                     # on the goal for CLI/debugging, ADR-016)
                     try:
-                        g = self.goal_manager.get_goal(task.goal_id)
-                        if g is not None:
-                            g.last_replan_reason = reason
-                            g.updated_at = utcnow()
-                            self.storage.save_goal(g)
+                        self.goal_manager.set_replan_reason(task.goal_id, reason)
                     except Exception:
                         pass
             except Exception:

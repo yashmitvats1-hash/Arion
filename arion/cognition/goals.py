@@ -8,7 +8,8 @@ GoalManager is the AUTHORITATIVE state machine for long-lived goals:
 It owns:
   - goal lifecycle state transitions (validated; invalid transitions FAIL
     CLOSED via GoalStateError), persisted and restart-safe;
-  - goal versioning (goal.version increments on every state change);
+  - goal versioning (goal.version is the CAS token; increments on every
+    committed authoritative write);
   - plan versioning (monotonic, immutable previous plans, replay-safe);
   - progress evaluation (via the ProgressEvaluator seam);
   - strategy selection (via StrategySelector, explainable + provenance).
@@ -36,6 +37,10 @@ from arion.state.models import (
     new_id,
     utcnow,
 )
+
+# Bounded CAS retries. A writer that cannot commit after this many
+# independent reloads fails closed rather than spinning.
+_GOAL_CAS_MAX_ATTEMPTS = 8
 
 
 class GoalManager:
@@ -79,48 +84,135 @@ class GoalManager:
     def list_goals(self, status: str | None = None) -> list[Goal]:
         return self.storage.list_goals(status=status)
 
-    def transition(self, goal_id: str, to_state: str, reason: str, actor: str = "system") -> Goal:
-        """Validate + persist a goal state transition (fail closed)."""
-        goal = self.get_goal(goal_id)
-        if goal is None:
-            raise KeyError(f"goal not found: {goal_id}")
+    def _commit_goal(self, goal: Goal, expected_version: int,
+                     extra: dict | None = None) -> bool:
+        """CAS lifecycle columns only (status, blockers, version).
+
+        Strategy / progress / last_evaluated_at are left untouched so a
+        lifecycle writer cannot clobber a concurrent metadata patch, and
+        a metadata patch cannot resurrect a superseded status. Optional
+        ``extra`` (e.g. last_replan_reason on fail_goal) is written in
+        the same UPDATE.
+        """
+        payload = {
+            "status": goal.status_value,
+            "blockers": list(goal.blockers or []),
+            "version": goal.version,
+            "updated_at": goal.updated_at,
+        }
+        if extra:
+            payload.update(extra)
+        casf = getattr(self.storage, "cas_goal_fields", None)
+        if casf is not None:
+            return bool(casf(goal.id, expected_version, payload))
+        cas = getattr(self.storage, "cas_goal", None)
+        if cas is None:
+            self.storage.save_goal(goal)
+            return True
+        return bool(cas(goal, expected_version))
+
+    def _contention_error(self, goal_id: str, op: str) -> GoalStateError:
+        return GoalStateError(
+            f"goal {goal_id} {op} failed under persistent contention (fail closed)"
+        )
+
+    def _patch_goal(self, goal_id: str, apply, *, columns: tuple[str, ...],
+                    op: str = "update") -> Goal:
+        """Reload-apply-CAS for informational field updates.
+
+        ``apply(goal)`` mutates only informational columns named in
+        ``columns``. The write is column-scoped and does NOT increment
+        ``goal.version``, so a strategy/progress/replan-reason patch
+        cannot clobber status/blockers and is not itself a lifecycle
+        transition. On a version miss the latest row is reloaded.
+        """
+        casf = getattr(self.storage, "cas_goal_fields", None)
+        for _ in range(_GOAL_CAS_MAX_ATTEMPTS):
+            goal = self.get_goal(goal_id)
+            if goal is None:
+                raise KeyError(f"goal not found: {goal_id}")
+            expected = goal.version
+            apply(goal)
+            goal.updated_at = utcnow()
+            payload = {col: getattr(goal, col) for col in columns}
+            payload["updated_at"] = goal.updated_at
+            if casf is not None:
+                if casf(goal.id, expected, payload):
+                    return goal
+                continue
+            # Fallback for test doubles: full-row CAS still increments so
+            # the write cannot silently replace a newer lifecycle row.
+            goal.version = expected + 1
+            if self._commit_goal(goal, expected):
+                return goal
+        raise self._contention_error(goal_id, op)
+
+    def set_replan_reason(self, goal_id: str, reason: str) -> Goal:
+        """Persist ``last_replan_reason`` without touching lifecycle state."""
+        return self._patch_goal(
+            goal_id, lambda g: setattr(g, "last_replan_reason", reason),
+            columns=("last_replan_reason",), op="set_replan_reason")
+
+    def transition(self, goal_id: str, to_state: str, reason: str, actor: str = "system",
+                   fields: dict[str, Any] | None = None) -> Goal:
+        """Validate + persist a goal state transition (fail closed).
+
+        On a CAS miss the canonical row is reloaded and the transition
+        is revalidated against the latest status. Events are emitted
+        only after the write commits. ``fields`` (e.g. last_replan_reason
+        on fail_goal) are applied in the SAME successful write so the
+        version increments exactly once.
+        """
         to_state = to_state.value if isinstance(to_state, GoalStatus) else to_state
         if to_state not in GOAL_TRANSITIONS:
             raise GoalStateError(f"unknown goal state {to_state!r}")
-        allowed = GOAL_TRANSITIONS[goal.status.value]
-        if to_state not in allowed:
-            raise GoalStateError(
-                f"invalid goal transition {goal.status.value!r} -> {to_state!r} for goal {goal_id}"
-            )
-        old_state = goal.status.value
-        goal.status = GoalStatus(to_state)
-        goal.version += 1
-        goal.updated_at = utcnow()
-        if to_state == GoalStatus.ACTIVE.value and goal.blockers:
-            # resuming/unblocking clears resolved blockers
-            goal.blockers = []
-        self.storage.save_goal(goal)
-        self._emit("goal.state.changed", goal_id=goal_id, detail={
-            "goal_id": goal_id,
-            "from": old_state,
-            "to": to_state,
-            "reason": reason[:200],
-            "goal_version": goal.version,
-            "actor": actor,
-        })
-        # ADR-015 addendum (Phase A): TERMINAL transitions mark the active
-        # (latest) plan version's outcome - succeeded on completion, failed
-        # on failure. Informational, best-effort, idempotent (UNIQUE
-        # goal_id+plan_version); never breaks the state machine.
-        if to_state in (GoalStatus.COMPLETED.value, GoalStatus.FAILED.value):
-            latest = self.latest_plan(goal_id)
-            if latest is not None:
-                outcome = ("succeeded" if to_state == GoalStatus.COMPLETED.value
-                           else "failed")
-                self._record_strategy_outcome(
-                    goal_id, latest["plan_version"],
-                    latest.get("strategy", ""), outcome, reason)
-        return goal
+        for _ in range(_GOAL_CAS_MAX_ATTEMPTS):
+            goal = self.get_goal(goal_id)
+            if goal is None:
+                raise KeyError(f"goal not found: {goal_id}")
+            allowed = GOAL_TRANSITIONS[goal.status.value]
+            if to_state not in allowed:
+                raise GoalStateError(
+                    f"invalid goal transition {goal.status.value!r} -> {to_state!r} for goal {goal_id}"
+                )
+            old_state = goal.status.value
+            expected = goal.version
+            goal.status = GoalStatus(to_state)
+            goal.version = expected + 1
+            goal.updated_at = utcnow()
+            if to_state == GoalStatus.ACTIVE.value and goal.blockers:
+                # resuming/unblocking clears resolved blockers
+                goal.blockers = []
+            extra = None
+            if fields:
+                extra = {}
+                for key, value in fields.items():
+                    setattr(goal, key, value)
+                    extra[key] = value
+            if not self._commit_goal(goal, expected, extra=extra):
+                continue
+            self._emit("goal.state.changed", goal_id=goal_id, detail={
+                "goal_id": goal_id,
+                "from": old_state,
+                "to": to_state,
+                "reason": reason[:200],
+                "goal_version": goal.version,
+                "actor": actor,
+            })
+            # ADR-015 addendum (Phase A): TERMINAL transitions mark the active
+            # (latest) plan version's outcome - succeeded on completion, failed
+            # on failure. Informational, best-effort, idempotent (UNIQUE
+            # goal_id+plan_version); never breaks the state machine.
+            if to_state in (GoalStatus.COMPLETED.value, GoalStatus.FAILED.value):
+                latest = self.latest_plan(goal_id)
+                if latest is not None:
+                    outcome = ("succeeded" if to_state == GoalStatus.COMPLETED.value
+                               else "failed")
+                    self._record_strategy_outcome(
+                        goal_id, latest["plan_version"],
+                        latest.get("strategy", ""), outcome, reason)
+            return goal
+        raise self._contention_error(goal_id, "transition")
 
     def pause(self, goal_id: str, reason: str = "explicit_pause") -> Goal:
         return self.transition(goal_id, GoalStatus.PAUSED.value, reason)
@@ -132,69 +224,168 @@ class GoalManager:
         return self.transition(goal_id, GoalStatus.CANCELLED.value, reason)
 
     def fail_goal(self, goal_id: str, reason: str = "goal_failed") -> Goal:
-        goal = self.transition(goal_id, GoalStatus.FAILED.value, reason)
-        goal.last_replan_reason = reason
-        goal.updated_at = utcnow()
-        self.storage.save_goal(goal)
-        return goal
+        return self.transition(
+            goal_id, GoalStatus.FAILED.value, reason,
+            fields={"last_replan_reason": reason},
+        )
 
     def complete_goal(self, goal_id: str, reason: str = "all_work_complete") -> Goal:
         return self.transition(goal_id, GoalStatus.COMPLETED.value, reason)
 
     def set_blocked(self, goal_id: str, blocker: dict[str, Any], reason: str = "blocker") -> Goal:
-        """Attach a blocker (idempotent by key) and move to BLOCKED."""
-        goal = self.get_goal(goal_id)
-        if goal is None:
-            raise KeyError(f"goal not found: {goal_id}")
+        """Attach a blocker (upsert by key) and move ACTIVE -> BLOCKED.
+
+        Distinct keys merge across concurrent writers. The same key
+        upserts in place and preserves the original ``added_at``.
+        ACTIVE -> BLOCKED is applied in the same CAS as the blocker
+        write when still legal after a reload; PAUSED / terminal
+        statuses keep their lifecycle and only merge the blocker.
+        """
         key = blocker.get("key") or blocker.get("type") or blocker.get("reason") or "blocker"
-        existing = [b for b in (goal.blockers or []) if (b.get("key") or b.get("type")) == key]
-        if not existing:
-            goal.blockers = list(goal.blockers or []) + [{**blocker, "key": key, "added_at": utcnow()}]
+        for _ in range(_GOAL_CAS_MAX_ATTEMPTS):
+            goal = self.get_goal(goal_id)
+            if goal is None:
+                raise KeyError(f"goal not found: {goal_id}")
+            expected = goal.version
+            old_state = goal.status.value
+            blockers = list(goal.blockers or [])
+            existing_idx = next(
+                (i for i, b in enumerate(blockers)
+                 if (b.get("key") or b.get("type")) == key),
+                None,
+            )
+            changed = False
+            if existing_idx is None:
+                blockers.append({**blocker, "key": key, "added_at": utcnow()})
+                changed = True
+            else:
+                kept = blockers[existing_idx]
+                updated = {**kept, **blocker, "key": key,
+                           "added_at": kept.get("added_at") or utcnow()}
+                if updated != kept:
+                    blockers[existing_idx] = updated
+                    changed = True
+            transitioned = False
+            if goal.status == GoalStatus.ACTIVE:
+                allowed = GOAL_TRANSITIONS[goal.status.value]
+                if GoalStatus.BLOCKED.value not in allowed:
+                    raise GoalStateError(
+                        f"invalid goal transition {goal.status.value!r} -> "
+                        f"{GoalStatus.BLOCKED.value!r} for goal {goal_id}"
+                    )
+                goal.status = GoalStatus.BLOCKED
+                transitioned = True
+                changed = True
+            if not changed:
+                self._emit("goal.blocked", goal_id=goal_id, detail={
+                    "goal_id": goal_id,
+                    "blocker_key": key,
+                    "blocker_type": blocker.get("type", key),
+                    "reason": reason[:200],
+                })
+                return goal
+            goal.blockers = blockers
+            goal.version = expected + 1
             goal.updated_at = utcnow()
-            self.storage.save_goal(goal)
-        if goal.status == GoalStatus.ACTIVE:
-            goal = self.transition(goal_id, GoalStatus.BLOCKED.value, reason)
-        self._emit("goal.blocked", goal_id=goal_id, detail={
-            "goal_id": goal_id,
-            "blocker_key": key,
-            "blocker_type": blocker.get("type", key),
-            "reason": reason[:200],
-        })
-        return self.get_goal(goal_id)
+            if not self._commit_goal(goal, expected):
+                continue
+            if transitioned:
+                self._emit("goal.state.changed", goal_id=goal_id, detail={
+                    "goal_id": goal_id,
+                    "from": old_state,
+                    "to": GoalStatus.BLOCKED.value,
+                    "reason": reason[:200],
+                    "goal_version": goal.version,
+                    "actor": "system",
+                })
+            self._emit("goal.blocked", goal_id=goal_id, detail={
+                "goal_id": goal_id,
+                "blocker_key": key,
+                "blocker_type": blocker.get("type", key),
+                "reason": reason[:200],
+            })
+            return goal
+        raise self._contention_error(goal_id, "set_blocked")
 
     def clear_blocker(self, goal_id: str, key: str, reason: str = "blocker_resolved") -> Goal:
         """Remove ONE blocker by key; unblocks the goal when none remain."""
-        goal = self.get_goal(goal_id)
-        if goal is None:
-            raise KeyError(f"goal not found: {goal_id}")
-        kept = [b for b in (goal.blockers or []) if (b.get("key") or b.get("type")) != key]
-        if len(kept) == len(goal.blockers or []):
-            return self.get_goal(goal_id)  # nothing to clear
-        goal.blockers = kept
-        goal.updated_at = utcnow()
-        self.storage.save_goal(goal)
-        self._emit("goal.unblocked", goal_id=goal_id, detail={
-            "goal_id": goal_id, "blocker_key": key, "reason": reason[:200],
-        })
-        if goal.status == GoalStatus.BLOCKED and not kept:
-            goal = self.transition(goal_id, GoalStatus.ACTIVE.value, reason)
-        return self.get_goal(goal_id)
+        for _ in range(_GOAL_CAS_MAX_ATTEMPTS):
+            goal = self.get_goal(goal_id)
+            if goal is None:
+                raise KeyError(f"goal not found: {goal_id}")
+            kept = [b for b in (goal.blockers or []) if (b.get("key") or b.get("type")) != key]
+            if len(kept) == len(goal.blockers or []):
+                return goal  # nothing to clear
+            expected = goal.version
+            old_state = goal.status.value
+            goal.blockers = kept
+            transitioned = False
+            if goal.status == GoalStatus.BLOCKED and not kept:
+                allowed = GOAL_TRANSITIONS[goal.status.value]
+                if GoalStatus.ACTIVE.value not in allowed:
+                    raise GoalStateError(
+                        f"invalid goal transition {goal.status.value!r} -> "
+                        f"{GoalStatus.ACTIVE.value!r} for goal {goal_id}"
+                    )
+                goal.status = GoalStatus.ACTIVE
+                transitioned = True
+            goal.version = expected + 1
+            goal.updated_at = utcnow()
+            if not self._commit_goal(goal, expected):
+                continue
+            self._emit("goal.unblocked", goal_id=goal_id, detail={
+                "goal_id": goal_id, "blocker_key": key, "reason": reason[:200],
+            })
+            if transitioned:
+                self._emit("goal.state.changed", goal_id=goal_id, detail={
+                    "goal_id": goal_id,
+                    "from": old_state,
+                    "to": GoalStatus.ACTIVE.value,
+                    "reason": reason[:200],
+                    "goal_version": goal.version,
+                    "actor": "system",
+                })
+            return goal
+        raise self._contention_error(goal_id, "clear_blocker")
 
     def clear_blockers(self, goal_id: str, reason: str = "blocker_resolved") -> Goal:
-        goal = self.get_goal(goal_id)
-        if goal is None:
-            raise KeyError(f"goal not found: {goal_id}")
-        if not goal.blockers:
-            return self.get_goal(goal_id)
-        goal.blockers = []
-        goal.updated_at = utcnow()
-        self.storage.save_goal(goal)
-        self._emit("goal.unblocked", goal_id=goal_id, detail={
-            "goal_id": goal_id, "blocker_key": "*", "reason": reason[:200],
-        })
-        if goal.status == GoalStatus.BLOCKED:
-            return self.transition(goal_id, GoalStatus.ACTIVE.value, reason)
-        return self.get_goal(goal_id)
+        for _ in range(_GOAL_CAS_MAX_ATTEMPTS):
+            goal = self.get_goal(goal_id)
+            if goal is None:
+                raise KeyError(f"goal not found: {goal_id}")
+            if not goal.blockers:
+                return goal
+            expected = goal.version
+            old_state = goal.status.value
+            goal.blockers = []
+            transitioned = False
+            if goal.status == GoalStatus.BLOCKED:
+                allowed = GOAL_TRANSITIONS[goal.status.value]
+                if GoalStatus.ACTIVE.value not in allowed:
+                    raise GoalStateError(
+                        f"invalid goal transition {goal.status.value!r} -> "
+                        f"{GoalStatus.ACTIVE.value!r} for goal {goal_id}"
+                    )
+                goal.status = GoalStatus.ACTIVE
+                transitioned = True
+            goal.version = expected + 1
+            goal.updated_at = utcnow()
+            if not self._commit_goal(goal, expected):
+                continue
+            self._emit("goal.unblocked", goal_id=goal_id, detail={
+                "goal_id": goal_id, "blocker_key": "*", "reason": reason[:200],
+            })
+            if transitioned:
+                self._emit("goal.state.changed", goal_id=goal_id, detail={
+                    "goal_id": goal_id,
+                    "from": old_state,
+                    "to": GoalStatus.ACTIVE.value,
+                    "reason": reason[:200],
+                    "goal_version": goal.version,
+                    "actor": "system",
+                })
+            return goal
+        raise self._contention_error(goal_id, "clear_blockers")
 
     def recheck_blockers(self, goal_id: str) -> bool:
         """Re-evaluate the goal's blockers against the CURRENT world state.
@@ -204,51 +395,74 @@ class GoalManager:
         longer awaiting approval. Returns True when blockers were cleared
         (the goal may need re-evaluation/replanning); False otherwise.
         """
-        goal = self.get_goal(goal_id)
-        if goal is None or goal.status != GoalStatus.BLOCKED or not goal.blockers:
-            return False
-        world = self.world_monitor.current_state() if self.world_monitor else {}
-        reg = world.get("registered_capabilities") or {}
-        caps = list(reg.get("value", [])) if isinstance(reg, dict) else []
-        dropped_keys: set[str] = set()
-        newly_available: set[str] = set()
-        for b in list(goal.blockers):
-            key = b.get("key") or b.get("type")
-            if key == "missing_capability":
-                need = list(b.get("capabilities") or [])
-                if need and all(c in caps for c in need):
-                    dropped_keys.add(key)
-                    newly_available.update(c for c in need if c in caps)
-            elif key == "approval_pending":
-                tid = b.get("task_id")
-                task = self.storage.load_task(tid) if tid else None
-                if task is None or task.status != TaskStatus.AWAITING_APPROVAL:
-                    dropped_keys.add(key)
-            elif key == "lock_contention":
-                # ADR-021: the blocker clears when the mutation resource is no
-                # longer actively locked (resolved via the engine's live lock
-                # store - the lock store is the only lock authority).
-                if self.lock_contention_resolver is not None and self.lock_contention_resolver(b):
-                    dropped_keys.add(key)
-        if not dropped_keys:
-            return False
-        goal.blockers = [
-            b for b in (goal.blockers or [])
-            if (b.get("key") or b.get("type")) not in dropped_keys
-        ]
-        goal.updated_at = utcnow()
-        self.storage.save_goal(goal)
-        for cap in sorted(newly_available):
-            self._emit("capability.available", goal_id=goal_id, detail={
-                "goal_id": goal_id, "capability": cap, "source": "world_state",
-            })
-        if not goal.blockers:
-            self._emit("goal.unblocked", goal_id=goal_id, detail={
-                "goal_id": goal_id, "blocker_key": ",".join(sorted(dropped_keys)),
-                "reason": "blockers_resolved",
-            })
-            goal = self.transition(goal_id, GoalStatus.ACTIVE.value, "blockers_resolved")
-        return True
+        for _ in range(_GOAL_CAS_MAX_ATTEMPTS):
+            goal = self.get_goal(goal_id)
+            if goal is None or goal.status != GoalStatus.BLOCKED or not goal.blockers:
+                return False
+            world = self.world_monitor.current_state() if self.world_monitor else {}
+            reg = world.get("registered_capabilities") or {}
+            caps = list(reg.get("value", [])) if isinstance(reg, dict) else []
+            dropped_keys: set[str] = set()
+            newly_available: set[str] = set()
+            for b in list(goal.blockers):
+                key = b.get("key") or b.get("type")
+                if key == "missing_capability":
+                    need = list(b.get("capabilities") or [])
+                    if need and all(c in caps for c in need):
+                        dropped_keys.add(key)
+                        newly_available.update(c for c in need if c in caps)
+                elif key == "approval_pending":
+                    tid = b.get("task_id")
+                    task = self.storage.load_task(tid) if tid else None
+                    if task is None or task.status != TaskStatus.AWAITING_APPROVAL:
+                        dropped_keys.add(key)
+                elif key == "lock_contention":
+                    # ADR-021: the blocker clears when the mutation resource is no
+                    # longer actively locked (resolved via the engine's live lock
+                    # store - the lock store is the only lock authority).
+                    if self.lock_contention_resolver is not None and self.lock_contention_resolver(b):
+                        dropped_keys.add(key)
+            if not dropped_keys:
+                return False
+            expected = goal.version
+            old_state = goal.status.value
+            goal.blockers = [
+                b for b in (goal.blockers or [])
+                if (b.get("key") or b.get("type")) not in dropped_keys
+            ]
+            transitioned = False
+            if not goal.blockers:
+                allowed = GOAL_TRANSITIONS[goal.status.value]
+                if GoalStatus.ACTIVE.value not in allowed:
+                    raise GoalStateError(
+                        f"invalid goal transition {goal.status.value!r} -> "
+                        f"{GoalStatus.ACTIVE.value!r} for goal {goal_id}"
+                    )
+                goal.status = GoalStatus.ACTIVE
+                transitioned = True
+            goal.version = expected + 1
+            goal.updated_at = utcnow()
+            if not self._commit_goal(goal, expected):
+                continue
+            for cap in sorted(newly_available):
+                self._emit("capability.available", goal_id=goal_id, detail={
+                    "goal_id": goal_id, "capability": cap, "source": "world_state",
+                })
+            if transitioned:
+                self._emit("goal.unblocked", goal_id=goal_id, detail={
+                    "goal_id": goal_id, "blocker_key": ",".join(sorted(dropped_keys)),
+                    "reason": "blockers_resolved",
+                })
+                self._emit("goal.state.changed", goal_id=goal_id, detail={
+                    "goal_id": goal_id,
+                    "from": old_state,
+                    "to": GoalStatus.ACTIVE.value,
+                    "reason": "blockers_resolved",
+                    "goal_version": goal.version,
+                    "actor": "system",
+                })
+            return True
+        raise self._contention_error(goal_id, "recheck_blockers")
 
     # ------------------------------------------------------------------ #
     # Plan versioning (immutable, monotonic, replay-safe)
@@ -323,9 +537,12 @@ class GoalManager:
         # (persisted, restart-safe, still purely informational).
         goal = self.get_goal(goal_id)
         if goal is not None and goal.strategy != strategy:
-            goal.strategy = strategy
-            goal.updated_at = utcnow()
-            self.storage.save_goal(goal)
+            try:
+                self._patch_goal(
+                    goal_id, lambda g: setattr(g, "strategy", strategy),
+                    columns=("strategy",), op="record_plan_version")
+            except GoalStateError:
+                pass  # informational follow-up; plan lineage already committed
         self._emit("plan.versioned", goal_id=goal_id, detail={
             "goal_id": goal_id,
             "plan_version": record["plan_version"],
@@ -457,29 +674,45 @@ class GoalManager:
 
         Emits progress.evaluated + goal.evaluated with bounded metadata.
         """
-        goal = self.get_goal(goal_id)
-        if goal is None:
-            raise KeyError(f"goal not found: {goal_id}")
-        tasks = self.task_history(goal_id)
-        latest_plan = self.latest_plan(goal_id)
-        world_changes = self._relevant_world_changes(goal)
-        world_state = self.world_monitor.current_state() if self.world_monitor else None
-        result = self.progress_evaluator.evaluate(goal, tasks, latest_plan, world_changes, world_state)
-
-        goal.progress_metadata = result.to_dict()
-        goal.last_evaluated_at = utcnow()
-        goal.updated_at = utcnow()
-        self.storage.save_goal(goal)
-
-        self._emit("progress.evaluated", goal_id=goal_id, detail=result.to_dict())
-        self._emit("goal.evaluated", goal_id=goal_id, detail={
-            "goal_id": goal_id,
-            "next_action": result.next_action,
-            "status": result.status,
-            "progress": round(result.progress, 3),
-            "evidence_reason": result.evidence.get("reason"),
-        })
-        return result, self.get_goal(goal_id)
+        # Persist the snapshot via CAS so a concurrent lifecycle transition
+        # cannot be rolled back by this metadata write. On a miss we reload
+        # and re-evaluate against the latest status/blockers.
+        for _ in range(_GOAL_CAS_MAX_ATTEMPTS):
+            goal = self.get_goal(goal_id)
+            if goal is None:
+                raise KeyError(f"goal not found: {goal_id}")
+            tasks = self.task_history(goal_id)
+            latest_plan = self.latest_plan(goal_id)
+            world_changes = self._relevant_world_changes(goal)
+            world_state = self.world_monitor.current_state() if self.world_monitor else None
+            last_result = self.progress_evaluator.evaluate(
+                goal, tasks, latest_plan, world_changes, world_state)
+            expected = goal.version
+            goal.progress_metadata = last_result.to_dict()
+            goal.last_evaluated_at = utcnow()
+            goal.updated_at = utcnow()
+            casf = getattr(self.storage, "cas_goal_fields", None)
+            if casf is not None:
+                ok = casf(goal.id, expected, {
+                    "progress_metadata": goal.progress_metadata,
+                    "last_evaluated_at": goal.last_evaluated_at,
+                    "updated_at": goal.updated_at,
+                })
+            else:
+                goal.version = expected + 1
+                ok = self._commit_goal(goal, expected)
+            if not ok:
+                continue
+            self._emit("progress.evaluated", goal_id=goal_id, detail=last_result.to_dict())
+            self._emit("goal.evaluated", goal_id=goal_id, detail={
+                "goal_id": goal_id,
+                "next_action": last_result.next_action,
+                "status": last_result.status,
+                "progress": round(last_result.progress, 3),
+                "evidence_reason": last_result.evidence.get("reason"),
+            })
+            return last_result, self.get_goal(goal_id)
+        raise self._contention_error(goal_id, "evaluate")
 
     def _relevant_world_changes(self, goal: Goal) -> list:
         """Deterministic relevance filter: only changes to facts the goal's
@@ -518,9 +751,9 @@ class GoalManager:
         )
         goal = self.get_goal(goal_id)
         if goal is not None and goal.strategy != strategy.name:
-            goal.strategy = strategy.name
-            goal.updated_at = utcnow()
-            self.storage.save_goal(goal)
+            self._patch_goal(
+                goal_id, lambda g: setattr(g, "strategy", strategy.name),
+                columns=("strategy",), op="strategy_for")
         return strategy
 
     def summarize(self, goal_id: str) -> dict[str, Any]:
