@@ -316,8 +316,14 @@ Learn → Replan`, owned by an authoritative, restart-safe `GoalManager`.
 
 - **Explicit lifecycle:** ACTIVE / PAUSED / BLOCKED / COMPLETED / FAILED /
   CANCELLED with a validated transition table; invalid transitions raise
-  `GoalStateError` (fail closed) and are surfaced cleanly by the CLI. Every
-  transition bumps `goal.version` and emits `goal.state.changed`.
+  `GoalStateError` (fail closed) and are surfaced cleanly by the CLI. Goal
+  rows are authoritative versioned state: lifecycle writes use optimistic
+  concurrency (`SQLiteStorage.cas_goal` — `UPDATE … WHERE id=? AND
+  version=?` inside `BEGIN IMMEDIATE`). Stale writers reload and
+  revalidate; distinct blocker keys merge; a progress / strategy /
+  replan-reason patch cannot clobber a committed transition. A successful
+  transition increments `goal.version` exactly once and emits
+  `goal.state.changed` only after the CAS commits.
 - **ProgressEvaluator (deterministic seam):** `DeterministicProgressEvaluator`
   evaluates completed/failed/skipped work, blockers, outstanding latest-plan
   steps, and material world-state changes → `ProgressResult` with progress,

@@ -218,7 +218,7 @@ class Goal:
     description: str
     source: str = "cli"
     status: GoalStatus | str = GoalStatus.ACTIVE
-    version: int = 1                      # goal revision counter (increments on state change)
+    version: int = 1                      # CAS token; increments on every committed goal-row write
     strategy: str | None = None           # current strategy name
     blockers: list[dict[str, Any]] = field(default_factory=list)  # structured blocker records
     progress_metadata: dict[str, Any] = field(default_factory=dict)  # last evaluation summary

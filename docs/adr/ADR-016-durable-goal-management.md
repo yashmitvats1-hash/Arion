@@ -763,13 +763,83 @@ re-adoption inherits the durable claim (replay of an identical
 unimplemented rollback still adopts; a rollback after a task
 implements the latest equivalent creates a new version).
 
+---
+
+## Addendum: durable goal-lifecycle compare-and-swap
+
+**Status:** Approved & implemented (2026-08-19)
+
+### Defect
+
+Goal lifecycle writes were a best-effort read-mutate-write sequence:
+
+```
+load_goal() → validate / mutate → version += 1 → save_goal()
+```
+
+and `SQLiteStorage.save_goal` used `INSERT OR REPLACE` keyed by `id`.
+Two independent processes or connections could both read version N,
+mutate differently (pause vs set_blocked, two distinct blockers,
+progress vs complete, strategy vs cancel), and the second writer
+would silently replace the first. That is the same class of lost-update
+already closed for beliefs (PR #5) and goal-plan versions (PR #6).
+
+### Invariant (now durable)
+
+The `goals` row is authoritative versioned state. For every goal:
+
+- stale full-row writes never overwrite a newer committed lifecycle
+  state;
+- a successful lifecycle transition increments `goal.version` exactly
+  once and emits `goal.state.changed` only after the CAS commits;
+- a CAS miss reloads the canonical row and revalidates transition
+  legality against the latest status (illegal after a race fails
+  closed);
+- concurrent additions of distinct blocker keys merge; the same key
+  upserts in place and preserves the original `added_at`;
+- a progress, strategy, or replan-reason patch reloads the latest
+  row and applies only its informational fields, so it cannot
+  resurrect a superseded lifecycle status;
+- retries are bounded (`_GOAL_CAS_MAX_ATTEMPTS`) and fail closed
+  under persistent contention.
+
+A crash between a committed CAS and the subsequent event emission
+remains an acknowledged limitation of the existing event architecture
+(events are not in the same SQLite transaction as the goal row).
+
+Plan-version allocation, belief supersession, and scheduler / lock /
+approval authority are unchanged.
+
+### Design
+
+`SQLiteStorage.cas_goal(goal, expected_version) -> bool` is the
+full-row primitive (`UPDATE … WHERE id=? AND version=?` inside
+`BEGIN IMMEDIATE`; `goal.version` must be `expected_version + 1`).
+
+Production writes go through `cas_goal_fields`, which updates only
+the supplied columns under the same version predicate:
+
+- lifecycle / blocker writes (`transition`, `set_blocked`,
+  `clear_blocker` / `clear_blockers`, `recheck_blockers`) include
+  `version = expected + 1` so a stale writer cannot replace a newer
+  row;
+- informational patches (`evaluate`, `strategy_for`,
+  `set_replan_reason`, the strategy-follow in `record_plan_version`)
+  omit `version`, so a progress or strategy update cannot bump the
+  CAS token or overwrite status/blockers.
+
+A miss returns False; the caller reloads and revalidates. `save_goal`
+remains only for creation / explicit seeding. Engine lock-contention
+upserts go through `set_blocked` (no raw `save_goal`).
+
+`fail_goal` writes `last_replan_reason` in the same CAS as the FAILED
+transition so the version increments once.
+
 ### Tests
 
-`tests/test_plan_invariant.py` covers in-process and real-subprocess
-divergent concurrent claims, identical concurrent adoption, repeated
-concurrent monotonic allocation (including post-prune gaps), replay
-deduplication, equivalent replan after a task references the previous
-plan, destructive overwrite refusal, exactly one `plan.versioned`
-event per created version and across identical concurrent claims,
-strategy-outcome crash/repair, `readopt_plan` parity, and
-`diff_plans` / stored-plan fast-path compatibility.
+`tests/test_goal_transition_invariant.py` covers independent-connection
+pause vs blocked, distinct blocker merge, stale overwrite refusal,
+CAS-miss reload/revalidate, illegal-after-race fail-closed, single
+version increment (including `fail_goal`), progress/strategy patches
+that cannot clobber lifecycle, exactly one event for one successful
+competing transition, repeated contention, and a real-subprocess race.
