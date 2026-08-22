@@ -122,6 +122,10 @@ human decision have one deterministic winner.
 - Legacy exact-resource and new hash-based fingerprints remain accepted.
 - Existing immediate `ApprovalHandler` records without durable request IDs keep
   their behavior.
+- ADR-044 later restricted compatibility updates to same-status summary refresh
+  and request-only transitions to DENIED/EXPIRED cleanup; historical raw
+  APPROVED split rows remain reconcilable, but current compatibility APIs cannot
+  manufacture them.
 - No destructive migration, workflow engine, voting model, or policy redesign.
 - Alternate stores may implement the conditional protocol; the default SQLite
   path is authoritative. Missing atomic support fails closed for durable queue

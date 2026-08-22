@@ -807,14 +807,41 @@ class SQLiteStorage:
 
     @_threadsafe
     def update_request(self, request: "ApprovalRequest") -> None:
+        """Refresh summary without changing approval authority (ADR-044)."""
+        from arion.state.approvals import ApprovalError
+
+        previous_updated_at = request.updated_at
         request.updated_at = utcnow()
-        self._conn.execute(
-            "UPDATE approval_requests SET status=?, decision_actor=?, decided_at=?, "
-            "summary=?, expired_at=?, updated_at=? WHERE approval_id=?",
-            (request.status.value, request.decision_actor, request.decided_at,
-             request.summary, request.expired_at, request.updated_at, request.approval_id),
-        )
-        self._conn.commit()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            cursor = self._conn.execute(
+                "UPDATE approval_requests SET summary=?, updated_at=? "
+                "WHERE approval_id=? AND status=?",
+                (request.summary, request.updated_at, request.approval_id,
+                 request.status.value),
+            )
+            if cursor.rowcount != 1:
+                self._conn.rollback()
+                request.updated_at = previous_updated_at
+                row = self._conn.execute(
+                    "SELECT status FROM approval_requests WHERE approval_id=?",
+                    (request.approval_id,),
+                ).fetchone()
+                if row is None:
+                    raise ApprovalError(
+                        f"unknown approval id: {request.approval_id}"
+                    )
+                raise ApprovalError(
+                    f"stale approval status for {request.approval_id}: "
+                    f"object={request.status.value}, durable={row[0]} "
+                    f"(fail closed)"
+                )
+            self._conn.commit()
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            request.updated_at = previous_updated_at
+            raise
 
     @_threadsafe
     def transition_request(
@@ -822,18 +849,41 @@ class SQLiteStorage:
         request: "ApprovalRequest",
         expected_status: "ApprovalStatus",
     ) -> bool:
-        """CAS one approval status without changing task state."""
+        """CAS cleanup-only PENDING -> DENIED | EXPIRED (ADR-044)."""
+        from arion.state.approvals import ApprovalError, ApprovalStatus
+
+        if (expected_status != ApprovalStatus.PENDING
+                or request.status not in (
+                    ApprovalStatus.DENIED, ApprovalStatus.EXPIRED,
+                )):
+            raise ApprovalError(
+                f"request-only transition {expected_status.value} -> "
+                f"{request.status.value} is not allowed; APPROVED requires "
+                f"atomic request/task commit (fail closed)"
+            )
+        previous_updated_at = request.updated_at
         request.updated_at = utcnow()
-        cursor = self._conn.execute(
-            "UPDATE approval_requests SET status=?, decision_actor=?, "
-            "decided_at=?, summary=?, expired_at=?, updated_at=? "
-            "WHERE approval_id=? AND status=?",
-            (request.status.value, request.decision_actor, request.decided_at,
-             request.summary, request.expired_at, request.updated_at,
-             request.approval_id, expected_status.value),
-        )
-        self._conn.commit()
-        return cursor.rowcount == 1
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            cursor = self._conn.execute(
+                "UPDATE approval_requests SET status=?, decision_actor=?, "
+                "decided_at=?, summary=?, expired_at=?, updated_at=? "
+                "WHERE approval_id=? AND status=?",
+                (request.status.value, request.decision_actor,
+                 request.decided_at, request.summary, request.expired_at,
+                 request.updated_at, request.approval_id,
+                 expected_status.value),
+            )
+            if cursor.rowcount != 1:
+                self._conn.rollback()
+                request.updated_at = previous_updated_at
+                return False
+            self._conn.commit()
+            return True
+        except Exception:
+            self._conn.rollback()
+            request.updated_at = previous_updated_at
+            raise
 
     @_threadsafe
     def commit_approval_decision(

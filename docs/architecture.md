@@ -1189,11 +1189,27 @@ Human decisions and executable task state now transition as one durable unit:
 - terminal/cancelled goals cannot be revived through pending or previously
   approved work;
 - approval persistence failure fails the task closed instead of creating an
-  awaiting task with no resolvable request.
+  awaiting task with no resolvable request;
+- compatibility `update_request` is status/provenance preserving, and
+  request-only CAS can close PENDING only as DENIED/EXPIRED—APPROVED always
+  requires the atomic request+task commit (ADR-044).
 
 The commit occurs before events and goal-blocker cleanup, so a post-commit crash
 may omit observability but cannot split approval authority from task state. See
-[`ADR-038`](adr/ADR-038-atomic-approval-decisions.md).
+[`ADR-038`](adr/ADR-038-atomic-approval-decisions.md) and
+[`ADR-044`](adr/ADR-044-approval-compatibility-fencing.md).
+
+## Approval compatibility write fencing (ADR-044)
+
+Historical split-row reconciliation remains available, but current compatibility
+writes cannot manufacture the authority it repairs:
+
+- stale request objects cannot change durable status or decision actor/time;
+- `update_request` refreshes only bounded summary metadata at the same status;
+- request-only `transition_request` supports PENDING→DENIED/EXPIRED cleanup;
+- PENDING→APPROVED is rejected unless request and task commit atomically;
+- raw pre-ADR APPROVED+AWAITING rows remain readable and reconcile through live
+  task, policy, fingerprint, and terminal-state checks.
 
 ## Mutation lock lease ownership (ADR-039)
 

@@ -372,7 +372,7 @@ def test_legacy_denied_row_cannot_execute_through_approved_mirror(
     )
     request.status = ApprovalStatus.DENIED
     request.decision_actor = "legacy-denier"
-    storage.update_request(request)
+    assert storage.transition_request(request, ApprovalStatus.PENDING)
     persisted = storage.load_task(task.id)
     persisted.status = TaskStatus.RUNNING
     persisted.approvals[-1]["outcome"] = "approved"
@@ -394,9 +394,15 @@ def test_legacy_approved_awaiting_split_reconciles_on_same_retry(
         tmp_path / "legacy.db"
     )
     # Pre-ADR-038 crash shape: decision row committed, task still awaiting.
-    request.status = ApprovalStatus.APPROVED
-    request.decision_actor = "legacy-approver"
-    storage.update_request(request)
+    # Historical compatibility is injected as data; current request-only APIs
+    # cannot manufacture APPROVED without the task transaction (ADR-044).
+    storage._conn.execute(
+        "UPDATE approval_requests SET status='approved', "
+        "decision_actor='legacy-approver', decided_at=? "
+        "WHERE approval_id=?",
+        ("2026-08-22T00:00:00+00:00", request.approval_id),
+    )
+    storage._conn.commit()
 
     resolved = engine.resolve_approval_request(
         request.approval_id, ApprovalOutcome.APPROVED
