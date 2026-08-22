@@ -25,6 +25,7 @@ from arion.memory.reflection_schema import (
     ReflectionValidationError,
     validate_reflection_dict,
 )
+from arion.observability.error_boundary import ErrorSource, summarize_error
 from arion.state.models import utcnow
 
 REFLECT_PROMPT = f"""You are Arion's reflection component. Produce a JSON reflection about a completed task.
@@ -65,7 +66,14 @@ class ModelReflector:
         try:
             raw = self.router.generate(prompt, temperature=0)
         except Exception as exc:
-            raise ReflectionValidationError(f"model reflection failed: {exc}") from exc
+            summary = summarize_error(
+                exc,
+                source=ErrorSource.EXTERNAL,
+                category=getattr(exc, "category", "reflection_validation"),
+            )
+            raise ReflectionValidationError(
+                f"model reflection failed: {summary.message}"
+            ) from exc
         try:
             obj = json.loads(raw)
         except json.JSONDecodeError as exc:

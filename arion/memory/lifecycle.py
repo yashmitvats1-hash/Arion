@@ -16,6 +16,7 @@ from typing import Any
 
 from arion.memory.models import Episode, EPISODE_OUTCOMES
 from arion.observability.events import AuditEvent
+from arion.resource_identifiers import present_resource
 from arion.state.models import PlanStep, StepStatus, Task, TaskStatus, new_id, utcnow
 
 _DENY_MARKERS = ("not permitted", "outside boundary", "no resource boundary", "approval denied",
@@ -88,11 +89,15 @@ def build_episode_from_task(
             if spec is not None and spec.resource_kind and spec.resource_param:
                 value = s.params.get(spec.resource_param)
                 if isinstance(value, str) and value:
+                    presentation = present_resource(spec.resource_kind, value)
                     resources.append({
                         "step": s.index,
                         "capability": s.capability,
                         "action": s.action,
-                        "resource": value,
+                        "resource_kind": spec.resource_kind,
+                        "resource": presentation.display,
+                        "resource_fingerprint": presentation.fingerprint,
+                        "resource_redacted": presentation.redacted,
                         "status": s.status.value,
                     })
     verification = {
@@ -116,7 +121,10 @@ def build_episode_from_task(
     denials = [
         {
             "scope": e.detail.get("scope"),
+            "resource_kind": e.detail.get("resource_kind"),
             "resource": e.detail.get("resource"),
+            "resource_fingerprint": e.detail.get("resource_fingerprint"),
+            "resource_redacted": bool(e.detail.get("resource_redacted", False)),
             "reason": str(e.detail.get("reason", ""))[:200],
         }
         for e in events

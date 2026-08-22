@@ -345,6 +345,16 @@ def main(argv: list[str] | None = None) -> int:
         # reclamation (stale leases + dead schedulers' queues).
         scheduler_reclaim_on_start=args.command != "scheduler",
     )
+    try:
+        return _dispatch_command(args, engine)
+    finally:
+        # ADR-032: every command path, including delegated commands and
+        # exceptions, drains workers and releases all composition-owned stores.
+        engine.shutdown()
+
+
+def _dispatch_command(args, engine: ArionEngine) -> int:
+    """Run one parsed command while ``main`` retains lifecycle ownership."""
     storage = engine.storage
 
     if args.command == "run":
@@ -365,8 +375,6 @@ def main(argv: list[str] | None = None) -> int:
             _print_task(engine, latest.id)
         if goal.status_value == "failed":
             print(f"goal error: {goal.last_replan_reason or 'failed'}")
-            engine.shutdown()  # ADR-024: join bounded workers, no orphans
-            storage.close()
             return 1
     elif args.command == "resume":
         task = engine.run_task(args.task_id)
@@ -402,8 +410,6 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "scheduler":
         return _scheduler_command(args, engine)
 
-    engine.shutdown()  # ADR-024/025: join bounded workers, no orphans
-    storage.close()
     return 0
 
 

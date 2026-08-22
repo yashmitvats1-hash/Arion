@@ -124,6 +124,29 @@ def _entry_for_step(episode: Episode, step_index: int) -> dict | None:
     return None
 
 
+def _informational_for_redacted_resource(
+    episode: Episode,
+    entry: dict | None,
+    capability: str | None,
+    action: str | None,
+    reason: str,
+    base: dict,
+) -> MemoryGuidance | None:
+    """Redacted displays are evidence, never executable substitutions."""
+    if not entry or not entry.get("resource_redacted"):
+        return None
+    return MemoryGuidance(
+        guidance_id=new_id("guide"),
+        category="informational",
+        capability=entry.get("capability") or capability,
+        action=entry.get("action") or action,
+        resource=None,
+        strategy="review_resource",
+        reason=reason[:300],
+        **base,
+    )
+
+
 def _first_successful_resource(episode: Episode) -> dict | None:
     for r in episode.resources:
         if r.get("status") == "succeeded" and r.get("resource"):
@@ -173,6 +196,12 @@ def build_guidance_for_episode(episode: Episode, reflection: Reflection | None =
         cap = entry.get("capability") if entry else cap
         act = entry.get("action") if entry else act
         reasons = [d.get("reason", "") for d in episode.authorization.get("denials", [])]
+        reason = "; ".join(str(r) for r in reasons if r)[:300] or "authorization denied"
+        informational = _informational_for_redacted_resource(
+            episode, entry, cap, act, reason, base
+        )
+        if informational is not None:
+            return informational
         return MemoryGuidance(
             guidance_id=new_id("guide"),
             category="avoid",
@@ -180,7 +209,7 @@ def build_guidance_for_episode(episode: Episode, reflection: Reflection | None =
             action=act,
             resource=resource,
             strategy="defer",  # authorization-driven avoidance: defer / do not attempt
-            reason="; ".join(str(r) for r in reasons if r)[:300] or "authorization denied",
+            reason=reason,
             **base,
         )
 
@@ -195,6 +224,11 @@ def build_guidance_for_episode(episode: Episode, reflection: Reflection | None =
         reason = f"prior failure ({category}): " + (
             next((f.get("error", "") for f in episode.failures), "")[:200]
         )
+        informational = _informational_for_redacted_resource(
+            episode, entry, cap, act, reason, base
+        )
+        if informational is not None:
+            return informational
         return MemoryGuidance(
             guidance_id=new_id("guide"),
             category="avoid",
@@ -212,6 +246,11 @@ def build_guidance_for_episode(episode: Episode, reflection: Reflection | None =
         resource = entry.get("resource") if entry else _first_resource(episode)
         cap = entry.get("capability") if entry else cap
         act = entry.get("action") if entry else act
+        informational = _informational_for_redacted_resource(
+            episode, entry, cap, act, "prior success on redacted resource", base
+        )
+        if informational is not None:
+            return informational
         return MemoryGuidance(
             guidance_id=new_id("guide"),
             category="prefer",

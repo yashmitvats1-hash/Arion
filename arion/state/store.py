@@ -36,6 +36,10 @@ from arion.state.scheduler_work import (
     legal_transition,
 )
 
+# Full snapshots remain the recovery representation; only historical count is
+# bounded (ADR-036). Normal two-step tasks produce four checkpoints.
+DEFAULT_CHECKPOINT_RETENTION = 8
+
 
 def _audit_event(*args, **kwargs):
     """Cycle-safe lazy import of AuditEvent (events.py imports this
@@ -257,6 +261,16 @@ class Storage(Protocol):
     def list_events(self, task_id: str | None = None) -> list[AuditEvent]: ...
 
     def close(self) -> None: ...
+
+
+class CheckpointRetentionStore(Protocol):
+    """Optional storage capability for bounded historical checkpoints."""
+
+    def prune_checkpoints(
+        self,
+        task_id: str,
+        keep_last: int = DEFAULT_CHECKPOINT_RETENTION,
+    ) -> int: ...
 
 
 class SQLiteStorage:
@@ -547,6 +561,38 @@ class SQLiteStorage:
         ).fetchall()
         return [Checkpoint.from_dict(_row_to_dict(r, _CKPT_COLS)) for r in rows]
 
+    @_threadsafe
+    def prune_checkpoints(
+        self,
+        task_id: str,
+        keep_last: int = DEFAULT_CHECKPOINT_RETENTION,
+    ) -> int:
+        """Delete only historical checkpoints older than the newest bound.
+
+        Recovery reads the newest row by insertion order. The subquery always
+        protects that row (and the other newest rows); failure rolls back this
+        optimization without affecting the already committed checkpoint.
+        """
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("task_id must be a non-empty string")
+        if (isinstance(keep_last, bool) or not isinstance(keep_last, int)
+                or keep_last < 1 or keep_last > 1000):
+            raise ValueError("keep_last must be an integer in [1, 1000]")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            cursor = self._conn.execute(
+                "DELETE FROM checkpoints WHERE task_id=? AND rowid NOT IN ("
+                "SELECT rowid FROM checkpoints WHERE task_id=? "
+                "ORDER BY rowid DESC LIMIT ?)",
+                (task_id, task_id, keep_last),
+            )
+            removed = max(0, int(cursor.rowcount))
+            self._conn.commit()
+            return removed
+        except Exception:
+            self._conn.rollback()
+            raise
+
     # ---- audit events ----
 
     @_threadsafe
@@ -589,13 +635,34 @@ class SQLiteStorage:
     )
 
     @_threadsafe
-    def create_request(self, request: "ApprovalRequest") -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO approval_requests "
-            f"({', '.join(self._APPROVAL_COLS)}) VALUES ({', '.join('?' * len(self._APPROVAL_COLS))})",
-            _approval_row(request),
-        )
-        self._conn.commit()
+    def create_request(self, request: "ApprovalRequest") -> "ApprovalRequest":
+        """Atomically create or adopt one canonical matching PENDING row."""
+        from arion.state.approvals import ApprovalStatus
+
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            rows = self._conn.execute(
+                f"SELECT {', '.join(self._APPROVAL_COLS)} FROM approval_requests "
+                "WHERE task_id=? AND step_index=? AND status=? ORDER BY rowid",
+                (request.task_id, request.step_index,
+                 ApprovalStatus.PENDING.value),
+            ).fetchall()
+            for row in rows:
+                existing = _approval_from_row(row)
+                if existing.fingerprint == request.fingerprint:
+                    self._conn.commit()
+                    return existing
+            self._conn.execute(
+                "INSERT INTO approval_requests "
+                f"({', '.join(self._APPROVAL_COLS)}) "
+                f"VALUES ({', '.join('?' * len(self._APPROVAL_COLS))})",
+                _approval_row(request),
+            )
+            self._conn.commit()
+            return request
+        except Exception:
+            self._conn.rollback()
+            raise
 
     @_threadsafe
     def get_request(self, approval_id: str) -> "ApprovalRequest | None":
@@ -626,6 +693,110 @@ class SQLiteStorage:
              request.summary, request.expired_at, request.updated_at, request.approval_id),
         )
         self._conn.commit()
+
+    @_threadsafe
+    def transition_request(
+        self,
+        request: "ApprovalRequest",
+        expected_status: "ApprovalStatus",
+    ) -> bool:
+        """CAS one approval status without changing task state."""
+        request.updated_at = utcnow()
+        cursor = self._conn.execute(
+            "UPDATE approval_requests SET status=?, decision_actor=?, "
+            "decided_at=?, summary=?, expired_at=?, updated_at=? "
+            "WHERE approval_id=? AND status=?",
+            (request.status.value, request.decision_actor, request.decided_at,
+             request.summary, request.expired_at, request.updated_at,
+             request.approval_id, expected_status.value),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
+
+    @_threadsafe
+    def commit_approval_decision(
+        self,
+        request: "ApprovalRequest",
+        task: Task,
+        expected_task_updated_at: str,
+    ) -> bool:
+        """Atomically decide PENDING approval and transition AWAITING task."""
+        from arion.state.approvals import ApprovalStatus
+
+        if (request.task_id != task.id
+                or request.status not in (
+                    ApprovalStatus.APPROVED,
+                    ApprovalStatus.DENIED,
+                    ApprovalStatus.EXPIRED,
+                )):
+            return False
+        now = utcnow()
+        request.updated_at = now
+        task.updated_at = now
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            approval = self._conn.execute(
+                "UPDATE approval_requests SET status=?, decision_actor=?, "
+                "decided_at=?, summary=?, expired_at=?, updated_at=? "
+                "WHERE approval_id=? AND status=?",
+                (request.status.value, request.decision_actor,
+                 request.decided_at, request.summary, request.expired_at,
+                 request.updated_at, request.approval_id,
+                 ApprovalStatus.PENDING.value),
+            )
+            task_row = self._conn.execute(
+                "UPDATE tasks SET status=?, snapshot=?, updated_at=? "
+                "WHERE id=? AND status=? AND updated_at=?",
+                (task.status.value, json.dumps(task.to_dict()), task.updated_at,
+                 task.id, TaskStatus.AWAITING_APPROVAL.value,
+                 expected_task_updated_at),
+            )
+            if approval.rowcount != 1 or task_row.rowcount != 1:
+                self._conn.rollback()
+                return False
+            self._conn.commit()
+            return True
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_threadsafe
+    def reconcile_approval_task(
+        self,
+        request: "ApprovalRequest",
+        task: Task,
+        expected_task_updated_at: str,
+        expected_task_statuses: tuple[str, ...],
+    ) -> bool:
+        """CAS task mirror to an already-committed durable decision."""
+        if not expected_task_statuses or request.task_id != task.id:
+            return False
+        now = utcnow()
+        task.updated_at = now
+        placeholders = ",".join("?" * len(expected_task_statuses))
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                "SELECT status FROM approval_requests WHERE approval_id=?",
+                (request.approval_id,),
+            ).fetchone()
+            if row is None or row[0] != request.status.value:
+                self._conn.rollback()
+                return False
+            cursor = self._conn.execute(
+                "UPDATE tasks SET status=?, snapshot=?, updated_at=? "
+                f"WHERE id=? AND updated_at=? AND status IN ({placeholders})",
+                (task.status.value, json.dumps(task.to_dict()), task.updated_at,
+                 task.id, expected_task_updated_at, *expected_task_statuses),
+            )
+            if cursor.rowcount != 1:
+                self._conn.rollback()
+                return False
+            self._conn.commit()
+            return True
+        except Exception:
+            self._conn.rollback()
+            raise
 
     @_threadsafe
     def latest_request_for_step(self, task_id: str, step_index: int) -> "ApprovalRequest | None":
@@ -818,6 +989,62 @@ class SQLiteStorage:
             raise
 
     @_threadsafe
+    def renew(self, lock_id: str, owner_id: str, lease_seconds: float,
+              now: str | None = None) -> "MutationLock":
+        """Conditionally extend one live lock owned by the exact owner."""
+        from arion.state.locks import (
+            MutationLockError, _add_seconds, _parse_iso,
+        )
+
+        now = now or utcnow()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                f"SELECT {', '.join(self._LOCK_COLS)} FROM mutation_locks "
+                "WHERE lock_id=?", (lock_id,),
+            ).fetchone()
+            if row is None:
+                raise MutationLockError(
+                    f"mutation lock {lock_id} is missing; ownership lost"
+                )
+            lock = _lock_from_row(row)
+            if lock.owner_id != owner_id:
+                raise MutationLockError(
+                    f"lock {lock_id} is owned by another owner; cannot renew"
+                )
+            if _parse_iso(now) < _parse_iso(lock.acquired_at):
+                raise MutationLockError(
+                    f"lock {lock_id} renewal time precedes acquisition"
+                )
+            if _parse_iso(now) >= _parse_iso(lock.expires_at):
+                raise MutationLockError(
+                    f"lock {lock_id} already expired; stale owner cannot renew"
+                )
+            candidate = _add_seconds(now, max(0.0, float(lease_seconds)))
+            new_expiry = max(
+                _parse_iso(lock.expires_at), _parse_iso(candidate)
+            ).isoformat()
+            self._conn.execute(
+                "UPDATE mutation_locks SET expires_at=? "
+                "WHERE lock_id=? AND owner_id=?",
+                (new_expiry, lock_id, owner_id),
+            )
+            self._conn.commit()
+            lock.expires_at = new_expiry
+            return lock
+        except MutationLockError:
+            self._conn.rollback()
+            raise
+        except sqlite3.OperationalError as exc:
+            self._conn.rollback()
+            raise MutationLockError(
+                f"could not renew mutation lock (database busy): {exc}"
+            ) from exc
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_threadsafe
     def release(self, lock_id: str, owner_id: str) -> bool:
         """Release a lock owned by `owner_id`. Returns True when this call
         removed the lock; False when it was already gone (idempotent for the
@@ -927,10 +1154,10 @@ class SQLiteStorage:
                        now: str | None = None) -> "LockWaiter":
         """Atomically enqueue a FIFO waiter for a canonical resource.
 
-        The durable position (seq) is 1 + MAX(seq) for that resource inside
-        BEGIN IMMEDIATE, so concurrent enqueues from different processes get
-        distinct, commit-ordered positions. One waiter per resource per task
-        is the engine's responsibility; the store does not dedupe here.
+        Existing QUEUED membership for the same resource/task/step is adopted
+        unchanged (position/deadline preserved across a row-before-checkpoint
+        crash). Otherwise seq is allocated as 1 + MAX(seq) under the same
+        BEGIN IMMEDIATE transaction.
         """
         from arion.state.locks import LockWaiter, LockWaiterStatus
 
@@ -938,6 +1165,17 @@ class SQLiteStorage:
             now = utcnow()
         try:
             self._conn.execute("BEGIN IMMEDIATE")
+            existing = self._conn.execute(
+                f"SELECT {', '.join(self._WAITER_COLS)} "
+                "FROM mutation_lock_waiters WHERE resource_kind=? "
+                "AND resource=? AND task_id=? AND step_index=? AND status=? "
+                "ORDER BY seq LIMIT 1",
+                (resource_kind, resource, task_id, step_index,
+                 LockWaiterStatus.QUEUED.value),
+            ).fetchone()
+            if existing is not None:
+                self._conn.commit()
+                return _waiter_from_row(existing)
             row = self._conn.execute(
                 "SELECT COALESCE(MAX(seq), 0) + 1 FROM mutation_lock_waiters "
                 "WHERE resource_kind=? AND resource=?",

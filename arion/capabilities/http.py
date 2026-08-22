@@ -23,8 +23,43 @@ from typing import Any, Protocol
 from urllib.parse import urljoin, urlsplit
 
 from arion.capabilities.registry import ActionSpec, CapabilityError
+from arion.resource_identifiers import present_resource
 
 _MAX_REDIRECTS = 5
+_MAX_RETAINED_HEADER_BYTES = 1024
+_RETAINED_RESPONSE_HEADERS = frozenset({
+    "cache-control",
+    "content-length",
+    "content-type",
+    "etag",
+    "expires",
+    "last-modified",
+})
+
+
+def _bounded_header_value(value: str) -> str:
+    """One-line, UTF-8-byte-bounded diagnostic response metadata."""
+    normalized = value.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    encoded = normalized.encode("utf-8")
+    if len(encoded) <= _MAX_RETAINED_HEADER_BYTES:
+        return normalized
+    return encoded[:_MAX_RETAINED_HEADER_BYTES].decode("utf-8", errors="ignore")
+
+
+def _retained_response_headers(headers: dict[str, str] | None) -> dict[str, str]:
+    """Allowlist headers useful for content interpretation/caching only.
+
+    Transport credentials, cookies, authentication challenges, and arbitrary
+    extension headers never belong in durable task/checkpoint results.
+    """
+    retained: dict[str, str] = {}
+    for raw_name, raw_value in (headers or {}).items():
+        if not isinstance(raw_name, str) or not isinstance(raw_value, str):
+            continue
+        name = raw_name.strip().lower()
+        if name in _RETAINED_RESPONSE_HEADERS:
+            retained[name] = _bounded_header_value(raw_value)
+    return retained
 
 
 # --------------------------------------------------------------------------- #
@@ -215,12 +250,15 @@ class HttpGetCapability:
 
         if len((resp.body or "").encode("utf-8")) > self.max_bytes:
             raise CapabilityError("response exceeded max_bytes")
+        url_presentation = present_resource("url", current)
         return {
             "action": "get",
             "capability": self.name,
-            "url": current,
+            "url": url_presentation.display,
+            "url_fingerprint": url_presentation.fingerprint,
+            "url_redacted": url_presentation.redacted,
             "status": resp.status,
-            "headers": dict(resp.headers),
+            "headers": _retained_response_headers(resp.headers),
             "body": resp.body,
         }
 

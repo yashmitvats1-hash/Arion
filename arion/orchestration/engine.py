@@ -28,6 +28,7 @@ import os
 import threading as _threading
 from typing import Any
 
+from arion.capabilities.observations import normalize_observation
 from arion.capabilities.registry import CapabilityError, CapabilityRegistry
 from arion.state.approvals import ApprovalError, ApprovalRequest, ApprovalStatus, ApprovalStore
 from arion.state.recovery import MutationRecovery, RecoveryError, RecoveryStatus
@@ -36,7 +37,29 @@ from arion.intelligence.plan_schema import PlanValidationError
 from arion.intelligence.plan_validator import topo_sort_steps
 from arion.intelligence.planner import Planner
 from arion.intelligence.router import ModelRouter
-from arion.observability.events import AuditEvent, EventLogger
+from arion.observability.error_boundary import (
+    ErrorSource,
+    classify_error_source,
+    sanitize_error_text,
+    summarize_error,
+)
+from arion.observability.events import (
+    AuditEvent,
+    AuthorizationEventDetails,
+    EventDetails,
+    EventLogger,
+)
+from arion.resource_identifiers import (
+    present_resource,
+    present_resource_reason,
+)
+from arion.runtime.lifecycle import (
+    ComponentHealth,
+    HealthReport,
+    HealthStatus,
+    LifecycleState,
+    ResourceLifecycle,
+)
 from arion.orchestration.authz import (
     Actor,
     ApprovalHandler,
@@ -60,7 +83,7 @@ from arion.state.models import (
     new_id,
     utcnow,
 )
-from arion.state.store import Storage
+from arion.state.store import DEFAULT_CHECKPOINT_RETENTION, Storage
 
 
 def _iso_plus(iso: str, seconds: float) -> str:
@@ -111,7 +134,16 @@ class ArionEngine:
         scheduler_reclaim_on_start: bool = True,
         scheduler_global_max_concurrency: int | None = None,
         scheduler_max_lease_seconds: float | None = None,
+        lifecycle: ResourceLifecycle | None = None,
     ):
+        # Runtime ownership (ADR-032): dependencies passed directly to the
+        # engine are borrowed by default.  The composition root supplies a
+        # ResourceLifecycle containing only the resources it constructed and
+        # therefore owns.  This keeps shutdown complete without unexpectedly
+        # closing shared stores in manually assembled engines.
+        self._resource_lifecycle = lifecycle or ResourceLifecycle()
+        self._shutdown_lock = _threading.RLock()
+        self._shutdown_complete = False
         self.storage = storage
         self.registry = registry
         self.planner = planner
@@ -176,8 +208,6 @@ class ArionEngine:
         # (ADR-024 dispatch: a step whose resource is already held by a
         # running step of this task is not dispatched in the same round when
         # waiting is disabled). Coordination only - never authorization.
-        import threading as _threading
-
         self._inflight_locks: set[tuple[str, str]] = set()
         self._inflight_lock = _threading.RLock()
         # Durable scheduler/work registry (ADR-025): the storage backend is
@@ -377,6 +407,67 @@ class ArionEngine:
         """Explicit, unique owner/process identity for this engine's locks."""
         return f"proc:{os.getpid()}:{new_id('owner')}"
 
+    def _renew_mutation_lock(self, lock):
+        renew = getattr(self.mutation_lock_store, "renew", None)
+        if not callable(renew):
+            return lock  # compatibility for alternate legacy stores
+        renewed = renew(
+            lock.lock_id, lock.owner_id,
+            lease_seconds=self.mutation_lock_lease_seconds,
+            now=self._lock_now(),
+        )
+        lock.expires_at = renewed.expires_at
+        return renewed
+
+    def _start_lock_heartbeat(self, lock):
+        """Renew one live mutation owner while capability code is blocking."""
+        if (lock is None or self.mutation_lock_store is None
+                or not callable(getattr(self.mutation_lock_store, "renew", None))
+                or self.mutation_lock_lease_seconds <= 0):
+            return None
+        stop = _threading.Event()
+        state: dict[str, Any] = {"error": None}
+        interval = max(
+            0.01,
+            min(5.0, float(self.mutation_lock_lease_seconds) / 3.0),
+        )
+
+        def heartbeat() -> None:
+            while not stop.wait(interval):
+                try:
+                    self._renew_mutation_lock(lock)
+                except Exception as exc:
+                    state["error"] = exc
+                    return
+
+        thread = _threading.Thread(
+            target=heartbeat,
+            daemon=True,
+            name=f"arion-lock-heartbeat-{lock.lock_id}",
+        )
+        thread.start()
+        return stop, thread, state
+
+    @staticmethod
+    def _stop_lock_heartbeat(heartbeat) -> dict[str, Any]:
+        if heartbeat is None:
+            return {"error": None}
+        stop, thread, state = heartbeat
+        stop.set()
+        thread.join(timeout=5.0)
+        return state
+
+    def _lock_wait_cancelled(self, task: Task) -> bool:
+        if self._goal_is_terminal_for_approval(task):
+            return True
+        try:
+            durable = self.storage.load_task(task.id)
+            return durable is not None and durable.status in (
+                TaskStatus.COMPLETED, TaskStatus.FAILED,
+            )
+        except Exception:
+            return True
+
     def _lock_canonical(self, spec, step: PlanStep) -> tuple[str | None, str | None]:
         """Canonical lock identity: (resource_kind, canonical resource).
 
@@ -534,6 +625,18 @@ class ArionEngine:
 
         while True:
             now = self._lock_now()
+            if self._lock_wait_cancelled(task):
+                self.mutation_lock_store.dequeue_waiter(
+                    waiter_id, "cancelled"
+                )
+                task.lock_wait = None
+                step.status = StepStatus.FAILED
+                step.error = "mutation lock wait cancelled by terminal task/goal"
+                task.status = TaskStatus.FAILED
+                task.error = step.error
+                task.completed_at = utcnow()
+                self.storage.save_task(task)
+                raise MutationLockTimeoutError(step.error)
             if now >= deadline:
                 # durable, typed, explainable timeout - coordination only
                 self.mutation_lock_store.dequeue_waiter(waiter_id, "timed_out")
@@ -763,18 +866,27 @@ class ArionEngine:
             "permission.checked",
             task_id=task.id,
             step_id=_step_id(step),
-            detail={
-                **decision.to_dict(),
-                "params": request.params,
-                "actor": request.actor.id,
-                "revalidated_after_lock_wait": True,
-            },
+            detail=AuthorizationEventDetails.from_mapping(
+                decision.to_dict(),
+                actor=request.actor.id,
+                param_keys=tuple(request.params),
+                revalidated_after_lock_wait=True,
+            ),
         )
         if decision.outcome == PolicyOutcome.DENY:
             step.status = StepStatus.FAILED
-            step.error = decision.reason
-            self._emit("permission.denied", task_id=task.id, step_id=_step_id(step),
-                       success=False, detail=decision.to_dict())
+            step.error = present_resource_reason(
+                decision.reason, request.resource_kind, request.resource
+            )
+            self._emit(
+                "permission.denied",
+                task_id=task.id,
+                step_id=_step_id(step),
+                success=False,
+                detail=AuthorizationEventDetails.from_mapping(
+                    decision.to_dict()
+                ),
+            )
             return False
         if decision.outcome == PolicyOutcome.REQUIRE_APPROVAL:
             if not self._handle_approval(task, step, request, decision):
@@ -936,147 +1048,140 @@ class ArionEngine:
                 return False
         return False
 
-    def shutdown(self, timeout: float = 30.0) -> None:
-        """Stop the in-process step scheduler (ADR-024/025): no new work is
-        accepted, queued (not-running) work is cancelled, bounded active
-        workers are joined. After shutdown returns, no worker thread may
-        continue mutating. Idempotent.
+    def shutdown(self, timeout: float = 30.0) -> HealthReport:
+        """Stop work and release resources owned by this composition.
 
-        The durable registry is mirrored: QUEUED rows of THIS scheduler are
-        marked CANCELLED (a cancelled row can never run). Rows already
-        RUNNING were drained by the join and reach their terminal state via
-        the worker's own mirror; stale rows are reclaimed on the next
-        engine construction. The durable scheduler registration is removed
-        (ADR-026) so peers can abandon this process's leftover queue."""
-        if getattr(self, "scheduler", None) is not None:
-            self.scheduler.shutdown(timeout=timeout)
-        if getattr(self, "scheduler_registry", None) is not None:
-            try:
-                for row in self.scheduler_registry.list_work(
-                        status=SchedulerWorkStatus.QUEUED,
-                        scheduler_id=self.scheduler_id):
-                    try:
-                        self.scheduler_registry.mark_terminal(
-                            row.work_id, SchedulerWorkStatus.CANCELLED,
-                            now=self._lock_now())
-                    except SchedulerStateError:
-                        pass  # already transitioned by a draining worker
-            except Exception:
-                pass
-            if self._registered and hasattr(
-                    self.scheduler_registry, "unregister_scheduler"):
+        Scheduler ordering from ADR-024..026 is preserved: no new work is
+        accepted, active workers are drained, durable ownership is removed,
+        and only then are bootstrap-owned cognition, memory, and state stores
+        closed in reverse construction order (ADR-032).  Dependencies injected
+        directly into :class:`ArionEngine` are borrowed and remain open unless
+        their creator explicitly supplied a ``ResourceLifecycle``.
+
+        The operation is idempotent and concurrent callers receive the same
+        terminal health state.  After it returns no worker may continue
+        mutating an owned store.
+        """
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return self.health()
+            if getattr(self, "scheduler", None) is not None:
+                self.scheduler.shutdown(timeout=timeout)
+            if getattr(self, "scheduler_registry", None) is not None:
                 try:
-                    self.scheduler_registry.unregister_scheduler(self.scheduler_id)
-                    self._registered = False
+                    for row in self.scheduler_registry.list_work(
+                            status=SchedulerWorkStatus.QUEUED,
+                            scheduler_id=self.scheduler_id):
+                        try:
+                            self.scheduler_registry.mark_terminal(
+                                row.work_id, SchedulerWorkStatus.CANCELLED,
+                                now=self._lock_now())
+                        except SchedulerStateError:
+                            pass  # already transitioned by a draining worker
                 except Exception:
                     pass
+                if self._registered and hasattr(
+                        self.scheduler_registry, "unregister_scheduler"):
+                    try:
+                        self.scheduler_registry.unregister_scheduler(self.scheduler_id)
+                        self._registered = False
+                    except Exception:
+                        pass
+            self._resource_lifecycle.shutdown(timeout=timeout)
+            self._shutdown_complete = True
+            return self.health()
+
+    def close(self) -> HealthReport:
+        """Compatibility alias for complete runtime shutdown (ADR-032)."""
+        return self.shutdown()
+
+    def __enter__(self) -> "ArionEngine":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.shutdown()
+
+    def health(self) -> HealthReport:
+        """Return bounded scheduler and owned-resource lifecycle health."""
+        with self._shutdown_lock:
+            owned = self._resource_lifecycle.health()
+            scheduler_status = (
+                HealthStatus.STOPPED if self._shutdown_complete
+                else HealthStatus.HEALTHY
+            )
+            scheduler_detail = "scheduler active"
+            try:
+                snapshot = self.scheduler.snapshot()
+                queued = len(snapshot.get("queued", ()))
+                running = len(snapshot.get("running", ()))
+                workers = int(snapshot.get("workers", 0))
+                if snapshot.get("shutdown"):
+                    scheduler_status = HealthStatus.STOPPED
+                    scheduler_detail = "scheduler stopped"
+                else:
+                    scheduler_detail = (
+                        f"workers={workers}, queued={queued}, running={running}"
+                    )
+            except Exception as exc:
+                scheduler_status = HealthStatus.UNHEALTHY
+                scheduler_detail = f"health check failed: {type(exc).__name__}"
+
+            scheduler_health = ComponentHealth(
+                name="orchestration.scheduler",
+                status=scheduler_status,
+                detail=scheduler_detail,
+            )
+            components = (scheduler_health, *owned.components)
+
+            if (owned.state is LifecycleState.FAILED
+                    or scheduler_status is HealthStatus.UNHEALTHY):
+                state = LifecycleState.FAILED
+                status = HealthStatus.UNHEALTHY
+            elif self._shutdown_complete:
+                state = LifecycleState.STOPPED
+                status = HealthStatus.STOPPED
+            elif owned.status is not HealthStatus.HEALTHY:
+                state = LifecycleState.RUNNING
+                status = HealthStatus.DEGRADED
+            else:
+                state = LifecycleState.RUNNING
+                status = HealthStatus.HEALTHY
+            return HealthReport(state=state, status=status, components=components)
 
     # ---------- approval expiry (ADR-019) ----------
 
     def expire_stale_approvals(self, now: str | None = None) -> list[str]:
-        """Mark stale PENDING approval requests as EXPIRED (durable, idempotent).
-
-        A request expires when it has been pending longer than the engine's
-        configured TTL (approval_ttl_seconds). `now` is injectable for tests
-        (ISO-8601); defaults to the real clock. Returns the approval ids that
-        were newly expired in this call. Idempotent: already-EXPIRED requests
-        are never touched again, so no duplicate events. Expired requests
-        remain fully auditable - nothing is deleted.
-
-        An expired approval fails the awaiting task durably with an explicit
-        'approval expired; recovery requires new authorization' error and
-        clears the goal's approval_pending blocker, so a later run_goal
-        replans and requests FRESH authorization. A stale approval can never
-        cause a mutation.
-        """
-        if now is None:
-            from arion.state.models import utcnow
-
-            now = utcnow()
-        if self.approval_store is None:
+        """Conditionally expire stale PENDING rows with their awaiting tasks."""
+        now = now or utcnow()
+        if self.approval_store is None or self.approval_ttl_seconds is None:
             return []
-        ttl = self.approval_ttl_seconds
-        if ttl is None:
-            return []  # expiration disabled
-
-        from datetime import datetime, timedelta, timezone
-
-        try:
-            now_dt = datetime.fromisoformat(now)
-            if now_dt.tzinfo is None:
-                now_dt = now_dt.replace(tzinfo=timezone.utc)
-        except ValueError:
-            return []
-        cutoff = now_dt - timedelta(seconds=max(0.0, float(ttl)))
-        cutoff_iso = cutoff.isoformat()
-
         expired: list[str] = []
-        for req in self.approval_store.list_requests(status=ApprovalStatus.PENDING.value):
+        for req in self.approval_store.list_requests(
+                status=ApprovalStatus.PENDING.value):
+            if not self._approval_request_is_expired(req, now=now):
+                continue
             try:
-                created_dt = datetime.fromisoformat(req.created_at)
-                if created_dt.tzinfo is None:
-                    created_dt = created_dt.replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError):
-                continue
-            if created_dt >= cutoff:
-                continue
-            req.status = ApprovalStatus.EXPIRED
-            req.expired_at = now
-            req.updated_at = now
-            self.approval_store.update_request(req)
-            expired.append(req.approval_id)
-            self._emit(
-                "approval.expired",
-                task_id=req.task_id,
-                step_id=f"{req.task_id}:{req.step_index}",
-                success=False,
-                detail={
-                    "approval_id": req.approval_id,
-                    "task_id": req.task_id,
-                    "step_index": req.step_index,
-                    "capability": req.capability,
-                    "action": req.action,
-                    "resource": req.resource,
-                    "reason": "pending approval exceeded TTL",
-                },
-            )
-            self._fail_awaiting_task_on_expiry(req)
+                committed = self._apply_approval_status(
+                    req, ApprovalStatus.EXPIRED, "system:expiry",
+                    "approval expired; recovery requires new authorization",
+                    decision_time=now,
+                )
+            except ApprovalError:
+                # Task already terminal/missing: close the orphan request by
+                # CAS without reviving or rewriting task state.
+                req.status = ApprovalStatus.EXPIRED
+                req.decision_actor = "system:expiry"
+                req.decided_at = now
+                req.expired_at = now
+                transition = getattr(self.approval_store,
+                                     "transition_request", None)
+                committed = bool(
+                    callable(transition)
+                    and transition(req, ApprovalStatus.PENDING)
+                )
+            if committed:
+                expired.append(req.approval_id)
         return expired
-
-    def _fail_awaiting_task_on_expiry(self, req: "ApprovalRequest") -> None:
-        """Fail the task that was waiting on an expired approval, durably.
-
-        Mirrors the DENIED path but with an explicit expiry reason: the
-        mutation is NOT executed, the task becomes terminally FAILED with an
-        explainable error, and the goal's approval_pending blocker is cleared
-        so the next run_goal replans and requests fresh authorization.
-        """
-        task = self.storage.load_task(req.task_id)
-        if task is None or task.status != TaskStatus.AWAITING_APPROVAL:
-            return
-        step = task.active_step
-        if step is not None and step.index == req.step_index:
-            step.status = StepStatus.FAILED
-            step.error = "approval expired; recovery requires new authorization"
-        task.status = TaskStatus.FAILED
-        task.error = "approval expired; recovery requires new authorization"
-        task.completed_at = utcnow()
-        if self.goal_manager is not None and task.goal_id:
-            try:
-                self.goal_manager.clear_blocker(task.goal_id, "approval_pending",
-                                                reason="approval_expired")
-            except Exception:
-                pass
-        self._emit("task.failed", task_id=task.id, detail={
-            "step_index": req.step_index, "error": task.error,
-        })
-        self._emit("goal.approval.expired", task_id=task.id, detail={
-            "goal_id": task.goal_id, "task_id": task.id, "step_index": req.step_index,
-            "approval_id": req.approval_id,
-        })
-        self._record_memory(task)
-        task.updated_at = utcnow()
-        self.storage.save_task(task)
 
     # ---------- public API ----------
 
@@ -1338,7 +1443,7 @@ class ArionEngine:
             req = self._pending_request_for_step(task.id, step.index)
             if req is None:
                 raise GoalStateError(f"task {task_id} has no pending approval for step {step.index}")
-            self._resolve_request(req, outcome, actor)
+            self.resolve_approval_request(req.approval_id, outcome, actor)
             return self.storage.load_task(task_id)
         # No durable queue (legacy wiring): fall back to the in-memory mirror.
         recs = [r for r in task.approvals
@@ -1347,98 +1452,274 @@ class ArionEngine:
             raise GoalStateError(f"task {task_id} has no pending approval for step {step.index}")
         return self._resolve_legacy(task, recs[-1], outcome, actor)
 
+    def _approval_request_is_expired(
+        self, req: "ApprovalRequest", now: str | None = None,
+    ) -> bool:
+        ttl = self.approval_ttl_seconds
+        if ttl is None:
+            return False
+        from datetime import datetime, timedelta, timezone
+
+        now_value = now or utcnow()
+        try:
+            current = datetime.fromisoformat(now_value)
+            created = datetime.fromisoformat(req.created_at)
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=timezone.utc)
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return False
+        return created < current - timedelta(seconds=max(0.0, float(ttl)))
+
+    def _goal_is_terminal_for_approval(self, task: Task) -> bool:
+        if self.goal_manager is None or not task.goal_id:
+            return False
+        try:
+            goal = self.goal_manager.get_goal(task.goal_id)
+            return goal is not None and goal.status in (
+                GoalStatus.COMPLETED, GoalStatus.FAILED, GoalStatus.CANCELLED,
+            )
+        except Exception:
+            return True  # fail closed when terminal state cannot be verified
+
     def resolve_approval_request(self, approval_id: str, outcome: "ApprovalOutcome",
                                  actor: str = "approver") -> "ApprovalRequest":
-        """Resolve a durable approval-queue record by id (ADR-018).
-
-        APPROVED: the record is marked approved, the goal unblocks and the
-        next run resumes the EXACT pending step (no replan, no re-request).
-
-        DENIED: the record is durably denied; the step + task fail with
-        reason 'approval denied'.
-
-        Fail closed (ApprovalError): unknown id, already-resolved, or the
-        request's task/step no longer awaits this approval.
-        """
+        """Conditionally and atomically resolve one durable approval (ADR-038)."""
         if outcome not in (ApprovalOutcome.APPROVED, ApprovalOutcome.DENIED):
-            raise ValueError(f"resolve_approval_request accepts APPROVED or DENIED, got {outcome!r}")
+            raise ValueError(
+                f"resolve_approval_request accepts APPROVED or DENIED, got {outcome!r}"
+            )
         if self.approval_store is None:
             raise ApprovalError("approval queue is not available on this engine")
         req = self.approval_store.get_request(approval_id)
         if req is None:
             raise ApprovalError(f"unknown approval id: {approval_id}")
+        target = (
+            ApprovalStatus.APPROVED
+            if outcome == ApprovalOutcome.APPROVED else ApprovalStatus.DENIED
+        )
         if req.status != ApprovalStatus.PENDING:
-            raise ApprovalError(f"approval {approval_id} is already resolved ({req.status.value})")
+            if req.status == target:
+                self._reconcile_decided_request(req)
+                return self.approval_store.get_request(approval_id)
+            raise ApprovalError(
+                f"approval {approval_id} decision conflicts with committed "
+                f"state {req.status.value}"
+            )
+        if self._approval_request_is_expired(req):
+            self._apply_approval_status(
+                req, ApprovalStatus.EXPIRED, "system:expiry",
+                "approval expired; recovery requires new authorization",
+            )
+            raise ApprovalError(f"approval {approval_id} expired before decision")
+
         task = self.storage.load_task(req.task_id)
         if task is None:
-            raise ApprovalError(f"approval {approval_id} references a missing task {req.task_id}")
-        step = task.active_step
-        if task.status != TaskStatus.AWAITING_APPROVAL or step is None or step.index != req.step_index:
+            req.status = ApprovalStatus.DENIED
+            req.decision_actor = "system:missing_task"
+            req.decided_at = utcnow()
+            transition = getattr(self.approval_store, "transition_request", None)
+            if callable(transition):
+                transition(req, ApprovalStatus.PENDING)
             raise ApprovalError(
-                f"approval {approval_id} no longer matches the task's pending step "
-                f"(task={req.task_id} step={req.step_index})"
+                f"approval {approval_id} references a missing task {req.task_id}"
+            )
+        if self._goal_is_terminal_for_approval(task):
+            self._apply_approval_status(
+                req, ApprovalStatus.DENIED, "system:terminal_goal",
+                "approval rejected: terminal goal",
+            )
+            raise ApprovalError(
+                f"approval {approval_id} cannot revive a terminal goal"
+            )
+        step = task.active_step
+        if (task.status != TaskStatus.AWAITING_APPROVAL or step is None
+                or step.index != req.step_index):
+            req.status = ApprovalStatus.DENIED
+            req.decision_actor = "system:terminal_task"
+            req.decided_at = utcnow()
+            transition = getattr(self.approval_store, "transition_request", None)
+            if callable(transition):
+                transition(req, ApprovalStatus.PENDING)
+            raise ApprovalError(
+                f"approval {approval_id} no longer matches the task's pending "
+                f"step (task={req.task_id} step={req.step_index})"
             )
         self._resolve_request(req, outcome, actor)
         return self.approval_store.get_request(approval_id)
 
     def _resolve_request(self, req: "ApprovalRequest", outcome: "ApprovalOutcome",
                          actor: str) -> None:
-        """Resolve a durable queue record + the mirrored task state."""
+        target = (
+            ApprovalStatus.APPROVED
+            if outcome == ApprovalOutcome.APPROVED else ApprovalStatus.DENIED
+        )
+        reason = "approved" if target == ApprovalStatus.APPROVED else "approval denied"
+        self._apply_approval_status(req, target, actor, reason)
+
+    def _approval_mirror(self, task: Task, step: PlanStep,
+                         req: "ApprovalRequest", actor: str) -> dict:
+        mirror = [
+            record for record in (task.approvals or [])
+            if record.get("approval_id") == req.approval_id
+        ]
+        record = mirror[-1] if mirror else self._mirror_from_request(task, step, req)
+        record["outcome"] = req.status.value
+        record["resolved_by"] = actor
+        record["resolved_at"] = req.decided_at
+        return record
+
+    def _apply_approval_status(
+        self,
+        req: "ApprovalRequest",
+        target: ApprovalStatus,
+        actor: str,
+        reason: str,
+        decision_time: str | None = None,
+    ) -> bool:
+        """Commit request + task transition before events/blocker cleanup."""
         task = self.storage.load_task(req.task_id)
+        if task is None:
+            raise ApprovalError(
+                f"approval {req.approval_id} references missing task {req.task_id}"
+            )
         step = task.active_step
-        req.status = ApprovalStatus.APPROVED if outcome == ApprovalOutcome.APPROVED else ApprovalStatus.DENIED
+        if (task.status != TaskStatus.AWAITING_APPROVAL or step is None
+                or step.index != req.step_index):
+            raise ApprovalError(
+                f"approval {req.approval_id} task is not awaiting its step"
+            )
+        expected_task_updated_at = task.updated_at
+        req.status = target
         req.decision_actor = actor
-        req.decided_at = utcnow()
-        self.approval_store.update_request(req)
-
-        mirror = [r for r in (task.approvals or []) if r.get("approval_id") == req.approval_id]
-        rec = mirror[-1] if mirror else self._mirror_from_request(task, step, req)
-        rec["outcome"] = req.status.value
-        rec["resolved_by"] = actor
-        rec["resolved_at"] = req.decided_at
-
-        gm = self.goal_manager
-        if outcome == ApprovalOutcome.APPROVED:
-            task.status = TaskStatus.RUNNING  # resumable; not terminal
-            if gm is not None and task.goal_id:
-                try:
-                    gm.clear_blocker(task.goal_id, "approval_pending", reason="approval_granted")
-                except Exception:
-                    pass
-            self._emit("approval.granted", task_id=task.id, step_id=_step_id(step), detail={
-                "scope": req.scope, "resource": req.resource, "approval_id": req.approval_id,
-            })
-            self._emit("goal.approval.granted", task_id=task.id, detail={
-                "goal_id": task.goal_id, "task_id": task.id, "step_index": step.index,
-                "capability": req.capability, "action": req.action, "scope": req.scope,
-                "actor": actor, "approval_id": req.approval_id,
-            })
+        req.decided_at = decision_time or utcnow()
+        if target == ApprovalStatus.EXPIRED:
+            req.expired_at = req.decided_at
+        self._approval_mirror(task, step, req, actor)
+        if target == ApprovalStatus.APPROVED:
+            task.status = TaskStatus.RUNNING
         else:
             step.status = StepStatus.FAILED
-            step.error = "approval denied"
+            step.error = reason
             task.status = TaskStatus.FAILED
-            task.error = "approval denied"
+            task.error = reason
             task.completed_at = utcnow()
-            if gm is not None and task.goal_id:
-                try:
-                    gm.clear_blocker(task.goal_id, "approval_pending", reason="approval_denied")
-                except Exception:
-                    pass
-            self._emit("approval.denied", task_id=task.id, step_id=_step_id(step),
-                       success=False, detail={
+
+        commit = getattr(self.approval_store, "commit_approval_decision", None)
+        if not callable(commit):
+            raise ApprovalError(
+                "approval store lacks atomic decision support (fail closed)"
+            )
+        committed = commit(req, task, expected_task_updated_at)
+        if not committed:
+            actual = self.approval_store.get_request(req.approval_id)
+            if actual is not None and actual.status == target:
+                self._reconcile_decided_request(actual)
+                return False
+            state = actual.status.value if actual is not None else "missing"
+            raise ApprovalError(
+                f"approval {req.approval_id} decision conflicts with committed "
+                f"state {state}"
+            )
+
+        self._after_approval_commit(req, task, step, target, actor, reason)
+        return True
+
+    def _after_approval_commit(
+        self, req: "ApprovalRequest", task: Task, step: PlanStep,
+        target: ApprovalStatus, actor: str, reason: str,
+    ) -> None:
+        gm = self.goal_manager
+        if gm is not None and task.goal_id:
+            try:
+                gm.clear_blocker(
+                    task.goal_id, "approval_pending",
+                    reason=("approval_granted" if target == ApprovalStatus.APPROVED
+                            else "approval_denied"),
+                )
+            except Exception:
+                pass
+        if target == ApprovalStatus.APPROVED:
+            self._emit("approval.granted", task_id=task.id,
+                       step_id=_step_id(step), detail={
                            "scope": req.scope, "resource": req.resource,
-                           "reason": "approval denied", "approval_id": req.approval_id,
+                           "approval_id": req.approval_id,
                        })
+            self._emit("goal.approval.granted", task_id=task.id, detail={
+                "goal_id": task.goal_id, "task_id": task.id,
+                "step_index": step.index, "capability": req.capability,
+                "action": req.action, "scope": req.scope,
+                "actor": actor, "approval_id": req.approval_id,
+            })
+            return
+        kind = "approval.expired" if target == ApprovalStatus.EXPIRED else "approval.denied"
+        self._emit(kind, task_id=task.id, step_id=_step_id(step),
+                   success=False, detail={
+                       "scope": req.scope, "resource": req.resource,
+                       "reason": reason, "approval_id": req.approval_id,
+                   })
+        if target == ApprovalStatus.EXPIRED:
+            self._emit("goal.approval.expired", task_id=task.id, detail={
+                "goal_id": task.goal_id, "task_id": task.id,
+                "step_index": step.index, "approval_id": req.approval_id,
+            })
+        else:
             self._emit("goal.approval.denied", task_id=task.id, detail={
-                "goal_id": task.goal_id, "task_id": task.id, "step_index": step.index,
-                "actor": actor, "reason": "approval denied", "approval_id": req.approval_id,
+                "goal_id": task.goal_id, "task_id": task.id,
+                "step_index": step.index, "actor": actor,
+                "reason": reason, "approval_id": req.approval_id,
             })
-            self._emit("task.failed", task_id=task.id, detail={
-                "step_index": step.index, "error": "approval denied",
-            })
-            self._record_memory(task)
-        task.updated_at = utcnow()
-        self.storage.save_task(task)
+        self._emit("task.failed", task_id=task.id, detail={
+            "step_index": step.index, "error": reason,
+        })
+        self._record_memory(task)
+
+    def _reconcile_decided_request(self, req: "ApprovalRequest") -> None:
+        """Repair pre-ADR-038 split rows without changing human decision."""
+        task = self.storage.load_task(req.task_id)
+        if task is None:
+            return
+        step = task.active_step
+        if step is None:
+            return
+        expected = task.updated_at
+        statuses: tuple[str, ...]
+        if req.status == ApprovalStatus.APPROVED:
+            if task.status != TaskStatus.AWAITING_APPROVAL:
+                return  # never revive a failed/completed task
+            self._approval_mirror(task, step, req,
+                                  req.decision_actor or "reconciler")
+            task.status = TaskStatus.RUNNING
+            statuses = (TaskStatus.AWAITING_APPROVAL.value,)
+        elif req.status in (ApprovalStatus.DENIED, ApprovalStatus.EXPIRED):
+            if task.status not in (TaskStatus.AWAITING_APPROVAL, TaskStatus.RUNNING):
+                return
+            reason = ("approval expired; recovery requires new authorization"
+                      if req.status == ApprovalStatus.EXPIRED else "approval denied")
+            self._approval_mirror(task, step, req,
+                                  req.decision_actor or "reconciler")
+            step.status = StepStatus.FAILED
+            step.error = reason
+            task.status = TaskStatus.FAILED
+            task.error = reason
+            task.completed_at = utcnow()
+            statuses = (TaskStatus.AWAITING_APPROVAL.value,
+                        TaskStatus.RUNNING.value)
+        else:
+            return
+        reconcile = getattr(self.approval_store,
+                            "reconcile_approval_task", None)
+        if not callable(reconcile):
+            raise ApprovalError(
+                "approval store lacks reconciliation support (fail closed)"
+            )
+        reconcile(req, task, expected, statuses)
+        if self.goal_manager is not None and task.goal_id:
+            try:
+                self.goal_manager.recheck_blockers(task.goal_id)
+            except Exception:
+                pass
 
     def _resolve_legacy(self, task: Task, rec: dict, outcome: "ApprovalOutcome", actor: str) -> Task:
         """Legacy in-memory resolution when no durable queue is wired."""
@@ -1497,20 +1778,27 @@ class ArionEngine:
             return req
         return None
 
-    def _pending_queue_request(self, task_id: str, step_index: int, fingerprint: dict) -> "ApprovalRequest | None":
-        """Dedupe: an existing PENDING request for the same task/step/authz
-        fingerprint. Repeated pauses never create duplicate queue records."""
-        for req in self.approval_store.list_requests(status=ApprovalStatus.PENDING.value):
-            if req.task_id == task_id and req.step_index == step_index and req.fingerprint == fingerprint:
+    def _pending_queue_request(
+        self,
+        task_id: str,
+        step_index: int,
+        request: AuthorizationRequest,
+    ) -> "ApprovalRequest | None":
+        """Dedupe current and legacy durable authorization fingerprints."""
+        for req in self.approval_store.list_requests(
+                status=ApprovalStatus.PENDING.value):
+            if (req.task_id == task_id and req.step_index == step_index
+                    and self._fingerprint_matches(req.fingerprint, request)):
                 return req
         return None
 
     def _queue_request_from_auth(self, task: Task, step: PlanStep, request: AuthorizationRequest,
                                  decision: PolicyDecision) -> "ApprovalRequest":
         fp = self._authz_fingerprint(request)
+        presentation = present_resource(request.resource_kind, request.resource)
         summary = (
             f"{request.capability}/{request.action} "
-            f"{('on ' + str(request.resource)) if request.resource else ''} "
+            f"{('on ' + str(presentation.display)) if presentation.display else ''} "
             f"(scope={request.scope}, risk={request.risk})"
         ).strip()
         return ApprovalRequest(
@@ -1524,7 +1812,7 @@ class ArionEngine:
             risk=request.risk,
             side_effects=request.side_effects,
             resource_kind=request.resource_kind,
-            resource=request.resource,
+            resource=presentation.display,
             summary=summary[:300],
             requester_actor=request.actor.id,
             actor_chain=list(request.actor.chain),
@@ -1550,6 +1838,8 @@ class ArionEngine:
                 "side_effects": req.side_effects,
                 "resource_kind": req.resource_kind,
                 "resource": req.resource,
+                "resource_fingerprint": req.fingerprint.get("resource_fingerprint"),
+                "resource_redacted": bool(req.fingerprint.get("resource_redacted", False)),
                 "params_keys": req.params_keys,
             },
             "fingerprint": req.fingerprint,
@@ -1610,7 +1900,7 @@ class ArionEngine:
                 self._emit(
                     "plan.produced",
                     task_id=task.id,
-                    detail={"steps": [s.to_dict() for s in steps],
+                    detail={"steps": self._plan_steps_for_audit(steps),
                             "stored_plan": True,
                             "plan_version": latest["plan_version"]},
                 )
@@ -1656,6 +1946,37 @@ class ArionEngine:
         else:
             self._emit("task.planning", task_id=task_id)
 
+        # A durable terminal goal is stronger than an earlier human approval.
+        # Never let an approved-but-not-yet-run task revive cancelled/failed
+        # goal work (ADR-038).
+        if (task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+                and self._goal_is_terminal_for_approval(task)):
+            step = task.active_step
+            if (task.status == TaskStatus.AWAITING_APPROVAL
+                    and step is not None and self.approval_store is not None):
+                pending = self._pending_request_for_step(task.id, step.index)
+                if pending is not None:
+                    self._apply_approval_status(
+                        pending, ApprovalStatus.DENIED,
+                        "system:terminal_goal",
+                        "approval rejected: terminal goal",
+                    )
+                    return self.storage.load_task(task.id)
+            if step is not None and step.status in (
+                    StepStatus.PENDING, StepStatus.RUNNING):
+                step.status = StepStatus.FAILED
+                step.error = "approval cannot resume work for terminal goal"
+            task.status = TaskStatus.FAILED
+            task.error = "approval cannot resume work for terminal goal"
+            task.completed_at = utcnow()
+            self.storage.save_task(task)
+            self._cancel_waiters_for_task(task)
+            self._emit("task.failed", task_id=task.id, detail={
+                "step_index": step.index if step is not None else None,
+                "error": task.error,
+            })
+            return task
+
         # Already terminal (e.g. completed before a restart): return as-is.
         if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
             return task
@@ -1678,15 +1999,26 @@ class ArionEngine:
             try:
                 task.steps = topo_sort_steps(task.steps)
             except PlanValidationError as exc:
+                summary = summarize_error(
+                    exc,
+                    source=classify_error_source(exc),
+                    category=getattr(exc, "category", "plan_validation"),
+                )
                 task.status = TaskStatus.FAILED
-                task.error = f"planning failed: {exc}"
+                task.error = sanitize_error_text(
+                    f"planning failed: {summary.message}",
+                    max_length=500,
+                )
                 task.completed_at = utcnow()
                 self.storage.save_task(task)
-                self._emit("error", task_id=task.id, success=False, detail={
-                    "error": task.error,
-                    "error_type": type(exc).__name__,
-                    "category": getattr(exc, "category", "unknown"),
-                })
+                detail = summary.to_event_detail()
+                detail["error"] = task.error
+                self._emit(
+                    "error",
+                    task_id=task.id,
+                    success=False,
+                    detail=detail,
+                )
                 self._emit("task.failed", task_id=task.id, detail={"error": task.error})
                 self._record_memory(task)
                 return task
@@ -2334,22 +2666,61 @@ class ArionEngine:
 
     # ---------- pipeline ----------
 
+    def _plan_steps_for_audit(self, steps: list[PlanStep]) -> list[dict[str, Any]]:
+        """Non-executable plan metadata with safe resource presentation."""
+        out: list[dict[str, Any]] = []
+        for step in steps:
+            detail: dict[str, Any] = {
+                "index": step.index,
+                "intent": step.intent[:300],
+                "capability": step.capability,
+                "action": step.action,
+                "scope": step.scope,
+                "status": step.status.value,
+                "param_keys": sorted(step.params),
+                "verification": {
+                    "policy": step.verification.policy,
+                    "args": step.verification.args,
+                },
+                "depends_on": list(step.depends_on),
+            }
+            spec = self.registry.action_spec(step.capability, step.action)
+            if spec is not None and spec.resource_kind and spec.resource_param:
+                exact = step.params.get(spec.resource_param)
+                if isinstance(exact, str):
+                    presentation = present_resource(spec.resource_kind, exact)
+                    detail["resource_kind"] = spec.resource_kind
+                    detail.update(presentation.metadata())
+            out.append(detail)
+        return out
+
     def _plan(self, task: Task, replan_reason: str | None = None) -> Task:
         self._emit("task.planning", task_id=task.id)
         task.status = TaskStatus.PLANNING
         context = self._build_planning_context(task)
         try:
             steps = self.planner.plan(task.description, task.id, self.registry, context=context)
-        except Exception as exc:  # planner/validator/provider failure: degrade gracefully
+        except Exception as exc:  # planner/model text crosses a trust boundary
+            summary = summarize_error(
+                exc,
+                source=classify_error_source(exc),
+                category=getattr(exc, "category", "unknown"),
+            )
             task.status = TaskStatus.FAILED
-            task.error = f"planning failed: {exc}"
+            task.error = sanitize_error_text(
+                f"planning failed: {summary.message}",
+                max_length=500,
+            )
             task.completed_at = utcnow()
             self.storage.save_task(task)
-            self._emit("error", task_id=task.id, success=False, detail={
-                "error": task.error,
-                "error_type": type(exc).__name__,
-                "category": getattr(exc, "category", "unknown"),
-            })
+            detail = summary.to_event_detail()
+            detail["error"] = task.error
+            self._emit(
+                "error",
+                task_id=task.id,
+                success=False,
+                detail=detail,
+            )
             self._emit("task.failed", task_id=task.id, detail={"error": task.error})
             return task
         if not steps:
@@ -2381,7 +2752,7 @@ class ArionEngine:
         self._emit(
             "plan.produced",
             task_id=task.id,
-            detail={"steps": [s.to_dict() for s in steps]},
+            detail={"steps": self._plan_steps_for_audit(steps)},
         )
 
         # Long-horizon goal management (ADR-016): record an IMMUTABLE plan
@@ -2469,7 +2840,7 @@ class ArionEngine:
             return False
         try:
             request = self._build_authz_request(task, step, spec)
-            return self._authz_fingerprint(request) == rec.get("fingerprint")
+            return self._fingerprint_matches(rec.get("fingerprint"), request)
         except Exception:
             return False
 
@@ -2565,24 +2936,28 @@ class ArionEngine:
             "permission.checked",
             task_id=task.id,
             step_id=_step_id(step),
-            detail={
-                **decision.to_dict(),
-                "params": request.params,
-                "step_declared_scope": step.scope,
-                "actor": request.actor.id,
-                "actor_chain": list(request.actor.chain),
-            },
+            detail=AuthorizationEventDetails.from_mapping(
+                decision.to_dict(),
+                actor=request.actor.id,
+                actor_chain=request.actor.chain,
+                param_keys=tuple(request.params),
+                step_declared_scope=step.scope,
+            ),
         )
 
         if decision.outcome == PolicyOutcome.DENY:
             step.status = StepStatus.FAILED
-            step.error = decision.reason
+            step.error = present_resource_reason(
+                decision.reason, request.resource_kind, request.resource
+            )
             self._emit(
                 "permission.denied",
                 task_id=task.id,
                 step_id=_step_id(step),
                 success=False,
-                detail=decision.to_dict(),
+                detail=AuthorizationEventDetails.from_mapping(
+                    decision.to_dict()
+                ),
             )
             return
 
@@ -2617,15 +2992,18 @@ class ArionEngine:
         """
         record = self._approved_record_for(task, step.index)
         if record is not None:
-            if self._authz_fingerprint(request) == record.get("fingerprint"):
+            if self._fingerprint_matches(record.get("fingerprint"), request):
                 # the exact approved request is still valid against LIVE
                 # metadata: resume without re-requesting
+                presentation = present_resource(
+                    request.resource_kind, request.resource
+                )
                 self._emit("task.approval.resumed", task_id=task.id, step_id=_step_id(step), detail={
                     "approval_record": record.get("record_id"),
                     "approval_id": record.get("approval_id"),
                     "resolved_by": record.get("resolved_by"),
                     "scope": request.scope,
-                    "resource": request.resource,
+                    **presentation.metadata(),
                 })
                 if self.goal_manager is not None and task.goal_id:
                     try:
@@ -2635,9 +3013,8 @@ class ArionEngine:
                 return True
             # stale approval (metadata changed): fall through to a fresh request
 
-        fp = self._authz_fingerprint(request)
         if self.approval_store is not None:
-            existing = self._pending_queue_request(task.id, step.index, fp)
+            existing = self._pending_queue_request(task.id, step.index, request)
             if existing is not None:
                 # we are already durably waiting on this exact request:
                 # idempotent - no new record, no re-request, no re-queue
@@ -2645,11 +3022,24 @@ class ArionEngine:
                 step.status = StepStatus.PENDING
                 return False
 
-        self._emit("approval.requested", task_id=task.id, step_id=_step_id(step), detail=decision.to_dict())
+        decision_detail = AuthorizationEventDetails.from_mapping(
+            decision.to_dict()
+        )
+        self._emit(
+            "approval.requested",
+            task_id=task.id,
+            step_id=_step_id(step),
+            detail=decision_detail,
+        )
         outcome = self.approval_handler.request(request, decision)
         if outcome == ApprovalOutcome.APPROVED:
             self._append_approval_record(task, step, request, decision, "approved", actor="system")
-            self._emit("approval.granted", task_id=task.id, step_id=_step_id(step), detail=decision.to_dict())
+            self._emit(
+                "approval.granted",
+                task_id=task.id,
+                step_id=_step_id(step),
+                detail=decision_detail,
+            )
             return True
         if outcome == ApprovalOutcome.DENIED:
             step.status = StepStatus.FAILED
@@ -2660,7 +3050,7 @@ class ArionEngine:
                 task_id=task.id,
                 step_id=_step_id(step),
                 success=False,
-                detail=decision.to_dict(),
+                detail=decision_detail,
             )
             return False
         # PENDING: queue exactly one durable request, pause the task durably;
@@ -2669,19 +3059,40 @@ class ArionEngine:
         step.status = StepStatus.PENDING
         req = self._queue_request_from_auth(task, step, request, decision)
         if self.approval_store is not None:
+            candidate_id = req.approval_id
             try:
-                self.approval_store.create_request(req)
-            except Exception:
-                pass
-            self._emit("approval.queued", task_id=task.id, step_id=_step_id(step), detail={
-                "approval_id": req.approval_id,
-                "task_id": task.id,
-                "step_index": step.index,
-                "capability": req.capability,
-                "action": req.action,
-                "scope": req.scope,
-                "resource": req.resource,
-            })
+                req = self.approval_store.create_request(req) or req
+            except Exception as exc:
+                # No durable human decision can exist: fail closed instead of
+                # creating an unresolvable AWAITING task (ADR-038).
+                task.status = TaskStatus.FAILED
+                step.status = StepStatus.FAILED
+                step.error = "approval persistence failed; execution denied"
+                task.error = step.error
+                task.completed_at = utcnow()
+                try:
+                    self._emit(
+                        "error", task_id=task.id, step_id=_step_id(step),
+                        success=False,
+                        detail={"error": step.error,
+                                "error_type": type(exc).__name__,
+                                "category": "approval_persistence"},
+                    )
+                except Exception:
+                    pass
+                return False
+            if req.approval_id == candidate_id:
+                self._emit("approval.queued", task_id=task.id, step_id=_step_id(step), detail={
+                    "approval_id": req.approval_id,
+                    "task_id": task.id,
+                    "step_index": step.index,
+                    "capability": req.capability,
+                    "action": req.action,
+                    "scope": req.scope,
+                    "resource": req.resource,
+                    "resource_fingerprint": req.fingerprint.get("resource_fingerprint"),
+                    "resource_redacted": bool(req.fingerprint.get("resource_redacted", False)),
+                })
         self._mirror_from_request(task, step, req)
         if self.goal_manager is not None and task.goal_id:
             try:
@@ -2692,9 +3103,14 @@ class ArionEngine:
                     "capability": request.capability,
                     "action": request.action,
                     "scope": request.scope,
-                    "resource": request.resource,
+                    "resource": req.resource,
+                    "resource_fingerprint": req.fingerprint.get("resource_fingerprint"),
+                    "resource_redacted": bool(req.fingerprint.get("resource_redacted", False)),
                     "approval_id": req.approval_id,
-                    "reason": decision.reason[:200],
+                    "reason": present_resource_reason(
+                        decision.reason, request.resource_kind, request.resource,
+                        max_chars=200,
+                    ),
                 }, reason="approval_pending")
             except Exception:
                 pass
@@ -2706,7 +3122,9 @@ class ArionEngine:
                     "capability": request.capability,
                     "action": request.action,
                     "scope": request.scope,
-                    "resource": request.resource,
+                    "resource": req.resource,
+                    "resource_fingerprint": req.fingerprint.get("resource_fingerprint"),
+                    "resource_redacted": bool(req.fingerprint.get("resource_redacted", False)),
                     "approval_id": req.approval_id,
                 })
             except Exception:
@@ -2721,13 +3139,17 @@ class ArionEngine:
         task snapshot / checkpoints). Never stores params values or secrets.
         Used for immediate handler decisions (approved/denied); PENDING uses
         the durable queue path (_mirror_from_request)."""
+        presentation = present_resource(request.resource_kind, request.resource)
         task.approvals = list(task.approvals or []) + [{
             "record_id": new_id("apr"),
             "step_index": step.index,
             "outcome": outcome,
             "actor": actor,
             "created_at": utcnow(),
-            "reason": decision.reason[:200],
+            "reason": present_resource_reason(
+                decision.reason, request.resource_kind, request.resource,
+                max_chars=200,
+            ),
             "request": {
                 "capability": request.capability,
                 "action": request.action,
@@ -2735,30 +3157,27 @@ class ArionEngine:
                 "risk": request.risk,
                 "side_effects": request.side_effects,
                 "resource_kind": request.resource_kind,
-                "resource": request.resource,
+                **presentation.metadata(),
                 "params_keys": sorted(request.params.keys()),
             },
             "fingerprint": self._authz_fingerprint(request),
         }]
 
     def _approved_record_for(self, task: Task, step_index: int) -> dict | None:
-        """The most recent APPROVED record for a step, if any."""
-        for r in reversed(list(task.approvals or [])):
-            if r.get("step_index") == step_index and r.get("outcome") == "approved":
-                return r
+        """Approved mirror, cross-checked with its durable queue decision."""
+        for record in reversed(list(task.approvals or [])):
+            if (record.get("step_index") != step_index
+                    or record.get("outcome") != "approved"):
+                continue
+            approval_id = record.get("approval_id")
+            if approval_id and self.approval_store is not None:
+                durable = self.approval_store.get_request(approval_id)
+                if durable is None or durable.status != ApprovalStatus.APPROVED:
+                    continue
+            return record
         return None
 
-    def _authz_fingerprint(self, request: AuthorizationRequest) -> dict[str, Any]:
-        """Canonical authorization fingerprint (ADR-017/018).
-
-        Everything an approval covers: capability, action, the resolved
-        required scope, risk, side effects, resource kind, resource, and the
-        SECURITY-RELEVANT parameters declared by the live ActionSpec
-        (ActionSpec.security_relevant_params). The resource parameter is
-        always covered via `resource`. Operational parameters (limits,
-        formatting, verification args) are NOT fingerprinted unless declared.
-        Any change forces fresh authorization.
-        """
+    def _authz_fingerprint_base(self, request: AuthorizationRequest) -> dict[str, Any]:
         fp: dict[str, Any] = {
             "capability": request.capability,
             "action": request.action,
@@ -2766,7 +3185,6 @@ class ArionEngine:
             "risk": request.risk,
             "side_effects": request.side_effects,
             "resource_kind": request.resource_kind,
-            "resource": request.resource,
         }
         srp: list[str] = []
         try:
@@ -2775,8 +3193,38 @@ class ArionEngine:
                 srp = list(getattr(spec, "security_relevant_params", []) or [])
         except Exception:
             srp = []
-        fp["security_relevant_params"] = {k: request.params.get(k) for k in srp if k in request.params}
+        fp["security_relevant_params"] = {
+            key: request.params.get(key) for key in srp if key in request.params
+        }
         return fp
+
+    def _authz_fingerprint(self, request: AuthorizationRequest) -> dict[str, Any]:
+        """Canonical approval fingerprint without persisting exact resource.
+
+        Exact-change detection uses the stable resource hash. Operational
+        parameters remain excluded unless the ActionSpec marks them security
+        relevant. See ADR-037.
+        """
+        fp = self._authz_fingerprint_base(request)
+        presentation = present_resource(request.resource_kind, request.resource)
+        fp.update(presentation.metadata())
+        return fp
+
+    def _legacy_authz_fingerprint(self, request: AuthorizationRequest) -> dict[str, Any]:
+        """Pre-ADR-037 exact-resource shape, accepted for durable compatibility."""
+        fp = self._authz_fingerprint_base(request)
+        fp["resource"] = request.resource
+        return fp
+
+    def _fingerprint_matches(
+        self,
+        stored: dict[str, Any] | None,
+        request: AuthorizationRequest,
+    ) -> bool:
+        return stored in (
+            self._authz_fingerprint(request),
+            self._legacy_authz_fingerprint(request),
+        )
 
     @staticmethod
     def _extract_resource(spec, params: dict[str, Any]) -> str | None:
@@ -2811,15 +3259,18 @@ class ArionEngine:
             try:
                 lock, waited = self._acquire_mutation_lock(task, step, spec)
             except MutationLockTimeoutError as exc:
-                # durable typed timeout (blocker set inside); task fails via
-                # the normal FAILED path in run_task
-                step.error = str(exc)
+                # Durable task state must stay bounded even when a resource
+                # identifier inside the mixed-trust error is caller-controlled.
+                step.error = sanitize_error_text(exc, max_length=500)
                 return  # capability NEVER executes; no recovery record
             except MutationLockError as exc:
                 # waiting disabled: immediate, durable contention failure
                 # (ADR-021 semantics preserved)
                 step.status = StepStatus.FAILED
-                step.error = f"mutation lock contention: {exc}"
+                step.error = sanitize_error_text(
+                    f"mutation lock contention: {exc}",
+                    max_length=500,
+                )
                 self._emit("mutation.lock.contended", task_id=task.id,
                            step_id=_step_id(step), success=False, detail={
                                "error": step.error[:200],
@@ -2836,15 +3287,22 @@ class ArionEngine:
                 if not self._revalidate_before_mutation(task, step, spec, waited=waited):
                     self._release_mutation_lock(lock, task, step)
                     return
+        heartbeat = self._start_lock_heartbeat(lock)
         try:
-            self._execute_attempts(task, step, capability, spec, mutating,
-                                   verify_failed, exec_error)
+            self._execute_attempts(
+                task, step, capability, spec, mutating,
+                verify_failed, exec_error, lock=lock,
+            )
         finally:
+            self._stop_lock_heartbeat(heartbeat)
             if lock is not None:
                 self._release_mutation_lock(lock, task, step)
 
     def _execute_attempts(self, task: Task, step: PlanStep, capability, spec,
-                          mutating: bool, verify_failed: bool, exec_error: str | None) -> None:
+                          mutating: bool, verify_failed: bool,
+                          exec_error: str | None, lock: Any = None) -> None:
+        from arion.state.locks import MutationLockError
+
         while step.attempts < step.max_attempts:
             step.attempts += 1
             step.status = StepStatus.RUNNING
@@ -2856,9 +3314,43 @@ class ArionEngine:
                     "attempt": step.attempts,
                 })
             try:
-                observation = capability.execute(step.action, dict(step.params))
+                raw_observation = capability.execute(
+                    step.action, dict(step.params)
+                )
+                # ADR-035: verification and persistence receive one detached,
+                # JSON-compatible, finite snapshot. For a non-retry-safe
+                # mutation, a contract failure is handled by the existing
+                # recovery fence because the side effect may already exist.
+                observation = normalize_observation(raw_observation)
+                if lock is not None:
+                    self._renew_mutation_lock(lock)
+            except MutationLockError as exc:
+                # The side effect may already have happened, but ownership is
+                # no longer valid. Never retry without reacquiring; fence it as
+                # explicit recovery even when action metadata said retry-safe.
+                step.status = StepStatus.FAILED
+                step.result = None
+                step.error = sanitize_error_text(
+                    f"mutation lock ownership lost after execution: {exc}",
+                    max_length=500,
+                )
+                self._emit(
+                    "mutation.failed", task_id=task.id,
+                    step_id=_step_id(step), success=False,
+                    detail={"error": step.error, "attempt": step.attempts},
+                )
+                self._emit(
+                    "mutation.requires_recovery", task_id=task.id,
+                    step_id=_step_id(step), success=False,
+                    detail={"error": step.error, "attempt": step.attempts},
+                )
+                self._record_recovery_required(task, step, spec, step.error)
+                return
             except CapabilityError as exc:
-                exec_error = str(exc)
+                # Capability messages combine system templates with resource,
+                # OS, or transport text. Keep useful diagnostics, but redact
+                # credential conventions and bound them before any durable use.
+                exec_error = sanitize_error_text(exc, max_length=500)
                 step.result = None
                 if mutating:
                     self._emit("mutation.failed", task_id=task.id, step_id=_step_id(step),
@@ -2874,9 +3366,12 @@ class ArionEngine:
                     detail={"attempt": step.attempts, "error": exec_error},
                 )
                 continue
-            except Exception as exc:  # unexpected capability bug - fail loudly
+            except Exception as exc:  # unexpected capability/extension failure
                 step.status = StepStatus.FAILED
-                step.error = f"capability raised unexpected error: {exc!r}"
+                step.error = sanitize_error_text(
+                    f"capability raised unexpected error: {exc!r}",
+                    max_length=500,
+                )
                 if mutating:
                     self._emit("mutation.failed", task_id=task.id, step_id=_step_id(step),
                                success=False, detail={"error": step.error, "attempt": step.attempts})
@@ -3027,6 +3522,15 @@ class ArionEngine:
             reason=reason,
         )
         self.storage.save_checkpoint(ckpt)
+        # ADR-036: the newest full checkpoint is already durable. Historical
+        # pruning is best effort; failure safely leaves extra snapshots and
+        # must never fail completed work or weaken recovery.
+        prune = getattr(self.storage, "prune_checkpoints", None)
+        if callable(prune):
+            try:
+                prune(task.id, keep_last=DEFAULT_CHECKPOINT_RETENTION)
+            except Exception:
+                pass
         self._emit(
             "checkpoint.persisted",
             task_id=task.id,
@@ -3251,11 +3755,18 @@ class ArionEngine:
                 if self.reflector is not None:
                     reflection = self.reflector.reflect(episode)
             except Exception as exc:
+                summary = summarize_error(
+                    exc,
+                    source=ErrorSource.EXTERNAL,
+                    category="reflection_validation",
+                )
+                detail = summary.to_event_detail()
+                detail["fallback"] = "deterministic"
                 self._emit(
                     "reflection.validation.failed",
                     task_id=task.id,
                     success=False,
-                    detail={"error": str(exc)[:300], "fallback": "deterministic"},
+                    detail=detail,
                 )
             if reflection is None:
                 reflection = DeterministicReflector().reflect(episode)
@@ -3439,9 +3950,15 @@ class ArionEngine:
         task_id: str | None,
         step_id: str | None = None,
         success: bool = True,
-        detail: dict[str, Any] | None = None,
+        detail: dict[str, Any] | EventDetails | None = None,
     ) -> None:
-        self.events.emit(AuditEvent(kind=kind, task_id=task_id, step_id=step_id, success=success, detail=detail or {}))
+        self.events.emit(AuditEvent(
+            kind=kind,
+            task_id=task_id,
+            step_id=step_id,
+            success=success,
+            detail=detail if detail is not None else {},
+        ))
 
 
 def _step_id(step: PlanStep) -> str:

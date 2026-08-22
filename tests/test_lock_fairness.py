@@ -341,12 +341,13 @@ def test_approval_cannot_transfer_or_clear_queue_ownership(tmp_path):
     with pytest.raises(RuntimeError, match="simulated crash"):
         engine.run_goal(gid)
     waiter_id = gm.task_history(gid)[-1].lock_wait["waiter_id"]
-    # approval resolution cannot touch the queue: re-resolving the already
-    # granted request fails closed, and the waiter row is untouched
+    # approval resolution cannot touch the queue: repeating the committed
+    # decision is idempotent, and the waiter row is untouched
     req = engine.approval_store.list_requests()[-1]
-    with pytest.raises(Exception, match="already resolved"):
-        engine.resolve_approval_request(req.approval_id, ApprovalOutcome.APPROVED,
-                                        actor="user:alice")
+    resolved = engine.resolve_approval_request(
+        req.approval_id, ApprovalOutcome.APPROVED, actor="user:alice"
+    )
+    assert resolved.status.value == "approved"
     waiter = engine.mutation_lock_store.get_waiter(waiter_id)
     assert waiter.status == LockWaiterStatus.QUEUED and waiter.seq == 1
     # denying a NEW request also cannot touch the queue

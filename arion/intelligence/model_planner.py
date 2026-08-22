@@ -22,6 +22,11 @@ from arion.intelligence.errors import PlanValidationError, PlanningError
 from arion.intelligence.plan_schema import PlanSchema
 from arion.intelligence.plan_validator import PlanValidator
 from arion.intelligence.router import ModelRouter
+from arion.observability.error_boundary import (
+    ErrorSource,
+    classify_error_source,
+    summarize_error,
+)
 from arion.observability.events import AuditEvent
 from arion.state.models import PlanStep
 
@@ -56,23 +61,34 @@ class RealModelPlanner:
             schema: PlanSchema = self.router.plan_structured(goal_description, catalog, router_context)
             steps = PlanValidator(registry).validate(schema)
         except PlanningError as exc:
-            # Typed planning failure: propagate the category so audit/recovery
-            # know WHY planning failed (provider, schema, capability, ...).
+            # Provider bodies are external; Arion-generated validation
+            # templates are mixed-trust and remain useful after redaction and
+            # bounding. Preserve category/class in either case.
+            summary = summarize_error(
+                exc,
+                source=classify_error_source(exc),
+                category=exc.category,
+            )
             self._emit(
                 "plan.validation.failed",
                 task_id=task_id,
                 success=False,
-                detail={"error": str(exc), "error_type": type(exc).__name__, "category": exc.category},
+                detail=summary.to_event_detail(),
             )
             raise
-        except Exception as exc:  # unexpected planner bug: keep the task failing gracefully
+        except Exception as exc:  # unknown router/validator text is untrusted here
+            summary = summarize_error(
+                exc,
+                source=ErrorSource.EXTERNAL,
+                category="unknown",
+            )
             self._emit(
                 "plan.validation.failed",
                 task_id=task_id,
                 success=False,
-                detail={"error": str(exc), "error_type": type(exc).__name__, "category": "unknown"},
+                detail=summary.to_event_detail(),
             )
-            raise PlanValidationError(str(exc)) from exc
+            raise PlanValidationError(summary.message) from exc
         self._emit("plan.validation.passed", task_id=task_id, detail={"steps": len(steps)})
 
         # Memory-driven guidance applied AFTER validation (registry-aware,

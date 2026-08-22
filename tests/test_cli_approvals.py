@@ -182,7 +182,7 @@ def test_cli_approvals_deny(tmp_path, capsys, monkeypatch):
     # invalid transition: approve after deny fails closed with clean message
     rc, out = _run(["approvals", "approve", approval_id, "--db", db], capsys)
     assert rc == 1
-    assert "already" in out.lower()
+    assert "conflicts" in out.lower()
 
     # unknown id
     rc, out = _run(["approvals", "approve", "approval_does_not_exist", "--db", db], capsys)

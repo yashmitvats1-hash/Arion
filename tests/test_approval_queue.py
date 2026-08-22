@@ -246,7 +246,7 @@ def test_unknown_approval_id_typed_error(tmp_path, sandbox):
         engine.resolve_approval_request("approval_nope", ApprovalOutcome.APPROVED)
 
 
-def test_already_resolved_typed_error(tmp_path, sandbox):
+def test_resolved_same_outcome_is_idempotent_opposite_conflicts(tmp_path, sandbox):
     db = tmp_path / "ar.db"
     engine, gm, storage, _ = _engine(db, sandbox)
     goal = engine.submit_goal("review this repository")
@@ -254,9 +254,11 @@ def test_already_resolved_typed_error(tmp_path, sandbox):
     engine.run_goal(gid)
     req = engine.approval_store.list_requests()[0]
     engine.resolve_approval_request(req.approval_id, ApprovalOutcome.APPROVED)
-    with pytest.raises(ApprovalError, match="already"):
-        engine.resolve_approval_request(req.approval_id, ApprovalOutcome.APPROVED)
-    with pytest.raises(ApprovalError, match="already"):
+    repeated = engine.resolve_approval_request(
+        req.approval_id, ApprovalOutcome.APPROVED
+    )
+    assert repeated.status == ApprovalStatus.APPROVED
+    with pytest.raises(ApprovalError, match="conflicts"):
         engine.resolve_approval_request(req.approval_id, ApprovalOutcome.DENIED)
     engine.storage.close()
 
@@ -295,7 +297,7 @@ def test_denied_approval_remains_durably_denied(tmp_path, sandbox):
     assert req_b.status == ApprovalStatus.DENIED
     task = gm_b.task_history(gid)[-1]
     assert task.status == TaskStatus.FAILED and task.error == "approval denied"
-    with pytest.raises(ApprovalError, match="already"):
+    with pytest.raises(ApprovalError, match="conflicts"):
         engine_b.resolve_approval_request(req.approval_id, ApprovalOutcome.APPROVED)
     engine_b.storage.close()
 

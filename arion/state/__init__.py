@@ -11,10 +11,17 @@ from arion.state.models import (
     new_id,
     utcnow,
 )
-from arion.state.store import SQLiteStorage, Storage
+from arion.state.store import (
+    DEFAULT_CHECKPOINT_RETENTION,
+    CheckpointRetentionStore,
+    SQLiteStorage,
+    Storage,
+)
 
 __all__ = [
     "Checkpoint",
+    "CheckpointRetentionStore",
+    "DEFAULT_CHECKPOINT_RETENTION",
     "Goal",
     "PlanStep",
     "SQLiteStorage",

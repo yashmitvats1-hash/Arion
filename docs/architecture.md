@@ -1061,6 +1061,196 @@ Goal → ModelRouter → Structured Plan → Schema Validation
   `plan.validation.passed/failed` — provider/model/latency/token metadata
   only; raw prompts/responses are never persisted.
 
+## Event contracts and sink policy (ADR-033)
+
+`AuditEvent` remains the single audit envelope and existing detail dictionaries
+remain compatible, but the event boundary is now explicit:
+
+- `EventDetails.to_event_detail()` is the gradual typed-payload adapter;
+  `AuditEvent` normalizes typed or mapping details to a copied,
+  JSON-serializable `dict[str, Any]` before any sink sees them.
+- `AuthorizationEventDetails` version 1 formalizes policy decision fields and
+  bounded permission-check context. New permission events persist parameter
+  names (`param_keys`), never arbitrary parameter values; old rows containing
+  legacy `params` dictionaries remain readable.
+- General SQLite and JSONL representations are unchanged JSON objects. No
+  event-table migration or typed class marker is persisted.
+- `EventLogger` distinguishes required sinks from best-effort mirrors. SQLite
+  is required and remains fail-closed; optional JSONL failures are isolated,
+  recorded as bounded `SinkFailure` diagnostics, and cannot break an already
+  durably audited engine operation.
+- Delivery remains synchronous. Distributed transports, async queues, retries,
+  tracing propagation, and a repository-wide payload migration are explicitly
+  deferred.
+
+The producer/consumer map and compatibility strategy are recorded in
+[`ADR-033`](adr/ADR-033-event-contract-consolidation.md).
+
+## Sensitive error boundary (ADR-034)
+
+Error strings crossing from providers, models, capabilities, or extension
+sinks are handled according to an explicit trust policy:
+
+- provider HTTP bodies and transport exception text are never retained in
+  exceptions or observability; typed category, exception class, and HTTP status
+  provide the durable diagnosis;
+- Arion-generated plan-validation templates remain useful, but are redacted,
+  normalized to one line, and bounded before task/event persistence;
+- capability failures keep bounded operational text while conservative bearer,
+  API-key, token, secret, and password conventions are redacted before the
+  value reaches step/task state, scheduler terminal metadata, audit, or memory;
+- failure events add `error_source` (`trusted`, `mixed`, or `external`) while
+  preserving existing `error`, `error_type`, and `category` fields;
+- best-effort `SinkFailure` diagnostics use the same bounded redaction policy.
+
+Existing SQLite/JSONL rows remain readable and no storage migration is needed.
+Authorization resource identifiers and HTTP capability result/header/body
+retention are separate from error policy; ADR-034 deferred them to a dedicated
+follow-up. See [`ADR-034`](adr/ADR-034-sensitive-error-boundary.md).
+
+## Capability observation retention (ADR-035)
+
+Successful capability output has a separate boundary from errors and durable
+knowledge:
+
+- `normalize_observation()` snapshots every newly executed result to a
+  canonical JSON object, validates nested string keys/serialization, and
+  enforces a finite durable encoded-size budget before verification and
+  `PlanStep.result` assignment;
+- `ObservationContractError` is a `CapabilityError`, so an invalid result after
+  a non-retry-safe mutation follows the existing recovery fence rather than
+  being silently retried;
+- `http.get` persists only a bounded allowlist of content/cache response
+  headers. Authorization, proxy authorization, cookies, authentication
+  challenges, and extension headers are excluded from task/checkpoint state;
+- authorized HTTP/file bodies remain usable under their existing 1 MB source
+  caps, and legacy result dictionaries remain readable;
+- audit and scheduler telemetry retain result metadata only; episodic memory,
+  reflection, guidance, and cognition continue to exclude raw successful
+  results unless a future explicit promotion design is approved.
+
+Full task checkpoints still copy retained observations. Delta/blob
+checkpointing, streaming, per-action budgets, secret-reference resolution, and
+automatic knowledge extraction are deferred in
+[`ADR-035`](adr/ADR-035-capability-observation-retention.md).
+
+## Resource presentation boundary (ADR-037)
+
+Exact resource identifiers and non-executable presentation are distinct:
+
+- task/checkpoint params, stored executable plans, live policy/capability input,
+  mutation lock keys, and recovery authority retain the exact identifier;
+- `ResourcePresentation` provides a bounded display value, SHA-256 correlation
+  fingerprint, and redaction marker for audit, approvals, HTTP result metadata,
+  memory, cognition, and display;
+- URL presentation removes userinfo, all query content, and fragments while
+  retaining normalized origin/path plus omission markers;
+- filesystem/Git path display remains useful and exact unless it requires
+  one-line/length bounding;
+- new approval fingerprints use exact-resource hashes, while legacy exact-value
+  fingerprints remain accepted for restart compatibility;
+- redacted memory resources become informational guidance only and can never be
+  substituted into an executable plan.
+
+Historical records remain readable and exact execution state is unchanged.
+Vaults, credential handles, encrypted params, historical rewrites, generic DLP,
+and removal of exact lock/recovery authority identifiers remain deferred in
+[`ADR-037`](adr/ADR-037-resource-presentation-boundary.md).
+
+## Atomic durable approval decisions (ADR-038)
+
+Human decisions and executable task state now transition as one durable unit:
+
+- matching pending requests are created/adopted transactionally, preventing
+  concurrent duplicate rows;
+- SQLite conditionally commits `PENDING -> APPROVED|DENIED|EXPIRED` together
+  with `AWAITING_APPROVAL -> RUNNING|FAILED`, guarded by task status and
+  `updated_at` CAS;
+- concurrent conflicting decisions have one winner; same-outcome retries are
+  idempotent and opposite outcomes fail closed;
+- an approved task mirror is cross-checked against its durable request before
+  execution;
+- legacy decided-request/awaiting-task crash states reconcile without changing
+  the human decision, while denied/expired rows can never authorize execution;
+- configured TTL is enforced when deciding, not only by explicit expiry sweeps;
+- terminal/cancelled goals cannot be revived through pending or previously
+  approved work;
+- approval persistence failure fails the task closed instead of creating an
+  awaiting task with no resolvable request.
+
+The commit occurs before events and goal-blocker cleanup, so a post-commit crash
+may omit observability but cannot split approval authority from task state. See
+[`ADR-038`](adr/ADR-038-atomic-approval-decisions.md).
+
+## Mutation lock lease ownership (ADR-039)
+
+Mutation coordination now keeps live ownership valid across blocking capability
+execution and closes the waiter row-before-checkpoint crash window:
+
+- SQLite `renew(lock_id, owner_id, lease, now)` extends only an unexpired row
+  owned by the exact token; missing, foreign, and stale owners fail closed;
+- the engine heartbeats a held mutation lock during capability execution and
+  performs a synchronous final renewal before accepting verification/success;
+- ownership loss after a possible side effect is never retried under a missing
+  lock and creates durable mutation recovery required;
+- waiter creation transactionally adopts an existing queued row for the same
+  canonical resource/task/step, preserving FIFO sequence and deadline across
+  restart even if the process died before `task.lock_wait` was checkpointed;
+- cancellation/terminal goal state observed during a wait cancels the waiter
+  and performs no mutation;
+- resource presentation remains separate: locks continue using exact canonical
+  execution identity, never display identifiers.
+
+External fencing tokens, distributed coordinators, preemptive cancellation of
+arbitrary capability code, and atomic external-side-effect/SQLite commits remain
+deferred in [`ADR-039`](adr/ADR-039-mutation-lock-lease-ownership.md).
+
+## Bounded full-checkpoint history (ADR-036)
+
+Recovery continues to use complete task snapshots; only historical count is
+bounded:
+
+- the mutable `tasks` row remains the current complete task;
+- each checkpoint remains a complete, directly restorable `Task` snapshot;
+- runtime resume still reads only the latest checkpoint and applies the existing
+  task-row/checkpoint timestamp precedence used by approval resolution and
+  crash recovery;
+- after a new checkpoint commits, SQLite retains the newest eight checkpoints
+  for that task through the optional `CheckpointRetentionStore` capability;
+- pruning is best effort and occurs after durability, so its only failure mode
+  is extra history—not missing recovery state;
+- scheduler ownership, goal CAS, lock waiting, mutation recovery fencing,
+  at-least-once crash semantics, and terminal result availability are
+  unchanged.
+
+Measured 100-step checkpoint history fell from unbounded cumulative growth
+(102 snapshots and a 55.9x total snapshot factor before retention) to a fixed
+number of recent full snapshots. Delta replay, compression, blobs, event
+sourcing, and automatic legacy-history compaction remain deferred in
+[`ADR-036`](adr/ADR-036-bounded-full-checkpoint-retention.md).
+
+## Runtime lifecycle and ownership (ADR-032)
+
+Arion initializes eagerly, but runtime ownership is now explicit:
+
+- `build_engine` owns every store it constructs (`state.storage`,
+  `memory.store`, and `cognition.store`) through a `ResourceLifecycle`.
+- `ArionEngine.shutdown()` first drains the scheduler and removes durable
+  worker ownership, then closes owned stores in reverse construction order.
+  It is idempotent; `close()` and context-manager use call the same path.
+- Dependencies passed directly to `ArionEngine` remain borrowed unless their
+  creator explicitly supplies a lifecycle. Shared injected stores are never
+  closed implicitly.
+- `LifecycleState`, `HealthStatus`, `ComponentHealth`, and `HealthReport`
+  provide a typed, bounded health contract through `engine.health()`.
+- A partial composition failure closes resources already constructed instead
+  of leaking SQLite connections.
+
+The concrete ownership map and consolidation deferrals are recorded in
+[`ADR-032`](adr/ADR-032-runtime-lifecycle-consolidation.md). Async start hooks,
+distributed health checks, and a broad event-payload migration are deferred
+until real service boundaries require them.
+
 ## Security boundary (first slice)
 
 No shell, no writes, no network. Filesystem access is read-only and confined
