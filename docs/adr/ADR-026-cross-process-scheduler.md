@@ -92,9 +92,9 @@ a live peer's queue.
   -> SchedulerWork | None` — same transaction, oldest QUEUED row for this
   scheduler; None when empty or capacity full.
 - `heartbeat(work_id, worker_id, lease_seconds, now, max_lease)` —
-  ownership-checked, monotonic (now ≥ started_at), bounded
-  (expiry ≤ started_at + max_lease), dead-owner-rejected (expired rows
-  cannot be resurrected).
+  ownership-checked, monotonic, bounded, and dead-owner-rejected (expired rows
+  cannot be resurrected). ADR-040 later changed the bound from an absolute
+  runtime cap to a sliding per-renewal cap and added an active worker heartbeat.
 - `release_and_claim_next(work_id, owner_worker_id, status, error,
   scheduler_id, worker_id, lease_seconds, now, max_lease) ->
   (SchedulerWork, SchedulerWork | None)` — one transaction: ownership-
@@ -135,11 +135,11 @@ a crashed process never permanently consumes capacity.
 
 ### Lease/heartbeat semantics
 
-- Work lease: `started_at + lease_seconds` at claim; `heartbeat` extends to
-  `min(now + lease, started_at + max_lease)` but never backwards; rejected
-  when `now < started_at` (forged/past), when the owner differs (forged
-  worker), or when the lease already expired (stale owner cannot
-  resurrect).
+- Work lease: `started_at + lease_seconds` at claim; `heartbeat` never moves
+  backwards and is rejected when `now < started_at` (forged/past), when the
+  owner differs (forged worker), or when the lease already expired (stale owner
+  cannot resurrect). ADR-040 makes successful in-window renewal sliding and
+  caps each extension to `max_lease` beyond the heartbeat time.
 - Registration lease: same rules on `scheduler_instances`.
 - All clocks are the engine's injectable `_lock_now()` (deterministic
   tests) or wall clock; the STORE writes all timestamps from the `now` it
@@ -188,13 +188,11 @@ a crashed process never permanently consumes capacity.
 
 ## Known limitations / future work
 
-- Same-task execution by two live processes is unsupported (a foreign
-  RUNNING row for a PENDING step is reclaimed; per-step SUCCEEDED state
-  prevents replays).
-- Global capacity is a single durable config; per-goal shares are future
-  work (weighted fairness).
-- Steps running longer than the lease can have their row reclaimed
-  mid-flight; the durable per-step task state remains authoritative.
+- ADR-040 closes the original same-task/live-peer gap: unexpired foreign rows
+  are no longer abandoned, active workers renew their rows, and task revision
+  preflight prevents terminal-step replay.
+- Global capacity is a single durable config; per-goal shares were added by
+  later scheduler ADRs.
 - Without an explicitly configured `global_max_concurrency`, cross-process
   capacity is bounded per engine only (ADR-025 semantics preserved); set
   the durable cap for multi-process deployments.

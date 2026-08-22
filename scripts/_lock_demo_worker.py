@@ -126,6 +126,11 @@ def build_engine(db_path, sandbox, write_cap=None,
         lock_wait_backoff_base=backoff_base,
         lock_wait_backoff_max=backoff_max,
         lock_wait_observer=observer,
+        # Keep subprocess restart tests bounded while preserving real lease
+        # semantics. Live waiters renew this row; a killed worker becomes
+        # reclaimable shortly after its heartbeat stops (ADR-040).
+        scheduler_lease_seconds=0.5,
+        scheduler_max_lease_seconds=2.0,
     )
     return engine, gm
 

@@ -78,7 +78,9 @@ from arion.state.models import (
     GoalStatus,
     PlanStep,
     StepStatus,
+    TASK_TERMINAL_STATUSES,
     Task,
+    TaskStateError,
     TaskStatus,
     new_id,
     utcnow,
@@ -283,6 +285,50 @@ class ArionEngine:
             r.status == RecoveryStatus.REQUIRED
             for r in self.recovery_store.list_recoveries(goal_id=goal_id)
         )
+
+    def _fence_task_on_open_recovery(self, task: Task) -> bool:
+        """Fail a non-terminal task closed when REQUIRED recovery exists.
+
+        ``run_goal`` already gates fresh work by goal.  This task-level check
+        closes the recovery-row-before-task-snapshot crash window and protects
+        callers that resume a task directly (ADR-040).
+        """
+        if task.status in TASK_TERMINAL_STATUSES or self.recovery_store is None:
+            return False
+        try:
+            own = [
+                record for record in self.recovery_store.list_recoveries(
+                    task_id=task.id
+                )
+                if record.status == RecoveryStatus.REQUIRED
+            ]
+            blocked = bool(own) or self._has_open_recovery(task.goal_id)
+        except Exception:
+            blocked = True  # inability to verify recovery state fails closed
+        if not blocked:
+            return False
+        reason = "mutation recovery required; task execution is fenced"
+        step = task.active_step
+        if step is not None and step.status in (
+                StepStatus.PENDING, StepStatus.RUNNING):
+            step.status = StepStatus.FAILED
+            step.error = reason
+        task.status = TaskStatus.FAILED
+        task.error = reason
+        task.completed_at = utcnow()
+        try:
+            self.storage.save_task(task)
+        except TaskStateError:
+            canonical = self.storage.load_task(task.id)
+            if canonical is not None:
+                task.__dict__.update(canonical.__dict__)
+        self._cancel_waiters_for_task(task)
+        self._emit("task.failed", task_id=task.id, detail={
+            "step_index": step.index if step is not None else None,
+            "error": reason,
+            "recovery_fenced": True,
+        })
+        return True
 
     def _record_recovery_required(self, task: Task, step: PlanStep, spec,
                                   reason: str) -> MutationRecovery | None:
@@ -854,7 +900,12 @@ class ArionEngine:
         the step was paused (fresh approval queued) or denied - the caller
         must NOT execute the capability."""
         if not waited:
-            return True  # no contention: the single authz check already ran
+            return True  # no contention: worker preflight already validated
+        if (self._fail_task_for_terminal_goal(
+                task, step, phase="post-lock-wait")
+                or self._fence_task_on_open_recovery(task)
+                or not self._task_step_is_current(task, step)):
+            return False
         from arion.orchestration.authz import PolicyOutcome
 
         # LIVE spec, not the stale one captured before the wait: the
@@ -1265,7 +1316,11 @@ class ArionEngine:
                     pending = gm.pending_task(goal_id)
                     if pending is not None:
                         pending = self.run_task(pending.id)
-                        if pending.status in (TaskStatus.FAILED, TaskStatus.AWAITING_APPROVAL):
+                        if pending.status in (
+                                TaskStatus.FAILED,
+                                TaskStatus.AWAITING_APPROVAL,
+                                TaskStatus.RUNNING,
+                        ):
                             return gm.get_goal(goal_id)
                         continue
                     continue
@@ -1316,7 +1371,11 @@ class ArionEngine:
             pending = gm.pending_task(goal_id)
             if pending is not None:
                 pending = self.run_task(pending.id)
-                if pending.status in (TaskStatus.FAILED, TaskStatus.AWAITING_APPROVAL):
+                if pending.status in (
+                        TaskStatus.FAILED,
+                        TaskStatus.AWAITING_APPROVAL,
+                        TaskStatus.RUNNING,
+                ):
                     return gm.get_goal(goal_id)
                 continue
             if self._block_on_missing_capability(goal_id, gm):
@@ -1472,16 +1531,61 @@ class ArionEngine:
             return False
         return created < current - timedelta(seconds=max(0.0, float(ttl)))
 
-    def _goal_is_terminal_for_approval(self, task: Task) -> bool:
+    def _terminal_goal_status(self, task: Task) -> GoalStatus | None:
         if self.goal_manager is None or not task.goal_id:
-            return False
+            return None
         try:
             goal = self.goal_manager.get_goal(task.goal_id)
-            return goal is not None and goal.status in (
-                GoalStatus.COMPLETED, GoalStatus.FAILED, GoalStatus.CANCELLED,
-            )
+            if goal is not None and goal.status in (
+                    GoalStatus.COMPLETED, GoalStatus.FAILED,
+                    GoalStatus.CANCELLED):
+                return goal.status
+            return None
         except Exception:
-            return True  # fail closed when terminal state cannot be verified
+            # A configured goal authority that cannot be read fails closed.
+            return GoalStatus.FAILED
+
+    def _goal_is_terminal_for_approval(self, task: Task) -> bool:
+        return self._terminal_goal_status(task) is not None
+
+    def _fail_task_for_terminal_goal(
+        self,
+        task: Task,
+        step: PlanStep | None = None,
+        *,
+        phase: str,
+    ) -> bool:
+        """Observe terminal goal authority at a planning/execution boundary."""
+        goal_status = self._terminal_goal_status(task)
+        if goal_status is None or task.status in TASK_TERMINAL_STATUSES:
+            return False
+        reason = (
+            f"task stopped during {phase}: terminal goal "
+            f"({goal_status.value})"
+        )
+        if step is None:
+            step = task.active_step
+        if step is not None and step.status in (
+                StepStatus.PENDING, StepStatus.RUNNING):
+            step.status = StepStatus.FAILED
+            step.error = reason
+        task.status = TaskStatus.FAILED
+        task.error = reason
+        task.completed_at = utcnow()
+        try:
+            self.storage.save_task(task)
+        except TaskStateError:
+            canonical = self.storage.load_task(task.id)
+            if canonical is not None:
+                task.__dict__.update(canonical.__dict__)
+        self._cancel_waiters_for_task(task)
+        self._emit("task.failed", task_id=task.id, detail={
+            "step_index": step.index if step is not None else None,
+            "error": reason,
+            "terminal_goal": goal_status.value,
+            "phase": phase,
+        })
+        return True
 
     def resolve_approval_request(self, approval_id: str, outcome: "ApprovalOutcome",
                                  actor: str = "approver") -> "ApprovalRequest":
@@ -1923,15 +2027,23 @@ class ArionEngine:
         if task is None:
             raise KeyError(f"task not found: {task_id}")
 
+        # The durable task row is the terminal authority.  A checkpoint is a
+        # recovery snapshot, never a way to move terminal work backwards.
+        if task.status in TASK_TERMINAL_STATUSES:
+            return task
+
         checkpoint = self.storage.latest_checkpoint(task_id)
         restored = None
         if checkpoint is not None:
             restored = Task.from_dict(checkpoint.snapshot)
-            if checkpoint.created_at >= task.updated_at:
-                # the checkpoint is the freshest state (normal crash recovery)
+            if (restored.revision == task.revision == 0
+                    and checkpoint.created_at >= task.updated_at):
+                # Compatibility for pre-ADR-040 rows/checkpoints that carry no
+                # revision.  Terminal rows were already protected above.
                 task = restored
-            # else: an out-of-band update (e.g. resolve_approval) wrote a
-            # NEWER task row - the task row is authoritative.
+            # Revisioned task rows are always authoritative. A checkpoint
+            # cannot mint a higher revision, and equal-revision snapshots add
+            # no state that was not already committed to the task row.
         if checkpoint is not None:
             # mid_execution distinguishes a genuine recovery (a task that had
             # begun executing steps) from a plan-only checkpoint (the normal
@@ -1977,8 +2089,9 @@ class ArionEngine:
             })
             return task
 
-        # Already terminal (e.g. completed before a restart): return as-is.
-        if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+        # Already terminal (e.g. restored from a compatible checkpoint):
+        # return as-is.
+        if task.status in TASK_TERMINAL_STATUSES:
             return task
 
         # Approval still pending (durable queue record exists): stop cleanly
@@ -1986,6 +2099,12 @@ class ArionEngine:
         # awaiting step (ADR-018). resolve_approval(APPROVED) flips the task
         # to RUNNING, which is how the exact-step resume proceeds.
         if task.status == TaskStatus.AWAITING_APPROVAL:
+            return task
+
+        # A REQUIRED recovery is task execution authority too, not merely a
+        # run_goal planning hint.  This repairs a recovery-row-before-task-save
+        # crash without replaying the uncertain mutation.
+        if self._fence_task_on_open_recovery(task):
             return task
 
         if not task.steps:
@@ -2038,6 +2157,12 @@ class ArionEngine:
                     self._emit("step.skipped", task_id=task.id, step_id=_step_id(st), detail={
                         "reason": st.skipped_reason or "skipped", "guidance": st.guidance[:5],
                     })
+
+            if self._fail_task_for_terminal_goal(
+                    task, phase="execution dispatch"):
+                return task
+            if self._fence_task_on_open_recovery(task):
+                return task
 
             pending = [i for i, st in enumerate(task.steps) if st.status == StepStatus.PENDING]
             if not pending:
@@ -2108,18 +2233,29 @@ class ArionEngine:
             if enqueued:
                 self.scheduler.run_until_done()
             else:
-                # nothing dispatched this round (cross-process capacity
-                # exhausted): stop cleanly - the caller re-invokes later.
-                self.storage.save_task(task)
-                return task
-
-            self.storage.save_task(task)
+                # Nothing was claimed.  Do not publish this runner's local
+                # RUNNING cursor over the live owner's task snapshot.
+                canonical = self.storage.load_task(task.id) or task
+                if canonical.status not in (
+                        TaskStatus.COMPLETED, TaskStatus.FAILED,
+                        TaskStatus.AWAITING_APPROVAL):
+                    # Coordination-only return state: let run_goal stop rather
+                    # than spin, without replacing the live owner's snapshot.
+                    canonical.status = TaskStatus.RUNNING
+                return canonical
 
             cstep = task.steps[cursor]
+            if task.status == TaskStatus.FAILED:
+                # A worker may have observed goal cancellation after capability
+                # return.  Respect that terminal task state even when the step
+                # itself has a known SUCCEEDED outcome.
+                canonical = self.storage.load_task(task.id)
+                return canonical or task
             if cstep.status == StepStatus.PENDING and task.status == TaskStatus.AWAITING_APPROVAL:
-                # cursor paused on approval: durable stop, exact-step resume
-                self._checkpoint(task, reason="awaiting approval")
+                # Cursor paused on approval: commit the task mirror before its
+                # checkpoint.  Revision CAS rejects a concurrent terminal row.
                 self.storage.save_task(task)
+                self._checkpoint(task, reason="awaiting approval")
                 return task
             if cstep.status == StepStatus.FAILED or any(
                     task.steps[i].status == StepStatus.FAILED for i in dispatch):
@@ -2191,6 +2327,13 @@ class ArionEngine:
                 task = tasks[tid]
                 if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED,
                                    TaskStatus.AWAITING_APPROVAL):
+                    results[tid] = task
+                    continue
+                if self._fail_task_for_terminal_goal(
+                        task, phase="shared execution dispatch"):
+                    results[tid] = task
+                    continue
+                if self._fence_task_on_open_recovery(task):
                     results[tid] = task
                     continue
                 if not task.steps:
@@ -2267,11 +2410,13 @@ class ArionEngine:
             # ---------------- post-round per task -----------------------------
             for tid, info in plan.items():
                 task = info["task"]
-                self.storage.save_task(task)
                 cstep = task.steps[info["cursor"]]
+                if task.status == TaskStatus.FAILED:
+                    results[tid] = self.storage.load_task(task.id) or task
+                    continue
                 if cstep.status == StepStatus.PENDING and task.status == TaskStatus.AWAITING_APPROVAL:
-                    self._checkpoint(task, reason="awaiting approval")
                     self.storage.save_task(task)
+                    self._checkpoint(task, reason="awaiting approval")
                     results[tid] = task
                     continue
                 failed_indices = [i for i in info["candidates"] + info["parked"]
@@ -2462,12 +2607,11 @@ class ArionEngine:
            worker id + bounded lease). A claim failure due to cross-process
            capacity leaves the row QUEUED for the next round - no worker is
            consumed;
-        3. a RUNNING row for this step that this engine did not claim is
-           stale/foreign/forged: it is reclaimed (ABANDONED) and the step is
-           re-admitted fresh - persisted state can never stall or fake
-           execution;
+        3. expired RUNNING rows are reclaimed only by the registry's lease
+           check; an unexpired foreign row remains authoritative and this
+           engine does not dispatch the step;
         4. only a claimed row is enqueued to the in-process worker pool; the
-           worker heartbeats (ownership check) and reports terminal WITH
+           worker heartbeats throughout execution and reports terminal WITH
            its worker id."""
         if self.scheduler_registry is None:
             # no durable registry: plain in-process dispatch (legacy path)
@@ -2479,6 +2623,10 @@ class ArionEngine:
         now = self._lock_now()
         worker_id = f"worker:{os.getpid()}:{new_id('w')}"
         try:
+            # Only the registry's expiry-checked reclaim path may revoke a
+            # RUNNING owner.  A live foreign row is not stale merely because
+            # it belongs to another engine (ADR-040).
+            reg.reclaim_stale(now=now)
             existing = [
                 r for r in reg.list_work(task_id=task.id, step_index=step.index)
                 if r.status in (SchedulerWorkStatus.QUEUED,
@@ -2491,17 +2639,10 @@ class ArionEngine:
                 row = r
                 break
             if r.status == SchedulerWorkStatus.RUNNING:
-                with self._inflight_lock:
-                    mine = r.work_id in self._claimed_work
-                if mine:
-                    return False  # already dispatched by this engine
-                # stale/foreign/forged RUNNING row: reclaim and re-admit fresh
-                try:
-                    reg.mark_terminal(r.work_id, SchedulerWorkStatus.ABANDONED,
-                                      error="reclaimed: stale/foreign owner",
-                                      now=now)
-                except Exception:
-                    pass
+                # ``reclaim_stale`` above already removed every expired row.
+                # Anything still RUNNING has a live lease and cannot be
+                # preempted by this engine, whether local or foreign.
+                return False
         if row is None:
             try:
                 row = reg.create(task_id=task.id, goal_id=task.goal_id,
@@ -2549,6 +2690,11 @@ class ArionEngine:
 
     def _complete_task_shared(self, task: Task) -> None:
         """Terminal COMPLETED handling shared by the multi-task driver."""
+        if self._fail_task_for_terminal_goal(
+                task, phase="shared completion"):
+            return
+        if self._fence_task_on_open_recovery(task):
+            return
         skipped = sum(1 for st in task.steps if st.status == StepStatus.SKIPPED)
         task.status = TaskStatus.COMPLETED
         task.completed_at = utcnow()
@@ -2723,6 +2869,9 @@ class ArionEngine:
             )
             self._emit("task.failed", task_id=task.id, detail={"error": task.error})
             return task
+        if self._fail_task_for_terminal_goal(
+                task, phase="planning"):
+            return task
         if not steps:
             # A plan with no steps can never reach a terminal state; fail the
             # task explicitly rather than leaving it dangling in 'planned'.
@@ -2844,6 +2993,64 @@ class ArionEngine:
         except Exception:
             return False
 
+    def _task_step_is_current(self, task: Task, step: PlanStep) -> bool:
+        """Revalidate the task revision and pending step before execution."""
+        durable = self.storage.load_task(task.id)
+        if durable is None:
+            return False
+        durable_step = next(
+            (candidate for candidate in durable.steps
+             if candidate.index == step.index),
+            None,
+        )
+        if (durable.revision != task.revision
+                or durable.status in TASK_TERMINAL_STATUSES
+                or durable_step is None
+                or durable_step.status != StepStatus.PENDING):
+            task.__dict__.update(durable.__dict__)
+            return False
+        return True
+
+    def _start_scheduler_heartbeat(
+        self, work_id: str, worker_id: str
+    ) -> tuple[Any, Any, dict[str, Any]]:
+        """Keep one exact scheduler work claim live while capability code runs."""
+        # Validate ownership synchronously before any capability can execute.
+        self.scheduler_registry.heartbeat(
+            work_id, worker_id,
+            lease_seconds=self.scheduler_lease_seconds,
+            now=self._lock_now(),
+            max_lease_seconds=self.scheduler_max_lease_seconds,
+        )
+        stop = _threading.Event()
+        state: dict[str, Any] = {"error": None}
+        interval = max(
+            0.01,
+            min(5.0, float(self.scheduler_lease_seconds) / 3.0),
+        )
+
+        def heartbeat() -> None:
+            while not stop.wait(interval):
+                try:
+                    self.scheduler_registry.heartbeat(
+                        work_id, worker_id,
+                        lease_seconds=self.scheduler_lease_seconds,
+                        now=self._lock_now(),
+                        max_lease_seconds=self.scheduler_max_lease_seconds,
+                    )
+                    self._heartbeat_registration()
+                except Exception as exc:
+                    state["error"] = exc
+                    return
+
+        thread = _threading.Thread(
+            target=heartbeat,
+            daemon=True,
+            name=f"arion-work-heartbeat-{work_id}",
+        )
+        thread.start()
+        return stop, thread, state
+
     def _run_step_worker(self, task: Task, step: PlanStep,
                          work_id: str | None = None,
                          worker_id: str | None = None) -> None:
@@ -2858,34 +3065,51 @@ class ArionEngine:
         timestamps); no thread objects, stack traces, capability outputs or
         model output are ever persisted.
 
-        ADR-026 ownership: the row was atomically CLAIMED at admission (it
-        is already RUNNING with `worker_id`). The worker first HEARTBEATS -
-        an ownership-checked lease refresh that fails closed if the row was
-        reclaimed (stale lease) or reassigned - and afterwards reports
-        terminal WITH its worker id (a stale owner can never complete a
-        row it no longer owns)."""
+        ADR-026/040 ownership: the row was atomically CLAIMED at admission
+        (it is already RUNNING with `worker_id`). The worker validates and
+        renews that exact ownership throughout capability execution, then
+        reports terminal WITH its worker id (a stale owner can never complete
+        a row it no longer owns)."""
+        scheduler_heartbeat = None
         if work_id is not None and self.scheduler_registry is not None:
             try:
-                self.scheduler_registry.heartbeat(
-                    work_id, worker_id,
-                    lease_seconds=self.scheduler_lease_seconds,
-                    now=self._lock_now(),
-                    max_lease_seconds=self.scheduler_max_lease_seconds)
+                scheduler_heartbeat = self._start_scheduler_heartbeat(
+                    work_id, worker_id
+                )
             except Exception as exc:
                 step.status = StepStatus.FAILED
                 step.error = f"scheduler lease failed closed: {exc}"
                 self.storage.save_task(task)
                 self._emit("error", task_id=task.id, step_id=_step_id(step), success=False,
                            detail={"error": step.error[:300]})
+                with self._inflight_lock:
+                    self._claimed_work.pop(work_id, None)
                 return
         try:
-            self._execute_step(task, step)
+            if (not self._fail_task_for_terminal_goal(
+                    task, step, phase="worker start")
+                    and self._task_step_is_current(task, step)):
+                self._execute_step(task, step)
+                # Capability code is not preemptible.  Recheck authority after
+                # it returns so cancellation cannot be reported as ordinary
+                # task completion.
+                self._fail_task_for_terminal_goal(
+                    task, step, phase="worker completion")
         finally:
+            heartbeat_state = self._stop_lock_heartbeat(scheduler_heartbeat)
+            if heartbeat_state.get("error") is not None:
+                self._emit(
+                    "error", task_id=task.id, step_id=_step_id(step),
+                    success=False, detail={
+                        "error": "scheduler ownership heartbeat lost",
+                        "error_type": type(heartbeat_state["error"]).__name__,
+                        "category": "scheduler_ownership",
+                    },
+                )
             if work_id is not None and self.scheduler_registry is not None:
-                # the WORK unit finished: FAILED only when the step failed;
+                # The WORK unit finished: FAILED only when the step failed;
                 # SUCCEEDED/SKIPPED AND approval-paused steps are COMPLETED
-                # work (an approval-paused step requested its approval and
-                # stops cleanly - the task state is the authority on that)
+                # work (the task snapshot remains execution authority).
                 terminal = (SchedulerWorkStatus.FAILED
                             if step.status == StepStatus.FAILED
                             else SchedulerWorkStatus.COMPLETED)
@@ -2899,7 +3123,11 @@ class ArionEngine:
                     self._claimed_work.pop(work_id, None)
         if step.status in (StepStatus.SUCCEEDED, StepStatus.FAILED,
                            StepStatus.SKIPPED):
-            self.storage.save_task(task)
+            durable = self.storage.load_task(task.id)
+            if durable is None or durable.status not in TASK_TERMINAL_STATUSES:
+                self.storage.save_task(task)
+            else:
+                task.__dict__.update(durable.__dict__)
 
     def _execute_step(self, task: Task, step: PlanStep) -> None:
         self._emit(
@@ -3296,7 +3524,26 @@ class ArionEngine:
         finally:
             self._stop_lock_heartbeat(heartbeat)
             if lock is not None:
+                # Publish a known terminal mutation outcome before another
+                # waiter can acquire the resource.  A stale task revision is
+                # uncertain for a non-retry-safe mutation and therefore keeps
+                # the existing recovery fence authoritative.
+                persistence_error = None
+                if step.status in (
+                        StepStatus.SUCCEEDED, StepStatus.FAILED,
+                        StepStatus.SKIPPED):
+                    try:
+                        self.storage.save_task(task)
+                    except TaskStateError as exc:
+                        persistence_error = exc
+                        if not getattr(spec, "retry_safe", False):
+                            self._record_recovery_required(
+                                task, step, spec,
+                                f"mutation task revision lost: {exc}",
+                            )
                 self._release_mutation_lock(lock, task, step)
+                if persistence_error is not None:
+                    raise persistence_error
 
     def _execute_attempts(self, task: Task, step: PlanStep, capability, spec,
                           mutating: bool, verify_failed: bool,

@@ -116,10 +116,13 @@ def test_poisoned_model_output_cannot_bypass_dependency(tmp_path):
 
 
 def test_fake_worker_id_cannot_claim_a_worker(tmp_path):
-    """A registry row whose worker_id was forged cannot run anything: worker
-    lifecycle comes only from the engine's mirror. A forged row never turns
-    into execution, never suppresses the real dispatch, and never marks the
-    step complete."""
+    """A durable RUNNING row cannot execute or complete by itself.
+
+    It is nevertheless ownership authority until its lease expires: another
+    engine must not preempt an unexpired row merely because its worker id is
+    unfamiliar. After expiry, the normal reclaim path permits one real
+    dispatch through the complete authorization pipeline.
+    """
     env = _env(tmp_path, TwoStepPlanner(lambda d: [_read_step("a.txt")]),
                max_concurrency=1, db_name="adv1.db")
     gid = _submit(env, "goal one")
@@ -127,16 +130,28 @@ def test_fake_worker_id_cannot_claim_a_worker(tmp_path):
     forged = env.engine.scheduler_registry.create(
         task_id=task.id, goal_id=gid, step_index=0,
         scheduler_id=env.engine.scheduler_id)
-    # a forged 'RUNNING' claim is meaningless: the engine never looks at it
     env.engine.scheduler_registry.mark_running(
         forged.work_id, worker_id="worker:forged:99", lease_seconds=60.0)
+
+    # The unexpired durable owner parks this runner and performs no execution.
+    results = env.engine.run_goals([gid])
+    assert results[gid].status == GoalStatus.ACTIVE
+    assert not [e for e in env.storage.list_events()
+                if e.kind == "capability.executed"]
+    assert env.engine.scheduler_registry.get_work(
+        forged.work_id).status == SchedulerWorkStatus.RUNNING
+
+    # Only expiry-based reclaim removes that authority; then exactly one real
+    # dispatch executes and completes the task.
+    env.engine.scheduler_registry.reclaim_stale(
+        now="2099-01-01T00:00:00+00:00")
     results = env.engine.run_goals([gid])
     assert results[gid].status == GoalStatus.COMPLETED
     rows = env.engine.scheduler_registry.list_work(task_id=task.id)
     completed = [r for r in rows if r.status == SchedulerWorkStatus.COMPLETED]
-    assert len(completed) == 1  # the REAL dispatch, exactly once
-    # the forged claim never became the step's outcome
-    assert forged.work_id not in [r.work_id for r in completed]
+    assert len(completed) == 1
+    assert env.engine.scheduler_registry.get_work(
+        forged.work_id).status == SchedulerWorkStatus.ABANDONED
     env.engine.storage.close()
 
 

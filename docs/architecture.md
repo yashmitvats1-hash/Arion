@@ -32,12 +32,17 @@ Goal → Task → Plan → Authorization → Capability → Observation
 ```
 
 - Tasks are persistent objects with status `created → planning → planned →
-  running → awaiting_approval → completed | failed`.
+  running → awaiting_approval → completed | failed`. Task cancellation is
+  represented by terminal `failed`; `cancelled` is an authoritative goal state.
+- Every committed task snapshot carries a monotonic revision. Existing-row
+  writes are revision-CAS and terminal task rows cannot be resurrected
+  (ADR-040).
 - Every step: capability discovery (resolve ActionSpec metadata) →
   authorization (policy decision) → execute (retries per retry-safety) →
   observe → verify → checkpoint.
-- Checkpoints are full task snapshots; resuming after a restart restores the
-  latest checkpoint and continues where it left off.
+- Checkpoints are full task snapshots. For revisioned state, the task row is
+  authoritative and checkpoints cannot mint progress or regress a step.
+  Timestamp fallback exists only for revision-zero legacy snapshots.
 - **The LLM never owns the loop** (ADR-005). Default planner/router are
   deterministic; the whole system runs and is tested with no model.
 
@@ -703,11 +708,13 @@ loop (ADR-016):
   on registration liveness, so a live peer's queue is never abandoned.
 - **Lease-based ownership:** every dispatched work item is atomically
   CLAIMED (`BEGIN IMMEDIATE`: lazy stale reclaim + cross-process capacity +
-  QUEUED→RUNNING with a bounded worker lease). Heartbeats are
-  ownership-checked, monotonic (`now >= started_at`), bounded
-  (`expiry <= started_at + max_lease`) and stale-rejected; `mark_terminal`
-  from RUNNING requires the current owner (a stale owner can never
-  complete/fail work after expiry or reassignment).
+  QUEUED→RUNNING with a bounded worker lease). Heartbeats are exact-owner
+  checked, monotonic, sliding-bounded per renewal, and stale-rejected. A worker
+  renews for the entire capability call; a second engine never abandons an
+  unexpired foreign row. `mark_terminal` from RUNNING requires the current
+  owner (a stale owner can never complete/fail work after expiry or
+  reassignment). Task revision preflight independently requires the same step
+  to remain pending before capability execution (ADR-040).
 - **Atomic handoff:** `release_and_claim_next` completes one row and claims
   the next in ONE transaction (release_and_select_next-style); racing
   processes produce exactly one owner.
@@ -1205,6 +1212,31 @@ External fencing tokens, distributed coordinators, preemptive cancellation of
 arbitrary capability code, and atomic external-side-effect/SQLite commits remain
 deferred in [`ADR-039`](adr/ADR-039-mutation-lock-lease-ownership.md).
 
+## Task lifecycle revision fencing (ADR-040)
+
+Task progress now has the same conditional-write discipline as goals,
+approvals, locks, and scheduler work:
+
+- every SQLite task row has a monotonic revision mirrored in its full snapshot;
+- existing-row saves require the exact expected revision under
+  `BEGIN IMMEDIATE` and reject stale writers with `TaskStateError`;
+- persisted task transitions are explicit, terminal task rows are immutable,
+  and execution states cannot regress to planning states;
+- worker preflight requires the durable task revision and referenced step to
+  remain current and pending before capability execution;
+- revisioned task rows outrank checkpoints; checkpoints cannot mint revisions;
+- a live foreign scheduler work row is never preempted, and active work renews
+  its exact lease throughout capability execution;
+- terminal goal and required-recovery authority are rechecked at planning,
+  dispatch, post-wait, and post-capability boundaries;
+- known mutation outcomes are revision-CAS persisted while the mutation lock is
+  still held, before another waiter may acquire the resource.
+
+Task cancellation remains represented as terminal `FAILED`; `CANCELLED` is a
+goal-level state. In-flight arbitrary capability code is not preempted, but its
+return cannot turn work under a cancelled goal into a completed task. See
+[`ADR-040`](adr/ADR-040-task-lifecycle-revision-fencing.md).
+
 ## Bounded full-checkpoint history (ADR-036)
 
 Recovery continues to use complete task snapshots; only historical count is
@@ -1212,9 +1244,9 @@ bounded:
 
 - the mutable `tasks` row remains the current complete task;
 - each checkpoint remains a complete, directly restorable `Task` snapshot;
-- runtime resume still reads only the latest checkpoint and applies the existing
-  task-row/checkpoint timestamp precedence used by approval resolution and
-  crash recovery;
+- runtime resume still reads only the latest checkpoint, but task revision
+  precedence is authoritative: terminal/newer task rows cannot be replaced by
+  later-inserted stale snapshots; timestamp fallback is legacy-only (ADR-040);
 - after a new checkpoint commits, SQLite retains the newest eight checkpoints
   for that task through the optional `CheckpointRetentionStore` capability;
 - pruning is best effort and occurs after durability, so its only failure mode

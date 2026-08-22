@@ -85,21 +85,22 @@ def test_heartbeat_scheduler_bounded_and_monotonic(db_path: str):
                                    now=_iso_plus(T0, 30), max_lease_seconds=300.0)
     assert reg.scheduler_registration_live("sched-1", now=_iso_plus(T0, 89))
     assert not reg.scheduler_registration_live("sched-1", now=_iso_plus(T0, 91))
-    # repeated in-window heartbeats can never exceed registered_at + max_lease
+    # Repeated in-window heartbeats use a sliding bound: each extension is at
+    # most max_lease beyond its heartbeat, so a live scheduler can remain live.
     for t in (89, 148, 207, 266):
         assert reg.heartbeat_scheduler("sched-1", lease_seconds=60.0,
                                        now=_iso_plus(T0, t),
                                        max_lease_seconds=300.0)
-    assert reg.scheduler_registration_live("sched-1", now=_iso_plus(T0, 299))
-    assert not reg.scheduler_registration_live("sched-1", now=_iso_plus(T0, 301))
-    # once the lease lapsed (t=300+), no heartbeat can resurrect it
+    assert reg.scheduler_registration_live("sched-1", now=_iso_plus(T0, 325))
+    assert not reg.scheduler_registration_live("sched-1", now=_iso_plus(T0, 327))
+    # Once the renewed lease lapsed, no heartbeat can resurrect it.
     assert not reg.heartbeat_scheduler("sched-1", lease_seconds=60.0,
-                                       now=_iso_plus(T0, 301),
+                                       now=_iso_plus(T0, 327),
                                        max_lease_seconds=300.0)
-    # a stale heartbeat must never shrink the lease (monotonic)
+    # An old but still syntactically valid timestamp never shrinks the lease.
     assert reg.heartbeat_scheduler("sched-1", lease_seconds=60.0, now=T0,
                                    max_lease_seconds=300.0)
-    assert reg.scheduler_registration_live("sched-1", now=_iso_plus(T0, 299))
+    assert reg.scheduler_registration_live("sched-1", now=_iso_plus(T0, 325))
     reg.close()
 
 
@@ -231,21 +232,20 @@ def test_heartbeat_monotonic_and_bounded(db_path: str):
     with pytest.raises(SchedulerStateError):
         reg.heartbeat(row.work_id, "w1", lease_seconds=60.0,
                       now="2025-01-01T00:00:00+00:00", max_lease_seconds=120.0)
-    # a legitimate in-window heartbeat extends, bounded by the cap
+    # A legitimate in-window heartbeat extends with a sliding per-renewal cap.
     hb = reg.heartbeat(row.work_id, "w1", lease_seconds=60.0,
                        now=_iso_plus(T0, 10), max_lease_seconds=120.0)
     assert hb.lease_expires_at == _iso_plus(T0, 70)
-    # repeated heartbeats can never exceed started_at + max_lease (120)
     hb2 = reg.heartbeat(row.work_id, "w1", lease_seconds=60.0,
                         now=_iso_plus(T0, 69), max_lease_seconds=120.0)
-    assert hb2.lease_expires_at == _iso_plus(T0, 120)
-    hb3 = reg.heartbeat(row.work_id, "w1", lease_seconds=60.0,
+    assert hb2.lease_expires_at == _iso_plus(T0, 129)
+    hb3 = reg.heartbeat(row.work_id, "w1", lease_seconds=1000.0,
                         now=_iso_plus(T0, 119), max_lease_seconds=120.0)
-    assert hb3.lease_expires_at == _iso_plus(T0, 120)
-    # a stale heartbeat that would SHRINK the lease never shrinks it
+    assert hb3.lease_expires_at == _iso_plus(T0, 239)
+    # An older heartbeat that would shrink the lease never shrinks it.
     hb4 = reg.heartbeat(row.work_id, "w1", lease_seconds=60.0,
                         now=_iso_plus(T0, 10), max_lease_seconds=120.0)
-    assert hb4.lease_expires_at == _iso_plus(T0, 120)
+    assert hb4.lease_expires_at == _iso_plus(T0, 239)
     reg.close()
 
 

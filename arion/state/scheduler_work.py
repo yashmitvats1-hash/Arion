@@ -168,8 +168,7 @@ class SchedulerRegistry(Protocol):
     def mark_running(self, work_id: str, worker_id: str, lease_seconds: float,
                      now: str | None = None,
                      max_lease_seconds: float | None = None) -> SchedulerWork:
-        """QUEUED -> RUNNING with a lease deadline. Typed error otherwise.
-        The lease is capped at started_at + max_lease_seconds when given."""
+        """QUEUED -> RUNNING with a bounded initial lease deadline."""
         ...
 
     def mark_terminal(self, work_id: str, status: SchedulerWorkStatus,
@@ -213,8 +212,8 @@ class SchedulerRegistry(Protocol):
     def heartbeat_scheduler(self, scheduler_id: str, lease_seconds: float,
                             now: str | None = None,
                             max_lease_seconds: float | None = None) -> bool:
-        """Extend a scheduler registration lease (bounded + monotonic).
-        Returns False for an unknown scheduler (never an error)."""
+        """Extend a live registration with a monotonic sliding-bounded lease.
+        Returns False for an unknown or expired scheduler."""
         ...
 
     def unregister_scheduler(self, scheduler_id: str) -> None:
@@ -254,9 +253,8 @@ class SchedulerRegistry(Protocol):
     def heartbeat(self, work_id: str, worker_id: str, lease_seconds: float,
                   now: str | None = None,
                   max_lease_seconds: float | None = None) -> SchedulerWork:
-        """Ownership-checked lease extension: monotonic (never shrinks, now
-        >= started_at), bounded (expiry <= started_at + max_lease), and a
-        stale owner (lease already expired) can never resurrect the row."""
+        """Ownership-checked sliding lease extension: monotonic, bounded per
+        renewal, and unable to resurrect an already-expired row."""
         ...
 
     def release_and_claim_next(self, work_id: str, owner_worker_id: str,

@@ -128,11 +128,12 @@ def test_forged_heartbeat_timestamps_cannot_extend(db_path: str):
     with pytest.raises(SchedulerStateError):
         reg.heartbeat(row.work_id, "w1", lease_seconds=60.0,
                       now="2099-01-01T00:00:00+00:00", max_lease_seconds=600.0)
-    # repeated in-window heartbeats capped at started_at + max_lease
+    # Repeated in-window heartbeats slide forward, but each individual
+    # extension remains bounded and forged past/future timestamps stay denied.
     for t in (10, 69, 118):
         reg.heartbeat(row.work_id, "w1", lease_seconds=60.0,
                       now=_iso_plus(T0, t), max_lease_seconds=120.0)
-    assert reg.get_work(row.work_id).lease_expires_at == _iso_plus(T0, 120)
+    assert reg.get_work(row.work_id).lease_expires_at == _iso_plus(T0, 178)
     reg.close()
 
 

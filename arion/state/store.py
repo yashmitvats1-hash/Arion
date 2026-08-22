@@ -25,7 +25,17 @@ def _threadsafe(method):
 
     return wrapper
 
-from arion.state.models import Checkpoint, Goal, Task, TaskStatus, new_id, utcnow
+from arion.state.models import (
+    Checkpoint,
+    Goal,
+    TASK_TERMINAL_STATUSES,
+    TASK_TRANSITIONS,
+    Task,
+    TaskStateError,
+    TaskStatus,
+    new_id,
+    utcnow,
+)
 from arion.state.recovery import MutationRecovery
 from arion.state.locks import LockWaiter, LockWaiterStatus, MutationLock, MutationLockError
 from arion.state.scheduler_work import (
@@ -69,6 +79,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     description TEXT NOT NULL,
     status      TEXT NOT NULL,
     snapshot    TEXT NOT NULL,
+    revision    INTEGER NOT NULL DEFAULT 0,
     updated_at  TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -289,6 +300,7 @@ class SQLiteStorage:
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._conn.executescript(SCHEMA)
         self._migrate_goals()
+        self._migrate_tasks()
         self._migrate_approvals()
         self._conn.commit()
 
@@ -309,6 +321,19 @@ class SQLiteStorage:
         for col, ddl in additions.items():
             if col not in cols:
                 self._conn.execute(ddl)
+
+    @_threadsafe
+    def _migrate_tasks(self) -> None:
+        """Add the monotonic task CAS token without rewriting snapshots."""
+        cols = {
+            row[1] for row in self._conn.execute(
+                "PRAGMA table_info(tasks)"
+            ).fetchall()
+        }
+        if "revision" not in cols:
+            self._conn.execute(
+                "ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+            )
 
     @_threadsafe
     def _migrate_approvals(self) -> None:
@@ -504,25 +529,114 @@ class SQLiteStorage:
 
     @_threadsafe
     def save_task(self, task: Task) -> None:
-        task.updated_at = utcnow()
-        self._conn.execute(
-            "INSERT OR REPLACE INTO tasks (id, goal_id, description, status, snapshot, updated_at) VALUES (?,?,?,?,?,?)",
-            (task.id, task.goal_id, task.description, task.status.value, json.dumps(task.to_dict()), task.updated_at),
-        )
-        self._conn.commit()
+        """Create or revision-CAS one full task snapshot.
+
+        ``Task.revision`` is the expected durable revision.  A successful
+        existing-row write increments it exactly once.  Stale writers and
+        attempts to move a terminal task back to a non-terminal status fail
+        closed instead of replacing newer state (ADR-040).
+        """
+        if isinstance(task.revision, bool) or not isinstance(task.revision, int):
+            raise TaskStateError("task revision must be a non-negative integer")
+        if task.revision < 0:
+            raise TaskStateError("task revision must be non-negative")
+        expected = task.revision
+        previous_updated_at = task.updated_at
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                "SELECT status, revision FROM tasks WHERE id=?", (task.id,)
+            ).fetchone()
+            now = utcnow()
+            if row is None:
+                # New domain objects start at revision zero.  A non-zero
+                # revision for an absent id is not proof of prior ownership.
+                if expected != 0:
+                    raise TaskStateError(
+                        f"task {task.id} is missing at expected revision "
+                        f"{expected} (fail closed)"
+                    )
+                task.revision = 1
+                task.updated_at = now
+                self._conn.execute(
+                    "INSERT INTO tasks (id, goal_id, description, status, "
+                    "snapshot, revision, updated_at) VALUES (?,?,?,?,?,?,?)",
+                    (task.id, task.goal_id, task.description,
+                     task.status.value, json.dumps(task.to_dict()),
+                     task.revision, task.updated_at),
+                )
+                self._conn.commit()
+                return
+
+            durable_status = TaskStatus(row[0])
+            durable_revision = int(row[1])
+            if durable_revision != expected:
+                raise TaskStateError(
+                    f"stale task revision for {task.id}: expected {expected}, "
+                    f"durable {durable_revision} (fail closed)"
+                )
+            if durable_status in TASK_TERMINAL_STATUSES:
+                raise TaskStateError(
+                    f"terminal task {task.id} is immutable "
+                    f"({durable_status.value}; fail closed)"
+                )
+            if task.status not in TASK_TRANSITIONS[durable_status]:
+                raise TaskStateError(
+                    f"invalid task transition {durable_status.value} -> "
+                    f"{task.status.value} for {task.id} (fail closed)"
+                )
+
+            task.revision = expected + 1
+            task.updated_at = now
+            cursor = self._conn.execute(
+                "UPDATE tasks SET goal_id=?, description=?, status=?, "
+                "snapshot=?, revision=?, updated_at=? "
+                "WHERE id=? AND revision=?",
+                (task.goal_id, task.description, task.status.value,
+                 json.dumps(task.to_dict()), task.revision, task.updated_at,
+                 task.id, expected),
+            )
+            if cursor.rowcount != 1:
+                raise TaskStateError(
+                    f"task {task.id} lost its revision race (fail closed)"
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            task.revision = expected
+            task.updated_at = previous_updated_at
+            raise
+
+    @staticmethod
+    def _task_from_storage_row(row: tuple[Any, ...]) -> Task:
+        task = Task.from_dict(json.loads(row[0]))
+        # The column is authoritative for migrated legacy snapshots that do
+        # not yet contain a revision field.
+        task.revision = int(row[1])
+        task.updated_at = row[2]
+        return task
 
     @_threadsafe
     def load_task(self, task_id: str) -> Task | None:
-        row = self._conn.execute("SELECT snapshot FROM tasks WHERE id=?", (task_id,)).fetchone()
-        return Task.from_dict(json.loads(row[0])) if row else None
+        row = self._conn.execute(
+            "SELECT snapshot, revision, updated_at FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        return self._task_from_storage_row(row) if row else None
 
     @_threadsafe
     def list_tasks(self, status: str | None = None) -> list[Task]:
         if status:
-            rows = self._conn.execute("SELECT snapshot FROM tasks WHERE status=? ORDER BY updated_at", (status,)).fetchall()
+            rows = self._conn.execute(
+                "SELECT snapshot, revision, updated_at FROM tasks "
+                "WHERE status=? ORDER BY updated_at", (status,)
+            ).fetchall()
         else:
-            rows = self._conn.execute("SELECT snapshot FROM tasks ORDER BY updated_at").fetchall()
-        return [Task.from_dict(json.loads(r[0])) for r in rows]
+            rows = self._conn.execute(
+                "SELECT snapshot, revision, updated_at FROM tasks "
+                "ORDER BY updated_at"
+            ).fetchall()
+        return [self._task_from_storage_row(row) for row in rows]
 
     # ---- checkpoints ----
 
@@ -732,6 +846,9 @@ class SQLiteStorage:
             return False
         now = utcnow()
         request.updated_at = now
+        previous_updated_at = task.updated_at
+        expected_revision = task.revision
+        task.revision = expected_revision + 1
         task.updated_at = now
         try:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -745,19 +862,24 @@ class SQLiteStorage:
                  ApprovalStatus.PENDING.value),
             )
             task_row = self._conn.execute(
-                "UPDATE tasks SET status=?, snapshot=?, updated_at=? "
-                "WHERE id=? AND status=? AND updated_at=?",
-                (task.status.value, json.dumps(task.to_dict()), task.updated_at,
-                 task.id, TaskStatus.AWAITING_APPROVAL.value,
+                "UPDATE tasks SET status=?, snapshot=?, revision=?, updated_at=? "
+                "WHERE id=? AND status=? AND revision=? AND updated_at=?",
+                (task.status.value, json.dumps(task.to_dict()), task.revision,
+                 task.updated_at, task.id,
+                 TaskStatus.AWAITING_APPROVAL.value, expected_revision,
                  expected_task_updated_at),
             )
             if approval.rowcount != 1 or task_row.rowcount != 1:
                 self._conn.rollback()
+                task.revision = expected_revision
+                task.updated_at = previous_updated_at
                 return False
             self._conn.commit()
             return True
         except Exception:
             self._conn.rollback()
+            task.revision = expected_revision
+            task.updated_at = previous_updated_at
             raise
 
     @_threadsafe
@@ -772,6 +894,9 @@ class SQLiteStorage:
         if not expected_task_statuses or request.task_id != task.id:
             return False
         now = utcnow()
+        previous_updated_at = task.updated_at
+        expected_revision = task.revision
+        task.revision = expected_revision + 1
         task.updated_at = now
         placeholders = ",".join("?" * len(expected_task_statuses))
         try:
@@ -782,20 +907,28 @@ class SQLiteStorage:
             ).fetchone()
             if row is None or row[0] != request.status.value:
                 self._conn.rollback()
+                task.revision = expected_revision
+                task.updated_at = previous_updated_at
                 return False
             cursor = self._conn.execute(
-                "UPDATE tasks SET status=?, snapshot=?, updated_at=? "
-                f"WHERE id=? AND updated_at=? AND status IN ({placeholders})",
-                (task.status.value, json.dumps(task.to_dict()), task.updated_at,
-                 task.id, expected_task_updated_at, *expected_task_statuses),
+                "UPDATE tasks SET status=?, snapshot=?, revision=?, updated_at=? "
+                f"WHERE id=? AND revision=? AND updated_at=? "
+                f"AND status IN ({placeholders})",
+                (task.status.value, json.dumps(task.to_dict()), task.revision,
+                 task.updated_at, task.id, expected_revision,
+                 expected_task_updated_at, *expected_task_statuses),
             )
             if cursor.rowcount != 1:
                 self._conn.rollback()
+                task.revision = expected_revision
+                task.updated_at = previous_updated_at
                 return False
             self._conn.commit()
             return True
         except Exception:
             self._conn.rollback()
+            task.revision = expected_revision
+            task.updated_at = previous_updated_at
             raise
 
     @_threadsafe
@@ -1705,9 +1838,13 @@ class SQLiteStorage:
     def heartbeat_scheduler(self, scheduler_id: str, lease_seconds: float,
                             now: str | None = None,
                             max_lease_seconds: float | None = None) -> bool:
-        """Extend a scheduler registration lease: bounded (registered_at +
-        max_lease) and monotonic (never shrinks). Unknown scheduler -> False
-        (never an error)."""
+        """Extend a live scheduler registration lease.
+
+        Each renewal is owner-time checked, monotonic, and bounded to at most
+        ``max_lease_seconds`` beyond ``now``.  The bound is sliding: a live
+        process may keep renewing indefinitely, while a lapsed registration
+        cannot be resurrected (ADR-040).
+        """
         now = now or utcnow()
         try:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -1728,10 +1865,10 @@ class SQLiteStorage:
                 return False
             max_lease = (float(max_lease_seconds) if max_lease_seconds is not None
                          else float(lease_seconds))
-            new_expiry = _iso_plus(now, float(lease_seconds))
-            cap = _iso_plus(registered_at, max_lease)
-            if new_expiry > cap:
-                new_expiry = cap
+            extension = min(
+                max(0.0, float(lease_seconds)), max(0.0, max_lease)
+            )
+            new_expiry = _iso_plus(now, extension)
             if expiry is not None and new_expiry < expiry:
                 new_expiry = expiry  # monotonic: never shrink
             self._conn.execute(
@@ -2281,11 +2418,13 @@ class SQLiteStorage:
     def heartbeat(self, work_id: str, worker_id: str, lease_seconds: float,
                   now: str | None = None,
                   max_lease_seconds: float | None = None) -> SchedulerWork:
-        """Ownership-checked lease extension. Rejected (typed error) when:
-        the row is unknown/not RUNNING, the caller is not the owner, the
-        timestamp is before started_at (forged/past), or the lease already
-        expired (a stale owner can never resurrect). The new expiry is
-        bounded by started_at + max_lease and never shrinks."""
+        """Ownership-checked sliding lease extension.
+
+        Unknown, non-running, wrong-owner, past-time, and already-expired
+        heartbeats fail closed.  Each renewal is bounded to at most
+        ``max_lease_seconds`` beyond ``now`` and never shrinks, so a live
+        worker can retain ownership without permitting stale resurrection.
+        """
         now = now or utcnow()
         try:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -2313,10 +2452,10 @@ class SQLiteStorage:
                     f"(lease expired {expiry})")
             max_lease = (float(max_lease_seconds) if max_lease_seconds is not None
                          else float(lease_seconds))
-            new_expiry = _iso_plus(now, float(lease_seconds))
-            cap = _iso_plus(started_at, max_lease)
-            if new_expiry > cap:
-                new_expiry = cap
+            extension = min(
+                max(0.0, float(lease_seconds)), max(0.0, max_lease)
+            )
+            new_expiry = _iso_plus(now, extension)
             if expiry is not None and new_expiry < expiry:
                 new_expiry = expiry  # monotonic: never shrink
             self._conn.execute(

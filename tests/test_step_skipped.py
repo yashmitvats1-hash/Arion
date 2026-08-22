@@ -140,19 +140,12 @@ def test_restart_resume_skipped_not_reexecuted(db_path, sandbox, fresh_engine):
     ]
     task = _make_task(engine_a, steps)
     task_id = task.id
-    # run to completion in process A
-    engine_a.run_task(task_id)
-    # tamper: pretend we're mid-task - reset step 1 to pending, current_step 0,
-    # so resume must re-walk from the start and see step 0 SKIPPED
-    restored = engine_a.storage.load_task(task_id)
-    restored.current_step = 0
-    restored.status = TaskStatus.PLANNED
-    restored.completed_at = None
-    for s in restored.steps:
-        if s.index != 0:
-            s.status = StepStatus.PENDING
-            s.result = None
-    engine_a.storage.save_task(restored)
+    # Persist a genuine mid-execution boundary instead of moving a terminal
+    # task backwards: step 0 is already SKIPPED and step 1 remains pending.
+    task.status = TaskStatus.RUNNING
+    task.current_step = 1
+    engine_a.storage.save_task(task)
+    engine_a._checkpoint(task, reason="step skipped; process interrupted")
     engine_a.storage.close()
 
     engine_b = fresh_engine(db_path, sandbox)

@@ -32,6 +32,50 @@ class TaskStatus(str, Enum):
     FAILED = "failed"
 
 
+TASK_TERMINAL_STATUSES = frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED})
+
+# Persisted task lifecycle edges.  CREATED remains intentionally permissive:
+# hand-built/stored plans may first become durable at PLANNED, RUNNING,
+# AWAITING_APPROVAL, or a terminal validation outcome.  Once execution begins,
+# earlier planning states cannot be restored.  Same-state writes persist step
+# and coordination progress; terminal rows are separately immutable.
+TASK_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
+    TaskStatus.CREATED: frozenset(TaskStatus),
+    TaskStatus.PLANNING: frozenset({
+        TaskStatus.PLANNING,
+        TaskStatus.PLANNED,
+        TaskStatus.RUNNING,
+        TaskStatus.AWAITING_APPROVAL,
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+    }),
+    TaskStatus.PLANNED: frozenset({
+        TaskStatus.PLANNED,
+        TaskStatus.RUNNING,
+        TaskStatus.AWAITING_APPROVAL,
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+    }),
+    TaskStatus.RUNNING: frozenset({
+        TaskStatus.RUNNING,
+        TaskStatus.AWAITING_APPROVAL,
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+    }),
+    TaskStatus.AWAITING_APPROVAL: frozenset({
+        TaskStatus.AWAITING_APPROVAL,
+        TaskStatus.RUNNING,
+        TaskStatus.FAILED,
+    }),
+    TaskStatus.COMPLETED: frozenset(),
+    TaskStatus.FAILED: frozenset(),
+}
+
+
+class TaskStateError(RuntimeError):
+    """A task snapshot lost its revision race or attempted resurrection."""
+
+
 class StepStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
@@ -121,6 +165,7 @@ class Task:
     current_step: int = 0
     error: str | None = None
     plan_version: int | None = None  # goal plan version this task implements (ADR-016)
+    revision: int = 0  # durable CAS token; incremented on every committed task write
     approvals: list[dict[str, Any]] = field(default_factory=list)  # approval records per step (ADR-017)
     lock_wait: dict[str, Any] | None = None  # ADR-022: durable lock-contention wait metadata
                                               # {resource_kind, resource, deadline, attempts,
@@ -144,6 +189,7 @@ class Task:
             "steps": [s.to_dict() for s in self.steps],
             "current_step": self.current_step,
             "error": self.error,
+            "revision": self.revision,
             "approvals": self.approvals,
             "lock_wait": self.lock_wait,
             "created_at": self.created_at,
@@ -165,6 +211,7 @@ class Task:
             current_step=d.get("current_step", 0),
             error=d.get("error"),
             plan_version=d.get("plan_version"),
+            revision=int(d.get("revision", 0)),
             approvals=list(d.get("approvals", []) or []),
             lock_wait=dict(d["lock_wait"]) if d.get("lock_wait") else None,
             created_at=d.get("created_at", utcnow()),
