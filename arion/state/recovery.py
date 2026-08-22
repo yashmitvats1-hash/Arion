@@ -96,4 +96,12 @@ class RecoveryStore(Protocol):
     def list_recoveries(self, status: str | None = None,
                         goal_id: str | None = None,
                         task_id: str | None = None) -> list[MutationRecovery]: ...
-    def update_recovery(self, recovery: MutationRecovery) -> None: ...
+    def update_recovery(self, recovery: MutationRecovery) -> None:
+        """Refresh diagnostic reason without changing status or decision provenance."""
+        ...
+    def transition_recovery(
+        self, recovery: MutationRecovery,
+        expected_status: RecoveryStatus,
+    ) -> bool:
+        """Conditionally commit one legal recovery status transition."""
+        ...

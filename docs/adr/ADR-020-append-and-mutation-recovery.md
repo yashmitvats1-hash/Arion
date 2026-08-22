@@ -40,7 +40,9 @@ before the write path is production-honest:
   via the persisted goal row). A planner emitting a new plan cannot clear it;
   memory/reflection/guidance cannot clear it (no code path).
 - **Transition (`engine.acknowledge_recovery`):** explicit caller/action,
-  durable, audited (`recovery.acknowledged`), restart-safe. It ONLY records
+  durable, audited (`recovery.acknowledged`), restart-safe. ADR-043 later made
+  REQUIRED→ACKNOWLEDGED an expected-status CAS with one winner and immutable
+  decision provenance. It ONLY records
   "the previous failed mutation has been handled" and unblocks the goal. It
   cannot execute a capability, cannot grant authorization, cannot reuse or
   resurrect approvals, cannot erase the failure history. After

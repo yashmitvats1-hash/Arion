@@ -535,7 +535,23 @@ class ArionEngine:
         rec.status = RecoveryStatus.ACKNOWLEDGED
         rec.acknowledged_at = utcnow()
         rec.acknowledged_by = actor
-        self.recovery_store.update_recovery(rec)
+        transition = getattr(self.recovery_store, "transition_recovery", None)
+        if not callable(transition):
+            raise RecoveryError(
+                "recovery store lacks conditional acknowledgement support "
+                "(fail closed)"
+            )
+        if not transition(rec, RecoveryStatus.REQUIRED):
+            actual = self.recovery_store.get_recovery(recovery_id)
+            state = actual.status.value if actual is not None else "missing"
+            if actual is not None and actual.status == RecoveryStatus.ACKNOWLEDGED:
+                raise RecoveryError(
+                    f"recovery {recovery_id} is already acknowledged"
+                )
+            raise RecoveryError(
+                f"recovery {recovery_id} acknowledgement conflicts with "
+                f"durable state {state}"
+            )
         self._emit("recovery.acknowledged", task_id=rec.task_id,
                    step_id=f"{rec.task_id}:{rec.step_index}", detail={
                        "recovery_id": rec.recovery_id,

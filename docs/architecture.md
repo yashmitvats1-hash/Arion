@@ -495,7 +495,9 @@ loop (ADR-016):
   (SQLite `mutation_recoveries` table). A failed non-retry-safe mutation
   durably records `REQUIRED` and attaches a `recovery_required` goal blocker;
   `run_goal` blocks fresh planning until an explicit, durable, audited,
-  restart-safe `acknowledge_recovery(recovery_id, actor)` transition.
+  restart-safe `acknowledge_recovery(recovery_id, actor)` transition. That
+  REQUIRED→ACKNOWLEDGED write is conditional and single-winner; stale snapshots
+  cannot reverse it or rewrite winning actor/time (ADR-043).
   Recovery is a GATE, never an authorization: after acknowledging, a fresh
   task still needs its own approval; expired/denied approvals stay
   expired/denied; failure history is never erased; memory/reflection/
@@ -1265,6 +1267,25 @@ ordering and reconciliation:
 Approval decision transactions, mutation lock/waiter ownership, scheduler
 claims, and Phase 32 task fencing remain unchanged. See
 [`ADR-041`](adr/ADR-041-persistence-crash-consistency.md).
+
+## Atomic recovery acknowledgement (ADR-043)
+
+Recovery acknowledgement now follows the same conditional-transition discipline
+as goals, tasks, approvals, locks, and scheduler ownership:
+
+- SQLite commits REQUIRED→ACKNOWLEDGED under `BEGIN IMMEDIATE` with an
+  expected-status predicate;
+- concurrent acknowledgements have one winner, one durable actor/time, and one
+  success event;
+- stale REQUIRED snapshots cannot reverse a committed acknowledgement;
+- compatibility `update_recovery` can refresh only the bounded diagnostic
+  reason for the current status, never status or acknowledgement provenance;
+- failed conditional writes emit no success event and do not clear goal
+  blockers;
+- acknowledgement remains a recovery gate only and never grants capability
+  authorization.
+
+See [`ADR-043`](adr/ADR-043-atomic-recovery-acknowledgement.md).
 
 ## Bounded full-checkpoint history (ADR-036)
 

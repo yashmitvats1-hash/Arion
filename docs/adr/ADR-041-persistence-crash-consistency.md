@@ -156,7 +156,8 @@ existing lock-contention resolver. The engine wires it to the authoritative
 recovery registry. `recheck_blockers()` drops a recovery blocker only when its
 record is no longer REQUIRED and no other REQUIRED record exists for the goal.
 This repairs acknowledgement-before-cleanup crashes without changing who may
-acknowledge recovery.
+acknowledge recovery. ADR-043 later made that acknowledgement itself a
+single-winner expected-status transition.
 
 ### Legacy revision promotion
 

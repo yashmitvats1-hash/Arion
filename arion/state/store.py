@@ -1095,13 +1095,68 @@ class SQLiteStorage:
 
     @_threadsafe
     def update_recovery(self, recovery: "MutationRecovery") -> None:
-        self._conn.execute(
-            "UPDATE mutation_recoveries SET status=?, acknowledged_at=?, acknowledged_by=?, "
-            "reason=? WHERE recovery_id=?",
-            (recovery.status.value, recovery.acknowledged_at, recovery.acknowledged_by,
-             recovery.reason, recovery.recovery_id),
+        """Refresh one recovery row without changing its durable status.
+
+        Compatibility callers may update the bounded diagnostic reason for the
+        state they loaded. Status and acknowledgement actor/time are immutable
+        here; a stale object cannot reverse or rewrite a decision (ADR-043).
+        """
+        from arion.state.recovery import RecoveryError
+
+        cursor = self._conn.execute(
+            "UPDATE mutation_recoveries SET reason=? "
+            "WHERE recovery_id=? AND status=?",
+            (recovery.reason, recovery.recovery_id, recovery.status.value),
         )
         self._conn.commit()
+        if cursor.rowcount == 1:
+            return
+        row = self._conn.execute(
+            "SELECT status FROM mutation_recoveries WHERE recovery_id=?",
+            (recovery.recovery_id,),
+        ).fetchone()
+        if row is None:
+            raise RecoveryError(
+                f"unknown recovery id: {recovery.recovery_id}"
+            )
+        raise RecoveryError(
+            f"stale recovery status for {recovery.recovery_id}: "
+            f"object={recovery.status.value}, durable={row[0]} (fail closed)"
+        )
+
+    @_threadsafe
+    def transition_recovery(
+        self,
+        recovery: "MutationRecovery",
+        expected_status: "RecoveryStatus",
+    ) -> bool:
+        """CAS the only legal recovery transition: REQUIRED -> ACKNOWLEDGED."""
+        from arion.state.recovery import RecoveryError, RecoveryStatus
+
+        if (expected_status != RecoveryStatus.REQUIRED
+                or recovery.status != RecoveryStatus.ACKNOWLEDGED):
+            raise RecoveryError(
+                f"invalid recovery transition {expected_status.value} -> "
+                f"{recovery.status.value} for {recovery.recovery_id} "
+                f"(fail closed)"
+            )
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            cursor = self._conn.execute(
+                "UPDATE mutation_recoveries SET status=?, acknowledged_at=?, "
+                "acknowledged_by=?, reason=? WHERE recovery_id=? AND status=?",
+                (recovery.status.value, recovery.acknowledged_at,
+                 recovery.acknowledged_by, recovery.reason,
+                 recovery.recovery_id, expected_status.value),
+            )
+            if cursor.rowcount != 1:
+                self._conn.rollback()
+                return False
+            self._conn.commit()
+            return True
+        except Exception:
+            self._conn.rollback()
+            raise
 
     # ---- advisory mutation locks (ADR-021) ----
 
