@@ -57,6 +57,8 @@ class GoalManager:
         lock_contention_resolver: Any | None = None,  # ADR-021: callable(blocker)->bool;
                                                       # True when a lock_contention blocker
                                                       # may clear (lock no longer active)
+        recovery_required_resolver: Any | None = None,  # ADR-041: callable(blocker)->bool;
+                                                        # True when no REQUIRED row remains
     ):
         self.storage = storage
         self.cognitive_store = cognitive_store
@@ -65,6 +67,7 @@ class GoalManager:
         self.progress_evaluator = progress_evaluator or DeterministicProgressEvaluator()
         self.world_monitor = world_monitor
         self.lock_contention_resolver = lock_contention_resolver
+        self.recovery_required_resolver = recovery_required_resolver
 
     # ------------------------------------------------------------------ #
     # Goal lifecycle
@@ -421,6 +424,13 @@ class GoalManager:
                     # longer actively locked (resolved via the engine's live lock
                     # store - the lock store is the only lock authority).
                     if self.lock_contention_resolver is not None and self.lock_contention_resolver(b):
+                        dropped_keys.add(key)
+                elif key == "recovery_required":
+                    # ADR-041: acknowledgement may commit before goal-blocker
+                    # cleanup. The recovery registry remains authoritative and
+                    # restart reconciliation drops only a stale mirror.
+                    if (self.recovery_required_resolver is not None
+                            and self.recovery_required_resolver(b)):
                         dropped_keys.add(key)
             if not dropped_keys:
                 return False

@@ -1237,6 +1237,31 @@ goal-level state. In-flight arbitrary capability code is not preempted, but its
 return cannot turn work under a cancelled goal into a completed task. See
 [`ADR-040`](adr/ADR-040-task-lifecycle-revision-fencing.md).
 
+## Persistence crash consistency (ADR-041)
+
+Logical lifecycle changes may span several individually transactional tables.
+The default SQLite path now gives the safety-critical combinations explicit
+ordering and reconciliation:
+
+- recovery REQUIRED create/adopt and its failed task revision commit in one
+  `BEGIN IMMEDIATE` transaction; a stale task CAS retains recovery authority;
+- recovery-only fallback remains valid, and a temporary recovery-table outage
+  terminalizes a task repair marker that recreates REQUIRED state before a
+  later replan;
+- `recovery_required` goal blockers reconcile against the live recovery
+  registry after acknowledgement-before-cleanup crashes;
+- worker task results and approval-pause state commit before scheduler work
+  reports terminal completion;
+- default SQLite promotes task revision zero to revision one on startup, so a
+  stale legacy checkpoint cannot win executable parameter authority;
+- checkpoint insertion remains separate from task CAS because failure on either
+  side already converges safely; pruning remains atomic, best effort, and
+  strictly post-checkpoint.
+
+Approval decision transactions, mutation lock/waiter ownership, scheduler
+claims, and Phase 32 task fencing remain unchanged. See
+[`ADR-041`](adr/ADR-041-persistence-crash-consistency.md).
+
 ## Bounded full-checkpoint history (ADR-036)
 
 Recovery continues to use complete task snapshots; only historical count is
@@ -1246,7 +1271,9 @@ bounded:
 - each checkpoint remains a complete, directly restorable `Task` snapshot;
 - runtime resume still reads only the latest checkpoint, but task revision
   precedence is authoritative: terminal/newer task rows cannot be replaced by
-  later-inserted stale snapshots; timestamp fallback is legacy-only (ADR-040);
+  later-inserted stale snapshots; default SQLite promotes legacy revision-zero
+  task rows at startup, leaving timestamp fallback only for alternate legacy
+  stores (ADR-040/041);
 - after a new checkpoint commits, SQLite retains the newest eight checkpoints
   for that task through the optional `CheckpointRetentionStore` capability;
 - pruning is best effort and occurs after durability, so its only failure mode

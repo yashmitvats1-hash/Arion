@@ -98,6 +98,9 @@ def _iso_plus(iso: str, seconds: float) -> str:
     return (dt + timedelta(seconds=seconds)).isoformat()
 
 
+_RECOVERY_PERSISTENCE_MARKER = "mutation recovery persistence failed"
+
+
 class ArionEngine:
     """Drives goals through the full task lifecycle with checkpointing."""
 
@@ -267,6 +270,7 @@ class ArionEngine:
         if self.goal_manager is not None:
             try:
                 self.goal_manager.lock_contention_resolver = self._lock_contention_resolver
+                self.goal_manager.recovery_required_resolver = self._recovery_blocker_resolver
             except Exception:
                 pass
 
@@ -285,6 +289,48 @@ class ArionEngine:
             r.status == RecoveryStatus.REQUIRED
             for r in self.recovery_store.list_recoveries(goal_id=goal_id)
         )
+
+    def _recovery_blocker_resolver(self, blocker: dict) -> bool:
+        """A recovery blocker clears only after all REQUIRED rows are gone."""
+        if self.recovery_store is None:
+            return False
+        try:
+            recovery_id = blocker.get("recovery_id")
+            record = (
+                self.recovery_store.get_recovery(recovery_id)
+                if recovery_id else None
+            )
+            if record is not None and record.status == RecoveryStatus.REQUIRED:
+                return False
+            goal_id = record.goal_id if record is not None else None
+            if not goal_id:
+                task_id = blocker.get("task_id")
+                task = self.storage.load_task(task_id) if task_id else None
+                goal_id = task.goal_id if task is not None else None
+            return bool(goal_id) and not self._has_open_recovery(goal_id)
+        except Exception:
+            return False
+
+    def _reconcile_missing_recovery_records(self, goal_id: str) -> None:
+        """Repair a task-only fallback after recovery-table unavailability."""
+        if self.recovery_store is None:
+            return
+        for task in self.storage.list_tasks(status=TaskStatus.FAILED.value):
+            if task.goal_id != goal_id:
+                continue
+            step = task.active_step or next(
+                (candidate for candidate in task.steps
+                 if candidate.status == StepStatus.FAILED),
+                None,
+            )
+            text = " ".join(filter(None, [task.error,
+                                           step.error if step else None]))
+            if _RECOVERY_PERSISTENCE_MARKER not in text or step is None:
+                continue
+            spec = self.registry.action_spec(step.capability, step.action)
+            if spec is None or getattr(spec, "side_effects", "") != "mutating":
+                continue
+            self._record_recovery_required(task, step, spec, step.error or task.error or text)
 
     def _fence_task_on_open_recovery(self, task: Task) -> bool:
         """Fail a non-terminal task closed when REQUIRED recovery exists.
@@ -332,33 +378,107 @@ class ArionEngine:
 
     def _record_recovery_required(self, task: Task, step: PlanStep, spec,
                                   reason: str) -> MutationRecovery | None:
-        """Durably record that a non-retry-safe mutation failed (ADR-020).
+        """Durably commit recovery authority and its failed-task mirror.
 
-        Idempotent per (task_id, step_index): a REQUIRED record is never
-        duplicated. Also gates the goal durably with a `recovery_required`
-        blocker so no fresh plan can proceed until the operator explicitly
-        acknowledges the recovery. The record carries bounded metadata only.
+        The default SQLite store performs the recovery create/adopt and task
+        revision transition in one transaction.  A stale task CAS never rolls
+        back recovery authority. Alternate stores retain create-then-save
+        compatibility; the durable recovery record still wins that split.
         """
         if self.recovery_store is None:
             return None
-        existing = [
-            r for r in self.recovery_store.list_recoveries(task_id=task.id)
-            if r.step_index == step.index and r.status == RecoveryStatus.REQUIRED
-        ]
-        rec = existing[0] if existing else None
-        if rec is None:
-            resource = step.params.get(spec.resource_param) if getattr(spec, "resource_param", None) else None
-            rec = MutationRecovery(
-                recovery_id=new_id("recovery"),
-                task_id=task.id,
-                goal_id=task.goal_id,
-                step_index=step.index,
-                capability=step.capability,
-                action=step.action,
-                resource=resource if isinstance(resource, str) else None,
-                reason=(reason or "mutation failed; recovery required")[:500],
-            )
-            self.recovery_store.create_recovery(rec)
+        bounded_reason = (reason or "mutation failed; recovery required")[:500]
+        if step.status != StepStatus.FAILED:
+            step.status = StepStatus.FAILED
+            step.result = None
+        step.error = step.error or bounded_reason
+        task.status = TaskStatus.FAILED
+        task.error = step.error
+        task.completed_at = task.completed_at or utcnow()
+        resource = (
+            step.params.get(spec.resource_param)
+            if getattr(spec, "resource_param", None) else None
+        )
+        candidate = MutationRecovery(
+            recovery_id=new_id("recovery"),
+            task_id=task.id,
+            goal_id=task.goal_id,
+            step_index=step.index,
+            capability=step.capability,
+            action=step.action,
+            resource=resource if isinstance(resource, str) else None,
+            reason=bounded_reason,
+        )
+        created = False
+        expected_revision = task.revision
+        commit = getattr(
+            self.recovery_store, "commit_recovery_requirement", None
+        )
+        try:
+            if callable(commit):
+                rec, created, task_committed = commit(
+                    candidate, task, expected_revision
+                )
+                if not task_committed:
+                    canonical = self.storage.load_task(task.id)
+                    if canonical is not None:
+                        task.__dict__.update(canonical.__dict__)
+            else:
+                existing = [
+                    record for record in self.recovery_store.list_recoveries(
+                        task_id=task.id
+                    )
+                    if (record.step_index == step.index
+                        and record.status == RecoveryStatus.REQUIRED)
+                ]
+                if existing:
+                    rec = existing[0]
+                else:
+                    rec = self.recovery_store.create_recovery(candidate) or candidate
+                    created = rec.recovery_id == candidate.recovery_id
+                try:
+                    self.storage.save_task(task)
+                except TaskStateError:
+                    canonical = self.storage.load_task(task.id)
+                    if canonical is not None:
+                        task.__dict__.update(canonical.__dict__)
+        except Exception as atomic_error:
+            # If the combined write failed because the task companion could
+            # not commit, retain recovery authority independently. This is the
+            # Phase 32 fail-safe direction: recovery may exist without its task
+            # mirror, never the reverse.
+            try:
+                rec = self.recovery_store.create_recovery(candidate) or candidate
+                created = rec.recovery_id == candidate.recovery_id
+            except Exception:
+                # Last durable fallback when the recovery table itself is
+                # unavailable: terminalize the task with a repair marker. On a
+                # later run_goal, reconciliation recreates the REQUIRED row
+                # before any replan can execute.
+                task.status = TaskStatus.FAILED
+                task.error = sanitize_error_text(
+                    f"{_RECOVERY_PERSISTENCE_MARKER}; recovery required: "
+                    f"{bounded_reason}",
+                    max_length=500,
+                )
+                step.status = StepStatus.FAILED
+                step.error = task.error
+                task.completed_at = task.completed_at or utcnow()
+                try:
+                    self.storage.save_task(task)
+                except TaskStateError:
+                    canonical = self.storage.load_task(task.id)
+                    if canonical is not None:
+                        task.__dict__.update(canonical.__dict__)
+                raise atomic_error
+            try:
+                self.storage.save_task(task)
+            except Exception:
+                canonical = self.storage.load_task(task.id)
+                if canonical is not None:
+                    task.__dict__.update(canonical.__dict__)
+
+        if created:
             self._emit("recovery.required", task_id=task.id, step_id=_step_id(step),
                        success=False, detail={
                            "recovery_id": rec.recovery_id,
@@ -371,7 +491,8 @@ class ArionEngine:
                            "reason": rec.reason[:200],
                        })
         # Durable goal gate: no fresh plan/task until this recovery is
-        # explicitly acknowledged. Idempotent by blocker key.
+        # explicitly acknowledged. Idempotent by blocker key. A crash before
+        # this mirror is repaired by recovery_required_resolver/_block_on_open.
         if self.goal_manager is not None and task.goal_id:
             try:
                 self.goal_manager.set_blocked(task.goal_id, {
@@ -380,12 +501,19 @@ class ArionEngine:
                     "step_index": step.index,
                     "capability": step.capability,
                     "action": step.action,
-                    "resource": step.params.get(spec.resource_param) if getattr(spec, "resource_param", None) else None,
+                    "resource": resource,
                     "recovery_id": rec.recovery_id,
                     "reason": "mutation failed; recovery required (non-retry-safe)",
                 }, reason="recovery_required")
             except Exception:
                 pass
+        if task.status == TaskStatus.FAILED:
+            self._emit("task.failed", task_id=task.id, detail={
+                "step_index": step.index,
+                "error": task.error,
+                "recovery_required": True,
+            })
+            self._record_memory(task)
         return rec
 
     def acknowledge_recovery(self, recovery_id: str, actor: str = "operator") -> MutationRecovery:
@@ -1401,6 +1529,13 @@ class ArionEngine:
         explicitly acknowledges the recovery. Recovery is a GATE, never an
         authorization - a fresh plan still needs its own approval.
         """
+        # A prior recovery-table outage may have left only the terminal task
+        # repair marker. Recreate the REQUIRED authority before deciding that
+        # the goal is clear to replan.
+        try:
+            self._reconcile_missing_recovery_records(goal_id)
+        except Exception:
+            return True  # persistence could not be verified; fail closed
         if not self._has_open_recovery(goal_id):
             return False
         goal = gm.get_goal(goal_id)
@@ -3085,6 +3220,7 @@ class ArionEngine:
                 with self._inflight_lock:
                     self._claimed_work.pop(work_id, None)
                 return
+        persistence_error: BaseException | None = None
         try:
             if (not self._fail_task_for_terminal_goal(
                     task, step, phase="worker start")
@@ -3106,28 +3242,47 @@ class ArionEngine:
                         "category": "scheduler_ownership",
                     },
                 )
+
+            # ADR-041 ordering: task execution/approval-pause state becomes
+            # durable before scheduler work advertises a terminal outcome.
+            # If task persistence fails, the work row is FAILED (or remains
+            # lease-recoverable after a hard kill), never false-COMPLETED.
+            if (task.status == TaskStatus.AWAITING_APPROVAL
+                    or step.status in (
+                        StepStatus.SUCCEEDED, StepStatus.FAILED,
+                        StepStatus.SKIPPED,
+                    )):
+                try:
+                    durable = self.storage.load_task(task.id)
+                    if (durable is None
+                            or durable.status not in TASK_TERMINAL_STATUSES):
+                        self.storage.save_task(task)
+                    else:
+                        task.__dict__.update(durable.__dict__)
+                except BaseException as exc:
+                    persistence_error = exc
+
             if work_id is not None and self.scheduler_registry is not None:
-                # The WORK unit finished: FAILED only when the step failed;
-                # SUCCEEDED/SKIPPED AND approval-paused steps are COMPLETED
-                # work (the task snapshot remains execution authority).
-                terminal = (SchedulerWorkStatus.FAILED
-                            if step.status == StepStatus.FAILED
-                            else SchedulerWorkStatus.COMPLETED)
+                terminal = (
+                    SchedulerWorkStatus.FAILED
+                    if (step.status == StepStatus.FAILED
+                        or persistence_error is not None)
+                    else SchedulerWorkStatus.COMPLETED
+                )
                 try:
                     self.scheduler_registry.mark_terminal(
-                        work_id, terminal, error=step.error,
+                        work_id, terminal,
+                        error=(step.error or (
+                            "task persistence failed"
+                            if persistence_error is not None else None
+                        )),
                         now=self._lock_now(), owner_worker_id=worker_id)
                 except Exception:
                     pass  # the durable step/task state is the authority
                 with self._inflight_lock:
                     self._claimed_work.pop(work_id, None)
-        if step.status in (StepStatus.SUCCEEDED, StepStatus.FAILED,
-                           StepStatus.SKIPPED):
-            durable = self.storage.load_task(task.id)
-            if durable is None or durable.status not in TASK_TERMINAL_STATUSES:
-                self.storage.save_task(task)
-            else:
-                task.__dict__.update(durable.__dict__)
+            if persistence_error is not None:
+                raise persistence_error
 
     def _execute_step(self, task: Task, step: PlanStep) -> None:
         self._emit(
@@ -3533,14 +3688,22 @@ class ArionEngine:
                         StepStatus.SUCCEEDED, StepStatus.FAILED,
                         StepStatus.SKIPPED):
                     try:
-                        self.storage.save_task(task)
-                    except TaskStateError as exc:
+                        durable = self.storage.load_task(task.id)
+                        if (durable is not None
+                                and durable.status in TASK_TERMINAL_STATUSES):
+                            task.__dict__.update(durable.__dict__)
+                        else:
+                            self.storage.save_task(task)
+                    except Exception as exc:
                         persistence_error = exc
                         if not getattr(spec, "retry_safe", False):
-                            self._record_recovery_required(
-                                task, step, spec,
-                                f"mutation task revision lost: {exc}",
-                            )
+                            try:
+                                self._record_recovery_required(
+                                    task, step, spec,
+                                    f"mutation task persistence lost: {exc}",
+                                )
+                            except Exception:
+                                pass  # task marker/recovery fallback already attempted
                 self._release_mutation_lock(lock, task, step)
                 if persistence_error is not None:
                     raise persistence_error

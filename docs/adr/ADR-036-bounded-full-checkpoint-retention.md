@@ -58,9 +58,11 @@ Recovery ordering is intentional:
 
 - after a successful verified step, the task row is saved and then a full
   checkpoint is inserted;
-- if a crash occurs between those writes, the newer task row wins;
-- once checkpoint insertion completes, the newer/equal checkpoint wins;
-- approval resolution writes a newer task row, so it wins over the pending
+- if a crash occurs between those writes, the task row retains progress;
+- ADR-040/041 later made the revisioned task row authoritative and promoted
+  default-SQLite legacy revision-zero rows, so a checkpoint cannot mint newer
+  executable state or win solely by insertion timestamp;
+- approval resolution writes a newer task revision, so it wins over the pending
   checkpoint;
 - lock-wait checkpoints preserve deadline, attempts, waiter/queue metadata,
   and task state;

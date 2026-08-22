@@ -334,6 +334,14 @@ class SQLiteStorage:
             self._conn.execute(
                 "ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
             )
+        # ADR-041: default SQLite always promotes legacy revision-zero rows to
+        # a real CAS generation.  The column is authoritative over the legacy
+        # JSON snapshot, so historical task/checkpoint payloads are not
+        # rewritten and stale revision-zero checkpoints lose timestamp
+        # authority immediately on reopen.
+        self._conn.execute(
+            "UPDATE tasks SET revision=1 WHERE revision=0"
+        )
 
     @_threadsafe
     def _migrate_approvals(self) -> None:
@@ -948,13 +956,112 @@ class SQLiteStorage:
     )
 
     @_threadsafe
-    def create_recovery(self, recovery: "MutationRecovery") -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO mutation_recoveries "
-            f"({', '.join(self._RECOVERY_COLS)}) VALUES ({', '.join('?' * len(self._RECOVERY_COLS))})",
-            _recovery_row(recovery),
-        )
-        self._conn.commit()
+    def create_recovery(self, recovery: "MutationRecovery") -> "MutationRecovery":
+        """Transactionally create or adopt one REQUIRED record per task/step."""
+        from arion.state.recovery import RecoveryStatus
+
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            if recovery.status == RecoveryStatus.REQUIRED:
+                row = self._conn.execute(
+                    f"SELECT {', '.join(self._RECOVERY_COLS)} "
+                    "FROM mutation_recoveries WHERE task_id=? AND step_index=? "
+                    "AND status=? ORDER BY rowid LIMIT 1",
+                    (recovery.task_id, recovery.step_index,
+                     RecoveryStatus.REQUIRED.value),
+                ).fetchone()
+                if row is not None:
+                    self._conn.commit()
+                    return _recovery_from_row(row)
+            self._conn.execute(
+                "INSERT INTO mutation_recoveries "
+                f"({', '.join(self._RECOVERY_COLS)}) "
+                f"VALUES ({', '.join('?' * len(self._RECOVERY_COLS))})",
+                _recovery_row(recovery),
+            )
+            self._conn.commit()
+            return recovery
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_threadsafe
+    def commit_recovery_requirement(
+        self,
+        recovery: "MutationRecovery",
+        task: Task,
+        expected_task_revision: int,
+    ) -> tuple["MutationRecovery", bool, bool]:
+        """Commit recovery authority and its failed-task mirror together.
+
+        The REQUIRED record always wins: if the task revision is stale or the
+        task is already terminal, the transaction still commits the recovery
+        record so Phase 32 fencing cannot be weakened.  Returns
+        ``(canonical_recovery, created, task_committed)``.
+        """
+        from arion.state.recovery import RecoveryStatus
+
+        if (recovery.status != RecoveryStatus.REQUIRED
+                or recovery.task_id != task.id
+                or task.status != TaskStatus.FAILED
+                or isinstance(expected_task_revision, bool)
+                or not isinstance(expected_task_revision, int)
+                or expected_task_revision < 0):
+            raise ValueError("invalid recovery/task atomic commit (fail closed)")
+        previous_revision = task.revision
+        previous_updated_at = task.updated_at
+        created = False
+        task_committed = False
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                f"SELECT {', '.join(self._RECOVERY_COLS)} "
+                "FROM mutation_recoveries WHERE task_id=? AND step_index=? "
+                "AND status=? ORDER BY rowid LIMIT 1",
+                (recovery.task_id, recovery.step_index,
+                 RecoveryStatus.REQUIRED.value),
+            ).fetchone()
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO mutation_recoveries "
+                    f"({', '.join(self._RECOVERY_COLS)}) "
+                    f"VALUES ({', '.join('?' * len(self._RECOVERY_COLS))})",
+                    _recovery_row(recovery),
+                )
+                canonical = recovery
+                created = True
+            else:
+                canonical = _recovery_from_row(row)
+
+            now = utcnow()
+            durable = self._conn.execute(
+                "SELECT status, revision FROM tasks WHERE id=?", (task.id,)
+            ).fetchone()
+            if (durable is not None
+                    and int(durable[1]) == expected_task_revision
+                    and TaskStatus(durable[0]) not in TASK_TERMINAL_STATUSES):
+                task.revision = expected_task_revision + 1
+                task.updated_at = now
+                cursor = self._conn.execute(
+                    "UPDATE tasks SET goal_id=?, description=?, status=?, "
+                    "snapshot=?, revision=?, updated_at=? "
+                    "WHERE id=? AND revision=? AND status NOT IN (?, ?)",
+                    (task.goal_id, task.description, task.status.value,
+                     json.dumps(task.to_dict()), task.revision, task.updated_at,
+                     task.id, expected_task_revision,
+                     TaskStatus.COMPLETED.value, TaskStatus.FAILED.value),
+                )
+                task_committed = cursor.rowcount == 1
+            self._conn.commit()
+            if not task_committed:
+                task.revision = previous_revision
+                task.updated_at = previous_updated_at
+            return canonical, created, task_committed
+        except Exception:
+            self._conn.rollback()
+            task.revision = previous_revision
+            task.updated_at = previous_updated_at
+            raise
 
     @_threadsafe
     def get_recovery(self, recovery_id: str) -> "MutationRecovery | None":

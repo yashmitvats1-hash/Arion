@@ -255,9 +255,11 @@ def test_legacy_task_rows_gain_revision_without_snapshot_rewrite(
 
     storage = SQLiteStorage(db)
     loaded = storage.load_task(legacy.id)
-    assert loaded.revision == 0
+    # ADR-041 promotes the task-table generation without rewriting the legacy
+    # JSON payload; the column remains authoritative.
+    assert loaded.revision == 1
     storage.save_task(loaded)
-    assert storage.load_task(legacy.id).revision == 1
+    assert storage.load_task(legacy.id).revision == 2
     storage.close()
 
 
@@ -516,6 +518,11 @@ def test_required_recovery_fences_task_after_split_crash(
     first = _engine(db, capability, "lifecycle:write")
     task = _seed(first, "recovery-gap", capability, "lifecycle:write")
     original_save = first.storage.save_task
+    original_commit = first.storage.commit_recovery_requirement
+
+    def split_after_recovery(recovery, candidate, expected_revision):
+        first.storage.create_recovery(recovery)
+        raise _Crash("recovery committed before task snapshot")
 
     def crash_failed_snapshot(candidate: Task) -> None:
         if (candidate.steps
@@ -523,9 +530,11 @@ def test_required_recovery_fences_task_after_split_crash(
             raise _Crash("recovery committed before task snapshot")
         original_save(candidate)
 
+    first.storage.commit_recovery_requirement = split_after_recovery
     first.storage.save_task = crash_failed_snapshot
     with pytest.raises(_Crash):
         first.run_task(task.id)
+    first.storage.commit_recovery_requirement = original_commit
     first.storage.save_task = original_save
     mid = first.storage.load_task(task.id)
     recoveries = first.storage.list_recoveries(task_id=task.id)

@@ -167,7 +167,9 @@ The lock is still released on the handled conflict path.
 
 - Existing databases receive one additive task column; no rows or checkpoints
   are rewritten.
-- Legacy task/checkpoint snapshots without `revision` remain readable.
+- Legacy task/checkpoint snapshots without `revision` remain readable. ADR-041
+  later promotes default-SQLite revision-zero task rows to revision one at
+  startup, without rewriting historical JSON.
 - Existing `Task` constructors remain valid because revision defaults to zero.
 - Approval request schemas and atomic decision semantics are unchanged.
 - Mutation lock identity, renewal, FIFO waiter adoption, cancellation, and
