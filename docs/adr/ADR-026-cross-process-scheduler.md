@@ -190,7 +190,8 @@ a crashed process never permanently consumes capacity.
 
 - ADR-040 closes the original same-task/live-peer gap: unexpired foreign rows
   are no longer abandoned, active workers renew their rows, and task revision
-  preflight prevents terminal-step replay.
+  preflight prevents terminal-step replay. ADR-042 later makes explicit
+  single-row reclaim atomically require lease expiry, including the CLI path.
 - Global capacity is a single durable config; per-goal shares were added by
   later scheduler ADRs.
 - Without an explicitly configured `global_max_concurrency`, cross-process

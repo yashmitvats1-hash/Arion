@@ -725,9 +725,13 @@ loop (ADR-016):
   prevents a hot claimer from monopolizing capacity; unset cap preserves
   ADR-025 behavior exactly.
 - **Crash recovery:** dead registrations → QUEUED rows abandoned; expired
-  leases → RUNNING rows reclaimed (no immortal RUNNING); stale mutation
-  locks reclaimed via the existing lock store; completed mutations never
-  replay; approval/recovery gates unchanged.
+  leases → RUNNING rows reclaimed (no immortal RUNNING). Single-row reclaim is
+  an atomic store decision: status and `lease_expires_at <= now` are checked in
+  the same `BEGIN IMMEDIATE` transition, so a renewed live row cannot be
+  abandoned from a stale CLI observation. Owner completion/failure and atomic
+  handoff likewise require `lease_expires_at > now`; expired owners cannot
+  terminalize work or claim next (ADR-042). Stale mutation locks remain governed
+  by the existing exact-owner lock store; approval/recovery gates are unchanged.
 - **Thread safety:** `SQLiteCognitiveStore`/`SQLiteMemoryStore` gained the
   same RLock + `check_same_thread=False` guard as `SQLiteStorage`.
 - **Demo:** `scripts/demo_adr026_cross_process_scheduler.py` (33 checks,

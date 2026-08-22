@@ -180,7 +180,8 @@ def test_forged_ownership_transition_from_terminal_rejected(db_path: str):
     reg = SQLiteStorage(db_path)
     row = _claim(reg, worker="w1")
     reg.mark_terminal(row.work_id, SchedulerWorkStatus.FAILED,
-                      error="real failure", owner_worker_id="w1")
+                      error="real failure", now=_iso_plus(T0, 1),
+                      owner_worker_id="w1")
     # no transition out of a terminal state, not even with the owner id
     for target in (SchedulerWorkStatus.COMPLETED, SchedulerWorkStatus.RUNNING,
                    SchedulerWorkStatus.CANCELLED, SchedulerWorkStatus.ABANDONED):

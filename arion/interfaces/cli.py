@@ -419,10 +419,10 @@ def _scheduler_command(args, engine) -> int:
     Reads the DURABLE scheduler/work registry through the domain store only -
     never raw SQLite. Output is bounded, metadata-only, secret-free and
     restart-safe (it reflects the durable rows, not live engine memory).
-    Unknown work ids fail closed (non-zero exit). Reclaim only moves a STALE
-    RUNNING row (lease expired) to ABANDONED; it never executes anything and
-    never authorizes a mutation - abandoned work re-runs the full fresh
-    authorization/recovery path on the next engine run.
+    Unknown work ids fail closed (non-zero exit). Reclaim delegates to one
+    atomic store transition that moves only an expired RUNNING row to
+    ABANDONED; a renewed live row wins. Reclaim never executes or authorizes a
+    mutation—abandoned work re-runs the full fresh authorization/recovery path.
     """
     import json
 
@@ -536,22 +536,14 @@ def _scheduler_command(args, engine) -> int:
         return 0
 
     if args.scheduler_command == "reclaim":
-        from arion.state.scheduler_work import SchedulerStateError, SchedulerWorkStatus
+        from arion.state.scheduler_work import SchedulerStateError
 
-        work = store.get_work(args.work_id)
-        if work is None:
-            print(f"unknown scheduler work id: {args.work_id} (fail closed)")
-            return 1
-        if work.status != SchedulerWorkStatus.RUNNING:
-            print(f"work {args.work_id} is {work.status.value} (only RUNNING rows can be reclaimed)")
-            return 1
-        if work.lease_expires_at is None or work.lease_expires_at > engine._lock_now():
-            print(f"work {args.work_id} lease is still valid (expires {work.lease_expires_at}); "
-                  f"not reclaimed")
+        reclaim = getattr(store, "reclaim_work", None)
+        if not callable(reclaim):
+            print("scheduler registry lacks atomic single-row reclaim (fail closed)")
             return 1
         try:
-            store.mark_terminal(args.work_id, SchedulerWorkStatus.ABANDONED,
-                                now=engine._lock_now())
+            reclaim(args.work_id, now=engine._lock_now())
         except SchedulerStateError as exc:
             print(f"reclaim failed: {exc}")
             return 1

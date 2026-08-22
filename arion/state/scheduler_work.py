@@ -174,10 +174,10 @@ class SchedulerRegistry(Protocol):
     def mark_terminal(self, work_id: str, status: SchedulerWorkStatus,
                       error: str | None = None, now: str | None = None,
                       owner_worker_id: str | None = None) -> SchedulerWork:
-        """Transition to a legal terminal state (COMPLETED/FAILED/CANCELLED/
-        ABANDONED). RUNNING -> COMPLETED/FAILED REQUIRES owner_worker_id to
-        match the row's current owner (stale owners are rejected with a
-        typed error). Typed error on illegal or unknown transitions."""
+        """Transition to a legal terminal state. RUNNING -> COMPLETED/FAILED
+        requires the exact owner. RUNNING -> ABANDONED additionally requires
+        lease expiry at ``now``; use ``reclaim_work`` for explicit reclaim.
+        Typed error on live, illegal, or unknown transitions."""
         ...
 
     def get_work(self, work_id: str) -> SchedulerWork | None:
@@ -188,6 +188,12 @@ class SchedulerRegistry(Protocol):
                   task_id: str | None = None,
                   goal_id: str | None = None,
                   step_index: int | None = None) -> list[SchedulerWork]:
+        ...
+
+    def reclaim_work(self, work_id: str,
+                     now: str | None = None) -> SchedulerWork:
+        """Atomically reclaim one expired RUNNING row. A renewed/live row,
+        queued row, terminal row, or unknown id fails closed."""
         ...
 
     def reclaim_stale(self, now: str | None = None) -> list[str]:
@@ -264,10 +270,9 @@ class SchedulerRegistry(Protocol):
                                now: str | None = None,
                                max_lease_seconds: float | None = None,
                                ) -> tuple[SchedulerWork, SchedulerWork | None]:
-        """Atomic handoff: ownership-checked terminal transition of ONE row
-        AND claim of the next QUEUED row for this scheduler in ONE
-        transaction (release_and_select_next-style). Returns
-        (terminal_row, next_row_or_None)."""
+        """Atomic handoff: live-lease and ownership-checked terminal
+        transition of one row plus claim of the next QUEUED row in one
+        transaction. Expired owners cannot complete or claim next."""
         ...
 
     # ---- ADR-027: durable per-goal scheduling weights ----

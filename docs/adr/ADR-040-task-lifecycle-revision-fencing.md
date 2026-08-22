@@ -128,7 +128,8 @@ after terminal-row protection.
 
 `_admit_step()` calls the existing expiry-checked `reclaim_stale()` operation.
 A foreign row that remains `RUNNING` is live and cannot be abandoned or
-reclaimed by the new engine.
+reclaimed by the new engine. ADR-042 later applies the same atomic expiry
+predicate to explicit single-row/CLI reclaim.
 
 Workers synchronously validate their exact claim before capability execution
 and run a bounded daemon heartbeat until capability return. Work and scheduler

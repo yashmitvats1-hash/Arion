@@ -82,11 +82,17 @@ def test_running_to_terminal_states(db_path: str):
         work = _mk(reg)
         reg.mark_running(work.work_id, worker_id="w1", lease_seconds=60.0,
                          now="2026-01-01T00:01:00+00:00")
+        terminal_at = (
+            "2026-01-01T00:02:00+00:00"
+            if status == SchedulerWorkStatus.ABANDONED
+            else "2026-01-01T00:01:59+00:00"
+        )
         terminal = reg.mark_terminal(
-            work.work_id, status, error="boom" if status == SchedulerWorkStatus.FAILED else None,
-            now="2026-01-01T00:02:00+00:00", owner_worker_id="w1")
+            work.work_id, status,
+            error="boom" if status == SchedulerWorkStatus.FAILED else None,
+            now=terminal_at, owner_worker_id="w1")
         assert terminal.status == status
-        assert terminal.completed_at == "2026-01-01T00:02:00+00:00"
+        assert terminal.completed_at == terminal_at
         if status == SchedulerWorkStatus.FAILED:
             assert terminal.error == "boom"
 
@@ -196,7 +202,7 @@ def test_created_row_is_durable_across_reopen(db_path: str):
     reg.mark_running(work.work_id, worker_id="w1", lease_seconds=10.0,
                      now="2026-01-01T00:01:00+00:00")
     reg.mark_terminal(work.work_id, SchedulerWorkStatus.COMPLETED,
-                      now="2026-01-01T00:02:00+00:00", owner_worker_id="w1")
+                      now="2026-01-01T00:01:05+00:00", owner_worker_id="w1")
     again = _reg(db_path)
     loaded = again.get_work(work.work_id)
     assert loaded.status == SchedulerWorkStatus.COMPLETED

@@ -1738,50 +1738,89 @@ class SQLiteStorage:
                 raise SchedulerStateError(
                     f"{status.value} requires owner_worker_id for {work_id} "
                     f"(fail closed)")
+            now_value = now or utcnow()
             cur = self._conn.execute(
                 "UPDATE scheduler_work SET status=?, error=?, completed_at=?, "
-                "lease_expires_at=NULL WHERE work_id=? AND status=? AND worker_id=?",
-                (status.value, (error or "")[:500], now or utcnow(),
-                 work_id, SchedulerWorkStatus.RUNNING.value, owner_worker_id),
+                "lease_expires_at=NULL WHERE work_id=? AND status=? "
+                "AND worker_id=? AND lease_expires_at IS NOT NULL "
+                "AND lease_expires_at > ?",
+                (status.value, (error or "")[:500], now_value,
+                 work_id, SchedulerWorkStatus.RUNNING.value,
+                 owner_worker_id, now_value),
             )
             if cur.rowcount > 0:
                 self._sech_insert_in_tx(_audit_event(
                     kind=("work.completed" if status == SchedulerWorkStatus.COMPLETED
                           else "work.failed"),
-                    ts=now or utcnow(),
+                    ts=now_value,
                     detail={"work_id": work_id, "worker_id": owner_worker_id,
                             "outcome": status.value,
-                            "reason": (error or "")[:200], "ts": now or utcnow()}))
+                            "reason": (error or "")[:200], "ts": now_value}))
             self._conn.commit()
             if cur.rowcount == 0:
                 row = self._conn.execute(
-                    "SELECT work_id, status, worker_id FROM scheduler_work WHERE work_id=?",
+                    "SELECT work_id, status, worker_id, lease_expires_at "
+                    "FROM scheduler_work WHERE work_id=?",
                     (work_id,)).fetchone()
                 if row is None:
                     raise SchedulerStateError(
                         f"unknown scheduler work id {work_id} (fail closed)")
                 actual = SchedulerWorkStatus(row[1])
                 if actual == SchedulerWorkStatus.RUNNING:
+                    if row[2] != owner_worker_id:
+                        raise SchedulerStateError(
+                            f"stale owner: {work_id} is owned by {row[2]}, "
+                            f"not {owner_worker_id} (fail closed)")
                     raise SchedulerStateError(
-                        f"stale owner: {work_id} is owned by {row[2]}, "
-                        f"not {owner_worker_id} (fail closed)")
+                        f"stale owner: work {work_id} lease expired "
+                        f"{row[3]} before {now_value} (fail closed)"
+                    )
                 self._sys_assert_transition(work_id, status, actual)
             return self._sys_row(work_id)
+        now_value = now or utcnow()
         sources = self._sys_terminal_sources(status)
-        cur = self._conn.execute(
-            "UPDATE scheduler_work SET status=?, error=?, completed_at=?, "
-            "lease_expires_at=NULL WHERE work_id=? AND status IN (%s)"
-            % ",".join("?" * len(sources)),
-            (status.value, (error or "")[:500], now or utcnow(), work_id, *sources),
-        )
+        if status == SchedulerWorkStatus.ABANDONED:
+            observed = self.get_work(work_id)
+            if observed is None:
+                raise SchedulerStateError(
+                    f"unknown scheduler work id {work_id} (fail closed)"
+                )
+            if observed.status == SchedulerWorkStatus.RUNNING:
+                # The observation only selects the API. reclaim_work repeats
+                # status + expiry under BEGIN IMMEDIATE and emits telemetry in
+                # the same commit, so a concurrent renewal still wins.
+                return self.reclaim_work(work_id, now=now_value)
+            # QUEUED abandonment is administrative pre-execution cleanup.
+            cur = self._conn.execute(
+                "UPDATE scheduler_work SET status=?, error=?, completed_at=?, "
+                "lease_expires_at=NULL WHERE work_id=? AND status=?",
+                (status.value, (error or "")[:500], now_value, work_id,
+                 SchedulerWorkStatus.QUEUED.value),
+            )
+        else:
+            cur = self._conn.execute(
+                "UPDATE scheduler_work SET status=?, error=?, completed_at=?, "
+                "lease_expires_at=NULL WHERE work_id=? AND status IN (%s)"
+                % ",".join("?" * len(sources)),
+                (status.value, (error or "")[:500], now_value,
+                 work_id, *sources),
+            )
         self._conn.commit()
         if cur.rowcount == 0:
             row = self._conn.execute(
-                "SELECT work_id, status FROM scheduler_work WHERE work_id=?",
+                "SELECT work_id, status, lease_expires_at "
+                "FROM scheduler_work WHERE work_id=?",
                 (work_id,)).fetchone()
             if row is None:
                 raise SchedulerStateError(f"unknown scheduler work id {work_id} (fail closed)")
-            self._sys_assert_transition(work_id, status, SchedulerWorkStatus(row[1]))
+            actual = SchedulerWorkStatus(row[1])
+            if (status == SchedulerWorkStatus.ABANDONED
+                    and actual == SchedulerWorkStatus.RUNNING):
+                raise SchedulerStateError(
+                    f"work {work_id} lease is still valid "
+                    f"(expires {row[2]}); not reclaimed (fail closed)"
+                )
+            self._sys_assert_transition(work_id, status, actual)
         return self._sys_row(work_id)
 
     @staticmethod
@@ -1832,6 +1871,58 @@ class SQLiteStorage:
         sql += " ORDER BY created_at, work_id"
         rows = self._conn.execute(sql, params).fetchall()
         return [_sys_work_from_row(r) for r in rows]
+
+    @_threadsafe
+    def reclaim_work(self, work_id: str,
+                     now: str | None = None) -> SchedulerWork:
+        """Atomically reclaim one expired RUNNING work lease (ADR-042)."""
+        now = now or utcnow()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                "SELECT work_id, goal_id, worker_id, scheduler_id, status, "
+                "lease_expires_at FROM scheduler_work WHERE work_id=?",
+                (work_id,),
+            ).fetchone()
+            if row is None:
+                raise SchedulerStateError(
+                    f"unknown scheduler work id {work_id} (fail closed)"
+                )
+            status = SchedulerWorkStatus(row[4])
+            if status != SchedulerWorkStatus.RUNNING:
+                raise SchedulerStateError(
+                    f"work {work_id} is {status.value} "
+                    f"(only RUNNING rows can be reclaimed)"
+                )
+            expiry = row[5]
+            if expiry is None or expiry > now:
+                raise SchedulerStateError(
+                    f"work {work_id} lease is still valid "
+                    f"(expires {expiry}); not reclaimed"
+                )
+            cursor = self._conn.execute(
+                "UPDATE scheduler_work SET status=?, completed_at=?, "
+                "lease_expires_at=NULL WHERE work_id=? AND status=? "
+                "AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?",
+                (SchedulerWorkStatus.ABANDONED.value, now, work_id,
+                 SchedulerWorkStatus.RUNNING.value, now),
+            )
+            if cursor.rowcount != 1:
+                raise SchedulerStateError(
+                    f"work {work_id} changed during reclaim (fail closed)"
+                )
+            self._sech_insert_in_tx(_audit_event(
+                kind="work.reclaimed", ts=now,
+                detail={"work_id": row[0], "goal_id": row[1],
+                        "worker_id": row[2], "scheduler_id": row[3],
+                        "lease_expires_at": expiry,
+                        "reason": "lease_expired",
+                        "outcome": "reclaimed", "ts": now}))
+            self._conn.commit()
+            return self._sys_row(work_id)
+        except Exception:
+            self._conn.rollback()
+            raise
 
     @_threadsafe
     def reclaim_stale(self, now: str | None = None) -> list[str]:
@@ -2600,21 +2691,29 @@ class SQLiteStorage:
             self._conn.execute("BEGIN IMMEDIATE")
             cur = self._conn.execute(
                 "UPDATE scheduler_work SET status=?, error=?, completed_at=?, "
-                "lease_expires_at=NULL WHERE work_id=? AND status=? AND worker_id=?",
+                "lease_expires_at=NULL WHERE work_id=? AND status=? "
+                "AND worker_id=? AND lease_expires_at IS NOT NULL "
+                "AND lease_expires_at > ?",
                 (status.value, (error or "")[:500], now, work_id,
-                 SchedulerWorkStatus.RUNNING.value, owner_worker_id))
+                 SchedulerWorkStatus.RUNNING.value, owner_worker_id, now))
             if cur.rowcount == 0:
                 row = self._conn.execute(
-                    "SELECT status, worker_id FROM scheduler_work WHERE work_id=?",
+                    "SELECT status, worker_id, lease_expires_at "
+                    "FROM scheduler_work WHERE work_id=?",
                     (work_id,)).fetchone()
                 if row is None:
                     raise SchedulerStateError(
                         f"unknown scheduler work id {work_id} (fail closed)")
                 actual = SchedulerWorkStatus(row[0])
                 if actual == SchedulerWorkStatus.RUNNING:
+                    if row[1] != owner_worker_id:
+                        raise SchedulerStateError(
+                            f"stale owner: {work_id} is owned by {row[1]}, "
+                            f"not {owner_worker_id} (fail closed)")
                     raise SchedulerStateError(
-                        f"stale owner: {work_id} is owned by {row[1]}, "
-                        f"not {owner_worker_id} (fail closed)")
+                        f"stale owner: work {work_id} lease expired "
+                        f"{row[2]} before {now} (fail closed)"
+                    )
                 self._sys_assert_transition(work_id, status, actual)
             nxt = self._sys_claim_in_tx(worker_id, lease_seconds, now,
                                         max_lease_seconds, scheduler_id=scheduler_id)
