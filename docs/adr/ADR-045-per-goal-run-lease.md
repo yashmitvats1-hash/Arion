@@ -115,6 +115,9 @@ No lease is held across separate API calls. Approval/recovery/lock clean stops
 release it, so a later invocation may continue normally. ADR-046 later extended
 the same lease boundary to direct `run_task`/CLI resume and public `run_tasks`,
 while goal-owned loops use internal owned task methods to avoid self-contention.
+ADR-052 later carries the exact acquired identity through those owned paths and
+synchronously fences plan/task publication, dispatch, and completion after
+heartbeat ownership is lost.
 
 ### Compatibility
 

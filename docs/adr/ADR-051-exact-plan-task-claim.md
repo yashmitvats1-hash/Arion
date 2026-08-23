@@ -16,7 +16,9 @@ read: no task implements (goal_id, plan_version)
 
 Per-goal leases normally serialize this path, but a suspended owner can lose its
 lease after the read and later continue. Task revision CAS is per task ID, so two
-random IDs do not conflict.
+random IDs do not conflict. ADR-052 later prevents that stale invocation from
+crossing plan/task publication or dispatch boundaries at all; this exact-plan
+claim remains the independent database deduplication backstop.
 
 The audit baseline was **1,427 passed, 2 skipped** at local and remote commit
 `addcc35`.

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import threading as _threading
+from dataclasses import dataclass
 from typing import Any
 
 from arion.capabilities.observations import normalize_observation
@@ -100,6 +101,30 @@ def _iso_plus(iso: str, seconds: float) -> str:
 
 
 _RECOVERY_PERSISTENCE_MARKER = "mutation recovery persistence failed"
+
+
+@dataclass
+class _GoalRunLease:
+    """Exact per-goal orchestration owner carried through an owned call.
+
+    ``lock_id`` plus ``owner_id`` are the authority.  The heartbeat keeps that
+    authority live; synchronous validation at execution boundaries decides
+    whether the invocation may continue (ADR-052).
+    """
+
+    goal_id: str
+    lock: Any | None
+    heartbeat: Any = None
+    lost: bool = False
+    loss_event_emitted: bool = False
+
+    # Preserve the private tuple-like seam used by existing deterministic
+    # lease tests while production code carries the explicit guard object.
+    def __getitem__(self, index: int) -> Any:
+        return (self.lock, self.heartbeat)[index]
+
+    def __iter__(self):
+        return iter((self.lock, self.heartbeat))
 
 
 class ArionEngine:
@@ -574,7 +599,95 @@ class ArionEngine:
                 pass
         return self.recovery_store.get_recovery(recovery_id)
 
-    # ---------- per-goal run ownership (ADR-045) ----------
+    # ---------- per-goal run ownership (ADR-045/052) ----------
+
+    @staticmethod
+    def _goal_run_claim_parts(claim) -> tuple[Any | None, Any]:
+        if isinstance(claim, _GoalRunLease):
+            return claim.lock, claim.heartbeat
+        return claim[0], claim[1]
+
+    def _emit_goal_run_ownership_lost(
+        self,
+        goal_id: str,
+        claim,
+        phase: str,
+        error: BaseException | None = None,
+    ) -> None:
+        """Record one bounded loss event without changing domain state."""
+        lock, _heartbeat = self._goal_run_claim_parts(claim)
+        if isinstance(claim, _GoalRunLease):
+            claim.lost = True
+            if claim.loss_event_emitted:
+                return
+            claim.loss_event_emitted = True
+        try:
+            self._emit("goal.run.ownership_lost", task_id=None,
+                       success=False, detail={
+                           "goal_id": goal_id,
+                           "lock_id": getattr(lock, "lock_id", None),
+                           "owner_id": getattr(lock, "owner_id", None),
+                           "phase": phase[:100],
+                           "error_type": (
+                               type(error).__name__ if error is not None
+                               else "GoalRunOwnershipLost"
+                           ),
+                       })
+        except Exception:
+            pass
+
+    def _goal_run_lease_current(
+        self,
+        goal_id: str | None,
+        claim,
+        phase: str,
+    ) -> bool:
+        """Synchronously validate the exact live goal-run owner.
+
+        The check renews the same ``lock_id``/``owner_id`` acquired by this
+        invocation.  A different current lease for the goal never satisfies
+        it.  ``None`` retains compatibility for private/standalone paths that
+        do not participate in default SQLite goal-run coordination.
+        """
+        if claim is None:
+            return True
+        lock, _heartbeat = self._goal_run_claim_parts(claim)
+        if lock is None:
+            return True  # alternate minimal stores retain single-process use
+        if isinstance(claim, _GoalRunLease):
+            if claim.lost:
+                return False
+            if claim.goal_id != goal_id:
+                self._emit_goal_run_ownership_lost(
+                    str(goal_id or ""), claim, phase,
+                    ValueError("goal-run claim belongs to another goal"),
+                )
+                return False
+        if (not goal_id
+                or getattr(lock, "resource_kind", None) != GOAL_RUN_RESOURCE_KIND
+                or getattr(lock, "resource", None) != goal_id):
+            self._emit_goal_run_ownership_lost(
+                str(goal_id or ""), claim, phase,
+                ValueError("goal-run claim identity mismatch"),
+            )
+            return False
+        try:
+            renewed = self._renew_mutation_lock(
+                lock, lease_seconds=self.scheduler_lease_seconds
+            )
+            lock.expires_at = renewed.expires_at
+            return True
+        except Exception as exc:
+            self._emit_goal_run_ownership_lost(goal_id, claim, phase, exc)
+            return False
+
+    def _goal_run_allows_task(self, task: Task, claim, phase: str) -> bool:
+        current = self._goal_run_lease_current(task.goal_id, claim, phase)
+        if not current:
+            # Coordination-only marker; Task serialization ignores it. Workers
+            # use it to avoid advertising a skipped invocation as completed.
+            setattr(task, "_goal_run_ownership_lost", True)
+        return current
 
     def _acquire_goal_run_lease(self, goal_id: str):
         """Claim one durable goal-run owner, or return None on contention.
@@ -584,7 +697,9 @@ class ArionEngine:
         scheduler, approval, recovery, or mutation-resource authority.
         """
         if self.mutation_lock_store is None:
-            return (None, None)  # compatibility for alternate minimal stores
+            # Compatibility guard for alternate minimal stores: no durable
+            # lease exists, so historical single-process behavior remains.
+            return _GoalRunLease(goal_id=goal_id, lock=None)
         from arion.state.locks import MutationLockError
 
         owner = self._lock_owner()
@@ -621,39 +736,38 @@ class ArionEngine:
             except Exception:
                 pass
             raise
-        return lock, heartbeat
+        return _GoalRunLease(
+            goal_id=goal_id, lock=lock, heartbeat=heartbeat
+        )
 
     def _release_goal_run_lease(self, goal_id: str, claim) -> None:
         if claim is None:
             return
-        lock, heartbeat = claim
+        lock, heartbeat = self._goal_run_claim_parts(claim)
         if lock is None:
             return
         state = self._stop_lock_heartbeat(heartbeat)
         if state.get("error") is not None:
-            try:
-                self._emit("goal.run.ownership_lost", task_id=None,
-                           success=False, detail={
-                               "goal_id": goal_id,
-                               "lock_id": lock.lock_id,
-                               "error_type": type(state["error"]).__name__,
-                           })
-            except Exception:
-                pass
+            self._emit_goal_run_ownership_lost(
+                goal_id, claim, "heartbeat", state["error"]
+            )
         try:
             released = self.mutation_lock_store.release(
                 lock.lock_id, lock.owner_id
             )
-            self._emit(
-                "goal.run.released" if released else "goal.run.ownership_lost",
-                task_id=None,
-                success=bool(released),
-                detail={
-                    "goal_id": goal_id,
-                    "lock_id": lock.lock_id,
-                    "owner_id": lock.owner_id,
-                },
-            )
+            if released:
+                self._emit(
+                    "goal.run.released", task_id=None, success=True,
+                    detail={
+                        "goal_id": goal_id,
+                        "lock_id": lock.lock_id,
+                        "owner_id": lock.owner_id,
+                    },
+                )
+            else:
+                self._emit_goal_run_ownership_lost(
+                    goal_id, claim, "release"
+                )
         except Exception as exc:
             try:
                 self._emit("error", task_id=None, success=False, detail={
@@ -799,7 +913,9 @@ class ArionEngine:
             return False
         return not self._lock_is_active(kind, resource)
 
-    def _acquire_mutation_lock(self, task: Task, step: PlanStep, spec) -> Any | None:
+    def _acquire_mutation_lock(
+        self, task: Task, step: PlanStep, spec, goal_run_claim=None
+    ) -> Any | None:
         """Acquire the advisory mutation lock for a step's canonical resource.
 
         Called ONLY after authorization succeeded (live policy + approval).
@@ -829,6 +945,9 @@ class ArionEngine:
         """
         from arion.state.locks import MutationLockError, MutationLockTimeoutError
 
+        if not self._goal_run_allows_task(
+                task, goal_run_claim, "mutation lock acquisition"):
+            return None, False
         kind, resource = self._lock_canonical(spec, step)
         if kind is None or resource is None:
             return None, False  # no lockable resource (e.g. non-resource mutation)
@@ -844,6 +963,9 @@ class ArionEngine:
         # Waiting disabled: immediate, durable contention failure (ADR-021
         # semantics preserved - no queue, no waiter rows).
         if self.lock_wait_max_seconds <= 0:
+            if not self._goal_run_allows_task(
+                    task, goal_run_claim, "immediate mutation lock"):
+                return None, False
             try:
                 lock = self.mutation_lock_store.acquire(
                     kind, resource, step.capability, step.action, owner,
@@ -899,6 +1021,9 @@ class ArionEngine:
         if waiter is not None:
             deadline = waiter.deadline
         if waiter is None:
+            if not self._goal_run_allows_task(
+                    task, goal_run_claim, "mutation waiter publication"):
+                return None, False
             waiter = self.mutation_lock_store.enqueue_waiter(
                 kind, resource, task.id, task.goal_id, step.index, deadline, now=now0)
             waiter_id = waiter.waiter_id
@@ -912,6 +1037,9 @@ class ArionEngine:
                        })
 
         while True:
+            if not self._goal_run_allows_task(
+                    task, goal_run_claim, "mutation lock wait"):
+                return None, False
             now = self._lock_now()
             if self._lock_wait_cancelled(task):
                 self.mutation_lock_store.dequeue_waiter(
@@ -939,6 +1067,24 @@ class ArionEngine:
                     kind, resource, step.capability, step.action, owner,
                     lease_seconds=self.mutation_lock_lease_seconds,
                     now=now, waiter_id=waiter_id)
+                if not self._goal_run_allows_task(
+                        task, goal_run_claim,
+                        "post-wait coordination cleanup"):
+                    # Store acquire already removed this waiter from the queue.
+                    # Release only our exact mutation owner and leave goal/task
+                    # mirrors untouched for the current goal runner.
+                    if hasattr(
+                            self.mutation_lock_store,
+                            "release_and_select_next"):
+                        self.mutation_lock_store.release_and_select_next(
+                            lock.lock_id, lock.owner_id,
+                            now=self._lock_now(),
+                        )
+                    else:
+                        self.mutation_lock_store.release(
+                            lock.lock_id, lock.owner_id
+                        )
+                    return None, False
                 # success: leave the queue, clear the durable wait state +
                 # goal blocker
                 self.mutation_lock_store.dequeue_waiter(waiter_id, "acquired")
@@ -1129,8 +1275,10 @@ class ArionEngine:
         with self._inflight_lock:
             return (resource_kind, resource) in self._inflight_locks
 
-    def _revalidate_before_mutation(self, task: Task, step: PlanStep, spec,
-                                    waited: bool) -> bool:
+    def _revalidate_before_mutation(
+        self, task: Task, step: PlanStep, spec, waited: bool,
+        goal_run_claim=None,
+    ) -> bool:
         """Re-check LIVE authorization immediately before mutating (ADR-022).
 
         Only meaningful after the task actually WAITED for the lock: the
@@ -1141,6 +1289,9 @@ class ArionEngine:
         relevant changed). Returns True when the step may proceed; False when
         the step was paused (fresh approval queued) or denied - the caller
         must NOT execute the capability."""
+        if not self._goal_run_allows_task(
+                task, goal_run_claim, "post-lock revalidation"):
+            return False
         if self._fence_task_for_superseded_plan(task):
             return False
         if self._observe_goal_pause(task):
@@ -1531,11 +1682,18 @@ class ArionEngine:
                 raise KeyError(f"goal not found: {goal_id}")
             return goal
         try:
-            return self._run_goal_owned(goal_id, max_replans=max_replans)
+            return self._run_goal_owned(
+                goal_id, max_replans=max_replans, goal_run_claim=claim
+            )
         finally:
             self._release_goal_run_lease(goal_id, claim)
 
-    def _run_goal_owned(self, goal_id: str, max_replans: int = 5) -> Goal:
+    def _run_goal_owned(
+        self,
+        goal_id: str,
+        max_replans: int = 5,
+        goal_run_claim=None,
+    ) -> Goal:
         """Long-horizon goal loop (ADR-016/017), with ownership preclaimed:
 
           Goal -> Goal State -> Strategy -> Plan -> Execute -> Observe ->
@@ -1567,7 +1725,13 @@ class ArionEngine:
         if gm is None:
             raise ValueError("goal manager not wired; use execute_goal instead")
         while True:
+            if not self._goal_run_lease_current(
+                    goal_id, goal_run_claim, "goal evaluation"):
+                return gm.get_goal(goal_id)
             result, _goal = gm.evaluate(goal_id)
+            if not self._goal_run_lease_current(
+                    goal_id, goal_run_claim, "post-evaluation"):
+                return gm.get_goal(goal_id)
             action = result.next_action
             if action in ("none", "paused"):
                 return gm.get_goal(goal_id)
@@ -1587,7 +1751,9 @@ class ArionEngine:
                 if gm.recheck_blockers(goal_id):
                     pending = gm.pending_task(goal_id)
                     if pending is not None:
-                        pending = self._run_task_owned(pending.id)
+                        pending = self._run_task_owned(
+                            pending.id, goal_run_claim=goal_run_claim
+                        )
                         if pending.status in (
                                 TaskStatus.FAILED,
                                 TaskStatus.AWAITING_APPROVAL,
@@ -1605,6 +1771,9 @@ class ArionEngine:
                     continue
                 return gm.get_goal(goal_id)
             if action == "complete":
+                if not self._goal_run_lease_current(
+                        goal_id, goal_run_claim, "goal completion"):
+                    return gm.get_goal(goal_id)
                 gm.complete_goal(goal_id, reason="all_work_complete")
                 return gm.get_goal(goal_id)
 
@@ -1621,6 +1790,9 @@ class ArionEngine:
                     if str(p.get("reason", "")).startswith("replan")
                 )
                 if replan_count >= max_replans:
+                    if not self._goal_run_lease_current(
+                            goal_id, goal_run_claim, "goal failure"):
+                        return gm.get_goal(goal_id)
                     gm.fail_goal(goal_id, reason="max_replans_exceeded")
                     return gm.get_goal(goal_id)
                 if self._block_on_missing_capability(goal_id, gm):
@@ -1629,9 +1801,15 @@ class ArionEngine:
                     return gm.get_goal(goal_id)
                 if self._block_on_lock_contention(goal_id, gm):
                     return gm.get_goal(goal_id)
-                task = self._plan_for_goal(goal_id, replan_reason=result.evidence.get("reason"))
+                task = self._plan_for_goal(
+                    goal_id,
+                    replan_reason=result.evidence.get("reason"),
+                    goal_run_claim=goal_run_claim,
+                )
                 if task is not None:
-                    task = self._run_task_owned(task.id)
+                    task = self._run_task_owned(
+                        task.id, goal_run_claim=goal_run_claim
+                    )
                     if task.status in (TaskStatus.FAILED, TaskStatus.AWAITING_APPROVAL,
                            TaskStatus.RUNNING):  # RUNNING = clean stop
                            # (cross-process capacity exhausted)
@@ -1642,7 +1820,9 @@ class ArionEngine:
             # plan version if one exists (replay safety), else plan + execute.
             pending = gm.pending_task(goal_id)
             if pending is not None:
-                pending = self._run_task_owned(pending.id)
+                pending = self._run_task_owned(
+                    pending.id, goal_run_claim=goal_run_claim
+                )
                 if pending.status in (
                         TaskStatus.FAILED,
                         TaskStatus.AWAITING_APPROVAL,
@@ -1656,9 +1836,13 @@ class ArionEngine:
                 return gm.get_goal(goal_id)
             if self._block_on_lock_contention(goal_id, gm):
                 return gm.get_goal(goal_id)
-            task = self._plan_for_goal(goal_id, replan_reason=None)
+            task = self._plan_for_goal(
+                goal_id, replan_reason=None, goal_run_claim=goal_run_claim
+            )
             if task is not None:
-                task = self._run_task_owned(task.id)
+                task = self._run_task_owned(
+                    task.id, goal_run_claim=goal_run_claim
+                )
                 if task.status in (TaskStatus.FAILED, TaskStatus.AWAITING_APPROVAL,
                            TaskStatus.RUNNING):  # RUNNING = clean stop
                            # (cross-process capacity exhausted)
@@ -2390,7 +2574,12 @@ class ArionEngine:
         task.approvals = list(task.approvals or []) + [rec]
         return rec
 
-    def _plan_for_goal(self, goal_id: str, replan_reason: str | None = None) -> Task | None:
+    def _plan_for_goal(
+        self,
+        goal_id: str,
+        replan_reason: str | None = None,
+        goal_run_claim=None,
+    ) -> Task | None:
         """Create + plan a task for a goal (records an immutable plan version).
 
         STORED-PLAN FAST PATH (ADR-016 addendum Phase B): when the goal's
@@ -2407,6 +2596,9 @@ class ArionEngine:
         (ValueError) rather than executing.
         """
         gm = self.goal_manager
+        if not self._goal_run_lease_current(
+                goal_id, goal_run_claim, "plan selection"):
+            return None
         goal = gm.get_goal(goal_id)
         if goal is None:
             return None
@@ -2462,6 +2654,10 @@ class ArionEngine:
                         "storage lacks atomic stored-plan task claim "
                         "(fail closed)"
                     )
+                if not self._goal_run_lease_current(
+                        goal_id, goal_run_claim,
+                        "stored-plan task publication"):
+                    return None
                 task, published = claim_task(candidate)
                 if not self._task_matches_latest_plan(task, latest):
                     raise ValueError(
@@ -2480,7 +2676,10 @@ class ArionEngine:
                     )
                 return task
         task = self.create_task(goal)
-        return self._plan(task, replan_reason=replan_reason)
+        return self._plan(
+            task, replan_reason=replan_reason,
+            goal_run_claim=goal_run_claim,
+        )
 
     def run_task(self, task_id: str) -> Task:
         """Resume one task only while holding its goal's durable run lease."""
@@ -2491,11 +2690,13 @@ class ArionEngine:
         if claim is None:
             return task
         try:
-            return self._run_task_owned(task_id)
+            return self._run_task_owned(
+                task_id, goal_run_claim=claim
+            )
         finally:
             self._release_goal_run_lease(task.goal_id, claim)
 
-    def _run_task_owned(self, task_id: str) -> Task:
+    def _run_task_owned(self, task_id: str, goal_run_claim=None) -> Task:
         """Resume-or-start a task with goal-run ownership already held.
 
         Stopping points: COMPLETED, FAILED, or AWAITING_APPROVAL (the task is
@@ -2508,6 +2709,9 @@ class ArionEngine:
         task = self.storage.load_task(task_id)
         if task is None:
             raise KeyError(f"task not found: {task_id}")
+        if not self._goal_run_allows_task(
+                task, goal_run_claim, "task resume"):
+            return task
         if self._fence_task_for_superseded_plan(task):
             return self.storage.load_task(task.id) or task
         if self._goal_is_paused(task):
@@ -2594,7 +2798,7 @@ class ArionEngine:
             return task
 
         if not task.steps:
-            task = self._plan(task)
+            task = self._plan(task, goal_run_claim=goal_run_claim)
             if self._goal_is_paused(task):
                 return self.storage.load_task(task.id) or task
             if task.status == TaskStatus.FAILED:
@@ -2638,6 +2842,9 @@ class ArionEngine:
         # reproduces the historical sequential behavior exactly.
         self._skipped_emitted = getattr(self, "_skipped_emitted", set())
         while True:
+            if not self._goal_run_allows_task(
+                    task, goal_run_claim, "task execution round"):
+                return self.storage.load_task(task.id) or task
             if self._fence_task_for_superseded_plan(task):
                 return self.storage.load_task(task.id) or task
             if self._goal_is_paused(task):
@@ -2659,6 +2866,9 @@ class ArionEngine:
             pending = [i for i, st in enumerate(task.steps) if st.status == StepStatus.PENDING]
             if not pending:
                 if self._observe_goal_pause(task):
+                    return self.storage.load_task(task.id) or task
+                if not self._goal_run_allows_task(
+                        task, goal_run_claim, "task completion"):
                     return self.storage.load_task(task.id) or task
                 # every step handled -> terminal COMPLETED (existing semantics)
                 skipped = sum(1 for st in task.steps if st.status == StepStatus.SKIPPED)
@@ -2721,12 +2931,15 @@ class ArionEngine:
             self._heartbeat_registration()
             enqueued = 0
             for i in dispatch:
-                if self._admit_step(task, task.steps[i]):
+                if self._admit_step(
+                        task, task.steps[i], goal_run_claim=goal_run_claim):
                     enqueued += 1
             self._last_run_progress = self._last_run_progress or enqueued > 0
             if enqueued:
                 self.scheduler.run_until_done()
             else:
+                if getattr(task, "_goal_run_ownership_lost", False):
+                    return self.storage.load_task(task.id) or task
                 # Nothing was claimed.  Do not publish this runner's local
                 # RUNNING cursor over the live owner's task snapshot.
                 canonical = self.storage.load_task(task.id) or task
@@ -2738,6 +2951,8 @@ class ArionEngine:
                     canonical.status = TaskStatus.RUNNING
                 return canonical
 
+            if getattr(task, "_goal_run_ownership_lost", False):
+                return self.storage.load_task(task.id) or task
             if (self._consume_goal_pause(task)
                     or self._goal_is_paused(task)):
                 return self.storage.load_task(task.id) or task
@@ -2808,13 +3023,19 @@ class ArionEngine:
                                 for task_id in goal_task_ids
                                 if task_id != chosen})
             if owned_task_ids:
-                results.update(self._run_tasks_owned(owned_task_ids))
+                results.update(self._run_tasks_owned(
+                    owned_task_ids, goal_run_claims=claims
+                ))
             return results
         finally:
             for goal_id in reversed(list(claims)):
                 self._release_goal_run_lease(goal_id, claims[goal_id])
 
-    def _run_tasks_owned(self, task_ids: list[str]) -> dict[str, Task]:
+    def _run_tasks_owned(
+        self,
+        task_ids: list[str],
+        goal_run_claims: dict[str, Any] | None = None,
+    ) -> dict[str, Task]:
         """Drive MULTIPLE preclaimed tasks through one scheduler (ADR-025).
 
         Semantics:
@@ -2861,6 +3082,14 @@ class ArionEngine:
             plan: dict[str, dict[str, Any]] = {}
             for tid in order:
                 task = tasks[tid]
+                goal_run_claim = (
+                    (goal_run_claims or {}).get(task.goal_id)
+                    if goal_run_claims is not None else None
+                )
+                if not self._goal_run_allows_task(
+                        task, goal_run_claim, "shared task round"):
+                    results[tid] = self.storage.load_task(task.id) or task
+                    continue
                 if task.status in TASK_TERMINAL_STATUSES:
                     results[tid] = task
                     continue
@@ -2881,7 +3110,13 @@ class ArionEngine:
                     results[tid] = task
                     continue
                 if not task.steps:
-                    task = self._plan(task)
+                    task = self._plan(
+                        task, goal_run_claim=goal_run_claim
+                    )
+                    if not self._goal_run_allows_task(
+                            task, goal_run_claim, "post-planning"):
+                        results[tid] = self.storage.load_task(task.id) or task
+                        continue
                     if self._goal_is_paused(task):
                         results[tid] = self.storage.load_task(task.id) or task
                         continue
@@ -2891,8 +3126,10 @@ class ArionEngine:
                 pending = [i for i, st in enumerate(task.steps)
                            if st.status == StepStatus.PENDING]
                 if not pending:
-                    self._complete_task_shared(task)
-                    results[tid] = task
+                    self._complete_task_shared(
+                        task, goal_run_claim=goal_run_claim
+                    )
+                    results[tid] = self.storage.load_task(task.id) or task
                     continue
                 cursor = min(pending)
                 task.current_step = cursor
@@ -2918,10 +3155,25 @@ class ArionEngine:
                         candidates.append(i)
                     elif reason == "parked":
                         parked.append(i)
-                plan[tid] = {"task": task, "candidates": candidates,
-                             "parked": parked, "cursor": cursor}
+                plan[tid] = {
+                    "task": task,
+                    "candidates": candidates,
+                    "parked": parked,
+                    "cursor": cursor,
+                    "goal_run_claim": goal_run_claim,
+                }
             # ---------------- park (durable waiter, no worker) ----------------
             for tid, info in plan.items():
+                if not self._goal_run_allows_task(
+                        info["task"], info["goal_run_claim"],
+                        "shared lock parking"):
+                    info["candidates"] = []
+                    info["parked"] = []
+                    results[tid] = (
+                        self.storage.load_task(info["task"].id)
+                        or info["task"]
+                    )
+                    continue
                 for i in info["parked"]:
                     self._park_on_lock(info["task"], info["task"].steps[i])
             # ---------------- fair admission across tasks --------------------
@@ -2950,13 +3202,18 @@ class ArionEngine:
             for tid, i in admitted:
                 task = plan[tid]["task"]
                 step = task.steps[i]
-                if self._admit_step(task, step):
+                if self._admit_step(
+                        task, step,
+                        goal_run_claim=plan[tid]["goal_run_claim"]):
                     enqueued += 1
             if enqueued:
                 self.scheduler.run_until_done()
             # ---------------- post-round per task -----------------------------
             for tid, info in plan.items():
                 task = info["task"]
+                if getattr(task, "_goal_run_ownership_lost", False):
+                    results[tid] = self.storage.load_task(task.id) or task
+                    continue
                 if (self._consume_goal_pause(task)
                         or self._goal_is_paused(task)):
                     results[tid] = self.storage.load_task(task.id) or task
@@ -3145,7 +3402,9 @@ class ArionEngine:
                                         task.id, task.goal_id, attempts,
                                         deadline, next_retry)
 
-    def _admit_step(self, task: Task, step: PlanStep) -> bool:
+    def _admit_step(
+        self, task: Task, step: PlanStep, goal_run_claim=None
+    ) -> bool:
         """Admit one step to the shared scheduler + durable registry
         (ADR-025/026). Returns True when the step was dispatched.
 
@@ -3164,11 +3423,17 @@ class ArionEngine:
         4. only a claimed row is enqueued to the in-process worker pool; the
            worker heartbeats throughout execution and reports terminal WITH
            its worker id."""
+        if not self._goal_run_allows_task(
+                task, goal_run_claim, "scheduler admission"):
+            return False
         if self.scheduler_registry is None:
             # no durable registry: plain in-process dispatch (legacy path)
             self.scheduler.enqueue(
                 f"{task.id}:{step.index}", task.id, step.index,
-                (lambda s=step: self._run_step_worker(task, s)))
+                (lambda s=step, g=goal_run_claim:
+                 self._run_step_worker(
+                     task, s, goal_run_claim=g
+                 )))
             return True
         reg = self.scheduler_registry
         now = self._lock_now()
@@ -3219,8 +3484,11 @@ class ArionEngine:
             self._claimed_work[claimed.work_id] = (task.id, step.index)
         self.scheduler.enqueue(
             f"{task.id}:{step.index}", task.id, step.index,
-            (lambda s=step, w=claimed.work_id, wk=worker_id:
-             self._run_step_worker(task, s, w, wk)))
+            (lambda s=step, w=claimed.work_id, wk=worker_id,
+                    g=goal_run_claim:
+             self._run_step_worker(
+                 task, s, w, wk, goal_run_claim=g
+             )))
         return True
 
     def _heartbeat_registration(self) -> None:
@@ -3239,8 +3507,13 @@ class ArionEngine:
         except Exception:
             pass
 
-    def _complete_task_shared(self, task: Task) -> None:
+    def _complete_task_shared(
+        self, task: Task, goal_run_claim=None
+    ) -> None:
         """Terminal COMPLETED handling shared by the multi-task driver."""
+        if not self._goal_run_allows_task(
+                task, goal_run_claim, "shared task completion"):
+            return
         if self._fail_task_for_terminal_goal(
                 task, phase="shared completion"):
             return
@@ -3278,14 +3551,20 @@ class ArionEngine:
                     claims[goal_id] = claim
             if claims:
                 results.update(self._run_goals_owned(
-                    list(claims), max_replans=max_replans
+                    list(claims), max_replans=max_replans,
+                    goal_run_claims=claims,
                 ))
             return results
         finally:
             for goal_id in reversed(list(claims)):
                 self._release_goal_run_lease(goal_id, claims[goal_id])
 
-    def _run_goals_owned(self, goal_ids: list[str], max_replans: int = 5) -> dict[str, Goal]:
+    def _run_goals_owned(
+        self,
+        goal_ids: list[str],
+        max_replans: int = 5,
+        goal_run_claims: dict[str, Any] | None = None,
+    ) -> dict[str, Goal]:
         """Drive MULTIPLE preclaimed goals through the shared scheduler (ADR-025).
 
         Each goal keeps its existing long-horizon lifecycle (ADR-016/017):
@@ -3306,14 +3585,30 @@ class ArionEngine:
         while active:
             tasks_to_run: list[str] = []
             for gid in active:
+                goal_run_claim = (
+                    (goal_run_claims or {}).get(gid)
+                    if goal_run_claims is not None else None
+                )
+                if not self._goal_run_lease_current(
+                        gid, goal_run_claim, "shared goal evaluation"):
+                    results[gid] = gm.get_goal(gid)
+                    continue
                 goal = gm.get_goal(gid)
                 if goal is None or goal.status in (GoalStatus.COMPLETED, GoalStatus.FAILED):
                     if goal is not None:
                         results[gid] = goal
                     continue
                 result, _ = gm.evaluate(gid)
+                if not self._goal_run_lease_current(
+                        gid, goal_run_claim, "shared post-evaluation"):
+                    results[gid] = gm.get_goal(gid)
+                    continue
                 action = result.next_action
                 if action == "complete":
+                    if not self._goal_run_lease_current(
+                            gid, goal_run_claim, "shared goal completion"):
+                        results[gid] = gm.get_goal(gid)
+                        continue
                     gm.complete_goal(gid, reason="all_work_complete")
                     results[gid] = gm.get_goal(gid)
                     continue
@@ -3342,6 +3637,11 @@ class ArionEngine:
                         1 for p in gm.plan_history(gid)
                         if str(p.get("reason", "")).startswith("replan"))
                     if replan_count >= max_replans:
+                        if not self._goal_run_lease_current(
+                                gid, goal_run_claim,
+                                "shared goal failure"):
+                            results[gid] = gm.get_goal(gid)
+                            continue
                         gm.fail_goal(gid, reason="max_replans_exceeded")
                         results[gid] = gm.get_goal(gid)
                         continue
@@ -3352,7 +3652,10 @@ class ArionEngine:
                     if self._block_on_lock_contention(gid, gm):
                         continue
                     task = self._plan_for_goal(
-                        gid, replan_reason=result.evidence.get("reason"))
+                        gid,
+                        replan_reason=result.evidence.get("reason"),
+                        goal_run_claim=goal_run_claim,
+                    )
                 else:  # continue / initial_plan
                     if self._block_on_missing_capability(gid, gm):
                         continue
@@ -3362,7 +3665,10 @@ class ArionEngine:
                         continue
                     task = gm.pending_task(gid)
                     if task is None:
-                        task = self._plan_for_goal(gid, replan_reason=None)
+                        task = self._plan_for_goal(
+                            gid, replan_reason=None,
+                            goal_run_claim=goal_run_claim,
+                        )
                 if task is not None and task.status not in (
                         TaskStatus.COMPLETED, TaskStatus.FAILED):
                     tasks_to_run.append(task.id)
@@ -3378,7 +3684,9 @@ class ArionEngine:
                     break
                 continue
             before = set(results)
-            self._run_tasks_owned(tasks_to_run)
+            self._run_tasks_owned(
+                tasks_to_run, goal_run_claims=goal_run_claims
+            )
             if not self._last_run_progress and not (set(results) - before):
                 # a full cycle claimed nothing and no goal reached a
                 # decision point (e.g. cross-process capacity exhausted):
@@ -3420,7 +3728,12 @@ class ArionEngine:
             out.append(detail)
         return out
 
-    def _plan(self, task: Task, replan_reason: str | None = None) -> Task:
+    def _plan(
+        self,
+        task: Task,
+        replan_reason: str | None = None,
+        goal_run_claim=None,
+    ) -> Task:
         self._emit("task.planning", task_id=task.id)
         task.status = TaskStatus.PLANNING
         context = self._build_planning_context(task)
@@ -3449,6 +3762,12 @@ class ArionEngine:
             )
             self._emit("task.failed", task_id=task.id, detail={"error": task.error})
             return task
+        # Planner/model calls may block for longer than the goal lease. The
+        # exact owner must still be live before immutable plan authority can
+        # be minted; ownership loss is a clean stop, not planning failure.
+        if not self._goal_run_allows_task(
+                task, goal_run_claim, "post-planner plan publication"):
+            return self.storage.load_task(task.id) or task
         if self._goal_is_paused(task):
             canonical = self.storage.load_task(task.id)
             if canonical is not None:
@@ -3511,6 +3830,10 @@ class ArionEngine:
                 plan_reason = "initial_plan" if not history else (
                     f"replan_{replan_reason}" if replan_reason else "replan"
                 )
+                if not self._goal_run_allows_task(
+                        task, goal_run_claim,
+                        "immutable plan publication"):
+                    return self.storage.load_task(task.id) or task
                 plan_record = self.goal_manager.record_plan_version(
                     task.goal_id, strategy_name,
                     [step.to_dict() for step in steps], plan_reason,
@@ -3540,6 +3863,9 @@ class ArionEngine:
                 raise TaskStateError(
                     "storage lacks atomic exact-plan task claim (fail closed)"
                 )
+            if not self._goal_run_allows_task(
+                    task, goal_run_claim, "exact-plan task publication"):
+                return self.storage.load_task(task.id) or task
             canonical, published = claim_task(task)
             if not published:
                 if (plan_record is not None
@@ -3675,9 +4001,14 @@ class ArionEngine:
         thread.start()
         return stop, thread, state
 
-    def _run_step_worker(self, task: Task, step: PlanStep,
-                         work_id: str | None = None,
-                         worker_id: str | None = None) -> None:
+    def _run_step_worker(
+        self,
+        task: Task,
+        step: PlanStep,
+        work_id: str | None = None,
+        worker_id: str | None = None,
+        goal_run_claim=None,
+    ) -> None:
         """Execute one step on a scheduler worker (ADR-024 Phase D /
         ADR-025/026).
 
@@ -3695,7 +4026,11 @@ class ArionEngine:
         reports terminal WITH its worker id (a stale owner can never complete
         a row it no longer owns)."""
         scheduler_heartbeat = None
-        if work_id is not None and self.scheduler_registry is not None:
+        ownership_lost = not self._goal_run_allows_task(
+            task, goal_run_claim, "worker start"
+        )
+        if (not ownership_lost and work_id is not None
+                and self.scheduler_registry is not None):
             try:
                 scheduler_heartbeat = self._start_scheduler_heartbeat(
                     work_id, worker_id
@@ -3711,19 +4046,26 @@ class ArionEngine:
                 return
         persistence_error: BaseException | None = None
         try:
-            if (not self._fail_task_for_terminal_goal(
-                    task, step, phase="worker start")
+            if (not ownership_lost
+                    and self._goal_run_allows_task(
+                        task, goal_run_claim, "worker preflight")
+                    and not self._fail_task_for_terminal_goal(
+                        task, step, phase="worker start")
                     and not self._fence_task_for_superseded_plan(task)
                     and not self._observe_goal_pause(task)
                     and self._task_step_is_current(task, step)):
-                self._execute_step(task, step)
+                self._execute_step(
+                    task, step, goal_run_claim=goal_run_claim
+                )
                 # Capability code is not preemptible. Recheck terminal and
-                # pause authority after it returns; a known result is persisted
-                # but no next step/completion begins while paused.
-                self._fail_task_for_terminal_goal(
-                    task, step, phase="worker completion")
-                self._fence_task_for_superseded_plan(task)
-                self._observe_goal_pause(task)
+                # pause authority after an invocation returns; a known result
+                # is persisted even if the goal-run lease was lost meanwhile.
+                # A pre-invocation ownership stop performs no task mutation.
+                if getattr(step, "_capability_started", False):
+                    self._fail_task_for_terminal_goal(
+                        task, step, phase="worker completion")
+                    self._fence_task_for_superseded_plan(task)
+                    self._observe_goal_pause(task)
         finally:
             heartbeat_state = self._stop_lock_heartbeat(scheduler_heartbeat)
             if heartbeat_state.get("error") is not None:
@@ -3759,7 +4101,11 @@ class ArionEngine:
                 terminal = (
                     SchedulerWorkStatus.FAILED
                     if (step.status == StepStatus.FAILED
-                        or persistence_error is not None)
+                        or persistence_error is not None
+                        or ownership_lost
+                        or getattr(
+                            task, "_goal_run_ownership_lost", False
+                        ))
                     else SchedulerWorkStatus.COMPLETED
                 )
                 try:
@@ -3767,7 +4113,12 @@ class ArionEngine:
                         work_id, terminal,
                         error=(step.error or (
                             "task persistence failed"
-                            if persistence_error is not None else None
+                            if persistence_error is not None else (
+                                "goal-run ownership lost"
+                                if (ownership_lost or getattr(
+                                    task, "_goal_run_ownership_lost", False
+                                )) else None
+                            )
                         )),
                         now=self._lock_now(), owner_worker_id=worker_id)
                 except Exception:
@@ -3777,7 +4128,12 @@ class ArionEngine:
             if persistence_error is not None:
                 raise persistence_error
 
-    def _execute_step(self, task: Task, step: PlanStep) -> None:
+    def _execute_step(
+        self, task: Task, step: PlanStep, goal_run_claim=None
+    ) -> None:
+        if not self._goal_run_allows_task(
+                task, goal_run_claim, "capability pipeline"):
+            return
         self._emit(
             "step.started",
             task_id=task.id,
@@ -3841,13 +4197,19 @@ class ArionEngine:
             if not self._handle_approval(task, step, request, decision):
                 return  # denied or paused (task will be checkpointed by the caller)
 
-        # 3. Execute with retries, then 4. verify. A newer plan or pause
-        # committed during authorization/approval is authoritative before
-        # capability start.
+        # 3. Execute with retries, then 4. verify. Revalidate goal ownership
+        # before any task fence that could otherwise rewrite a current owner's
+        # state; then apply newer-plan/pause authority before capability start.
+        if not self._goal_run_allows_task(
+                task, goal_run_claim, "capability dispatch"):
+            return
         if (self._fence_task_for_superseded_plan(task)
                 or self._observe_goal_pause(task)):
             return
-        self._execute_with_retries(task, step, capability, spec)
+        self._execute_with_retries(
+            task, step, capability, spec,
+            goal_run_claim=goal_run_claim,
+        )
 
     # ---------- authorization helpers ----------
 
@@ -4122,12 +4484,18 @@ class ArionEngine:
 
     # ---------- execution & verification ----------
 
-    def _execute_with_retries(self, task: Task, step: PlanStep, capability, spec) -> None:
+    def _execute_with_retries(
+        self, task: Task, step: PlanStep, capability, spec,
+        goal_run_claim=None,
+    ) -> None:
         verify_failed = False
         exec_error: str | None = None
         mutating = getattr(spec, "side_effects", "read_only") == "mutating"
         lock: Any = None
         waited = False
+        if not self._goal_run_allows_task(
+                task, goal_run_claim, "pre-execution"):
+            return
         if mutating:
             # ORDERING (ADR-021/022): authorization (live policy + approval)
             # has already succeeded in _execute_step BEFORE we reach this
@@ -4138,7 +4506,9 @@ class ArionEngine:
             from arion.state.locks import MutationLockError, MutationLockTimeoutError
 
             try:
-                lock, waited = self._acquire_mutation_lock(task, step, spec)
+                lock, waited = self._acquire_mutation_lock(
+                    task, step, spec, goal_run_claim=goal_run_claim
+                )
             except MutationLockTimeoutError as exc:
                 # Durable task state must stay bounded even when a resource
                 # identifier inside the mixed-trust error is caller-controlled.
@@ -4160,19 +4530,29 @@ class ArionEngine:
                            })
                 self._set_lock_contention_blocker(task, step, spec)
                 return  # capability NEVER executes; task fails durably
+            if getattr(task, "_goal_run_ownership_lost", False):
+                return
             if lock is not None:
                 # After a WAITED acquire, re-check LIVE authorization before
                 # mutating: the approval/authorization window may have gone
                 # stale while waiting. If the step pauses (fresh approval
                 # queued) or is denied, release the lock and do NOT execute.
-                if not self._revalidate_before_mutation(task, step, spec, waited=waited):
+                if not self._revalidate_before_mutation(
+                        task, step, spec, waited=waited,
+                        goal_run_claim=goal_run_claim):
                     self._release_mutation_lock(lock, task, step)
                     return
+        if not self._goal_run_allows_task(
+                task, goal_run_claim, "post-lock capability dispatch"):
+            if lock is not None:
+                self._release_mutation_lock(lock, task, step)
+            return
         heartbeat = self._start_lock_heartbeat(lock)
         try:
             self._execute_attempts(
                 task, step, capability, spec, mutating,
                 verify_failed, exec_error, lock=lock,
+                goal_run_claim=goal_run_claim,
             )
         finally:
             self._stop_lock_heartbeat(heartbeat)
@@ -4206,12 +4586,26 @@ class ArionEngine:
                 if persistence_error is not None:
                     raise persistence_error
 
-    def _execute_attempts(self, task: Task, step: PlanStep, capability, spec,
-                          mutating: bool, verify_failed: bool,
-                          exec_error: str | None, lock: Any = None) -> None:
+    def _execute_attempts(
+        self,
+        task: Task,
+        step: PlanStep,
+        capability,
+        spec,
+        mutating: bool,
+        verify_failed: bool,
+        exec_error: str | None,
+        lock: Any = None,
+        goal_run_claim=None,
+    ) -> None:
         from arion.state.locks import MutationLockError
 
         while step.attempts < step.max_attempts:
+            # Every retry is a new external invocation and therefore needs a
+            # fresh exact goal-run ownership decision.
+            if not self._goal_run_allows_task(
+                    task, goal_run_claim, "capability invocation"):
+                return
             step.attempts += 1
             step.status = StepStatus.RUNNING
             if mutating:
@@ -4222,6 +4616,7 @@ class ArionEngine:
                     "attempt": step.attempts,
                 })
             try:
+                setattr(step, "_capability_started", True)
                 raw_observation = capability.execute(
                     step.action, dict(step.params)
                 )

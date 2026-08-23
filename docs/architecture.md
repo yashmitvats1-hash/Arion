@@ -396,6 +396,10 @@ before evaluating, planning, or creating tasks:
   capability activity;
 - active ownership uses the scheduler/process lease duration and heartbeats
   through blocking planning and execution;
+- ADR-052 carries that exact lease identity through owned planning/task/bulk
+  paths and synchronously renews it after blocking work and before plan/task
+  publication, scheduler admission, each capability invocation, and owned
+  completion/failure; ownership loss stops without rewriting current work;
 - crashed ownership expires and is lazily reclaimed by the existing SQLite
   lease transaction; internal rows are excluded from public mutation-lock
   list/bulk-reclaim surfaces;
@@ -403,8 +407,9 @@ before evaluating, planning, or creating tasks:
   policy, approval, scheduler, recovery, or mutation authority;
 - different goals retain existing shared-scheduler concurrency.
 
-See [`ADR-045`](adr/ADR-045-per-goal-run-lease.md) and
-[`ADR-046`](adr/ADR-046-task-resume-goal-ownership.md).
+See [`ADR-045`](adr/ADR-045-per-goal-run-lease.md),
+[`ADR-046`](adr/ADR-046-task-resume-goal-ownership.md), and
+[`ADR-052`](adr/ADR-052-goal-run-lease-ownership-fencing.md).
 
 ## Paused goal execution boundary (ADR-047)
 
@@ -478,6 +483,29 @@ create/update-or-adopt boundary:
 - no additive relational plan-version column is required.
 
 See [`ADR-051`](adr/ADR-051-exact-plan-task-claim.md).
+
+## Goal-run lease ownership fencing (ADR-052)
+
+The renewable per-goal lease is now an execution fence as well as a contention
+mechanism:
+
+- each owned single/bulk invocation carries its exact acquired goal-run
+  `lock_id` and `owner_id`;
+- synchronous exact-owner renewal follows blocking planning and precedes
+  immutable plan publication and exact task reconstruction/publication;
+- task rounds, scheduler admission, worker preflight, post-lock dispatch, every
+  capability invocation/retry, and owned task/goal completion revalidate the
+  same lease;
+- a different current lease for the same goal never satisfies a stale caller;
+- ownership loss returns current durable state without creating/failing work or
+  clearing approval/recovery authority;
+- an already-started capability remains non-preemptible and persists its known
+  result through the existing task/scheduler/mutation/recovery boundaries;
+- bulk loss is isolated per goal, preserving independently owned concurrency.
+
+No schema, authorization, approval, recovery, scheduler, or mutation-lock
+semantics change. See
+[`ADR-052`](adr/ADR-052-goal-run-lease-ownership-fencing.md).
 
 ## Approval-Gated Goals, BLOCKED Semantics, Second Capability (ADR-017)
 
