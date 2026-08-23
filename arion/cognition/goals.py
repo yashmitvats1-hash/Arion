@@ -25,7 +25,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from arion.cognition.progress import DeterministicProgressEvaluator, ProgressEvaluator, ProgressResult
+from arion.cognition.progress import (
+    DeterministicProgressEvaluator,
+    ProgressEvaluator,
+    ProgressResult,
+    canonical_exact_task,
+)
 from arion.cognition.strategy import STRATEGY_NAMES, StrategySelector
 from arion.state.models import (
     GOAL_TRANSITIONS,
@@ -662,17 +667,27 @@ class GoalManager:
         }
 
     def pending_task(self, goal_id: str) -> Task | None:
-        """The non-terminal task implementing the LATEST plan version, if any.
+        """The non-terminal CANONICAL task implementing the LATEST plan version.
 
         Resume it on restart (replay safety) instead of duplicating work. A
         stale pending task for an older plan version is NOT resumed - after a
-        replan, a fresh task for the new version is created."""
+        replan, a fresh task for the new version is created. ADR-053: when
+        retained historical duplicates of the exact version exist, only the
+        deterministic canonical task (ADR-051 selection: ordered by
+        (created_at, task_id)) is current; noncanonical duplicates are never
+        selected as the pending task."""
         latest = self.latest_plan(goal_id)
         latest_version = latest["plan_version"] if latest else None
-        for t in self.task_history(goal_id):
-            if t.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-                if latest_version is None or t.plan_version == latest_version:
+        history = self.task_history(goal_id)
+        if latest_version is None:
+            for t in history:
+                if t.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
                     return t
+            return None
+        canonical = canonical_exact_task(history, latest_version)
+        if canonical is not None and canonical.status not in (
+                TaskStatus.COMPLETED, TaskStatus.FAILED):
+            return canonical
         return None
 
     # ------------------------------------------------------------------ #

@@ -1728,6 +1728,11 @@ class ArionEngine:
             if not self._goal_run_lease_current(
                     goal_id, goal_run_claim, "goal evaluation"):
                 return gm.get_goal(goal_id)
+            # ADR-053: converge superseded coordination state (stale queued
+            # approvals, parked mutation-lock waiters) BEFORE evaluating, so
+            # current progress derives only from latest-plan authority.
+            self._reconcile_superseded_coordination(
+                goal_id, goal_run_claim)
             result, _goal = gm.evaluate(goal_id)
             if not self._goal_run_lease_current(
                     goal_id, goal_run_claim, "post-evaluation"):
@@ -2136,6 +2141,64 @@ class ArionEngine:
         })
         self._record_memory(task)
         return True
+
+    def _reconcile_superseded_coordination(self, goal_id: str,
+                                           goal_run_claim=None) -> None:
+        """ADR-053: superseded coordination loses current authority.
+
+        When plan lineage advances, historical tasks keep their rows, but a
+        superseded or noncanonical task that still carries COORDINATION state
+        - an AWAITING_APPROVAL step (a queued approval plus the goal's
+        ``approval_pending`` blocker) or durable mutation-lock wait metadata -
+        must not block, park, or redirect latest-plan work. The live goal-run
+        owner therefore fences such tasks through the EXISTING ADR-049
+        superseded-task fence: the pending approval is denied with actor
+        ``system:superseded_plan``, the task is terminally FAILED, lock-wait
+        metadata is cleared, and queued waiters are cancelled. No capability
+        runs and no historical row is deleted. Tasks without coordination
+        state (e.g. PLANNED history) keep relying on the existing fences at
+        their execution boundaries.
+        """
+        gm = self.goal_manager
+        if gm is None or not goal_id:
+            return
+        try:
+            goal = gm.get_goal(goal_id)
+        except Exception:
+            return
+        if goal is None or goal.status in (
+                GoalStatus.COMPLETED, GoalStatus.FAILED,
+                GoalStatus.CANCELLED, GoalStatus.PAUSED):
+            return
+        try:
+            latest = gm.latest_plan(goal_id)
+        except Exception:
+            return
+        if latest is None:
+            return  # no immutable plan lineage: nothing is superseded by it
+        if not self._goal_run_lease_current(
+                goal_id, goal_run_claim,
+                "superseded coordination reconcile"):
+            return
+        try:
+            candidates = [
+                task for task in self.storage.list_tasks()
+                if task.goal_id == goal_id
+                and task.status not in TASK_TERMINAL_STATUSES
+                and (task.status == TaskStatus.AWAITING_APPROVAL
+                     or task.lock_wait is not None)
+            ]
+        except Exception:
+            return
+        for task in candidates:
+            # The fence itself decides authority: terminal rows and tasks
+            # implementing the latest plan (including the canonical exact
+            # task) are left untouched. A transient failure here is safe -
+            # the next owned cycle retries (the reconcile is idempotent).
+            try:
+                self._fence_task_for_superseded_plan(task)
+            except Exception:
+                continue
 
     def _goal_is_paused(self, task: Task) -> bool:
         """Return current PAUSED authority; read failures stop work safely."""
@@ -3593,6 +3656,10 @@ class ArionEngine:
                         gid, goal_run_claim, "shared goal evaluation"):
                     results[gid] = gm.get_goal(gid)
                     continue
+                # ADR-053: converge superseded coordination state before the
+                # shared evaluation (per-goal, ownership-scoped).
+                self._reconcile_superseded_coordination(
+                    gid, goal_run_claim)
                 goal = gm.get_goal(gid)
                 if goal is None or goal.status in (GoalStatus.COMPLETED, GoalStatus.FAILED):
                     if goal is not None:

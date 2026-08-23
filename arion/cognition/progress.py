@@ -62,24 +62,49 @@ class ProgressEvaluator(Protocol):
                  world_changes: list | None = None, world_state: dict | None = None) -> ProgressResult: ...
 
 
+def canonical_exact_task(tasks: list, plan_version) -> Any:
+    """The deterministic canonical task implementing an exact plan version.
+
+    ADR-051/053 selection: exact-version matches ordered by
+    ``(created_at, task_id)`` — the first is canonical; retained noncanonical
+    duplicates are historical. Shared by progress evaluation (coordination
+    authority) and pending-task selection so both use ONE definition of the
+    authoritative latest-plan task.
+    """
+    exact = [task for task in tasks if task.plan_version == plan_version]
+    if not exact:
+        return None
+    return sorted(exact, key=lambda task: (task.created_at, task.id))[0]
+
+
 class DeterministicProgressEvaluator:
     """Deterministic progress evaluation (reference path, offline).
+
+    Coordination/progress authority (ADR-053) is scoped to the canonical
+    task implementing the LATEST immutable plan version (with the legacy
+    unversioned fallback when no exact task exists). Superseded versions and
+    retained noncanonical duplicates remain observable history but never
+    coordinate the current goal.
 
     Rules (first match wins):
       1. terminal goal status           -> next_action "none"
       2. paused                         -> next_action "paused"
-      3. any task AWAITING_APPROVAL     -> next_action "await_approval" (durable
+      3. AUTHORITATIVE task AWAITING_APPROVAL
+                                       -> next_action "await_approval" (durable
                                           BLOCKED; never spin)
+      3b. AUTHORITATIVE task durably waiting on a mutation lock
+                                       -> next_action "await_lock"
       4. blockers present:
          - missing_capability blockers whose capabilities are ALL present in
            the current world state -> next_action "replan" (capability_available)
          - otherwise                -> next_action "resolve_blocker"
-      5. a resumable (non-terminal) task implements the LATEST plan version
-         -> next_action "continue" (resume it; never abandon in-flight work
-         - e.g. an approved task - merely because the world changed)
+      5. a resumable (non-terminal) authoritative task implements the LATEST
+         plan version -> next_action "continue" (resume it; never abandon
+         in-flight work - e.g. an approved task - merely because the world
+         changed)
       6. world changes since last eval -> next_action "replan" (material)
       7. no plan / no tasks            -> next_action "continue" (first plan)
-      8. any task failed               -> next_action "replan"
+      8. an AUTHORITATIVE task failed  -> next_action "replan"
       9. all plan steps succeeded      -> next_action "complete"
       10. outstanding steps remain     -> next_action "continue"
     """
@@ -131,8 +156,8 @@ class DeterministicProgressEvaluator:
         }
         blockers = list(goal.blockers or [])
 
-        awaiting: list[dict[str, Any]] = []
-        lock_waiters: list[dict[str, Any]] = []
+        # Task-status totals remain observational over the FULL task history
+        # (ADR-048): historical rows stay visible without holding authority.
         for t in tasks:
             st = t.status.value if hasattr(t.status, "value") else str(t.status)
             if st == TaskStatus.COMPLETED.value:
@@ -141,30 +166,6 @@ class DeterministicProgressEvaluator:
                 evidence["failed"] += 1
             else:
                 evidence["pending"] += 1
-                if st == TaskStatus.AWAITING_APPROVAL.value:
-                    evidence["awaiting_approval"] += 1
-                    awaiting.append({
-                        "task_id": t.id,
-                        "step_index": t.current_step,
-                        "plan_version": t.plan_version,
-                    })
-                if getattr(t, "lock_wait", None):
-                    # ADR-022: a task waiting (bounded) on a mutation lock is
-                    # its own durable state - distinct from approval-pending,
-                    # missing capability, recovery, and terminal failure.
-                    evidence["waiting_for_lock"] += 1
-                    lock_waiters.append({
-                        "task_id": t.id,
-                        "step_index": t.current_step,
-                        "plan_version": t.plan_version,
-                        "resource_kind": t.lock_wait.get("resource_kind"),
-                        "resource": t.lock_wait.get("resource"),
-                        "waiter_id": t.lock_wait.get("waiter_id"),
-                        "position": t.lock_wait.get("position"),
-                        "deadline": t.lock_wait.get("deadline"),
-                        "attempts": t.lock_wait.get("attempts"),
-                        "next_retry": t.lock_wait.get("next_retry"),
-                    })
         for t in tasks:
             for s in getattr(t, "steps", []):
                 if s.status == StepStatus.SKIPPED:
@@ -190,9 +191,19 @@ class DeterministicProgressEvaluator:
             # Revision-era tasks carry an exact version. Unversioned tasks are
             # accepted only when no exact implementing task exists, preserving
             # legacy snapshots without letting them inflate current work.
-            authoritative_tasks = exact_latest or [
-                task for task in tasks if task.plan_version is None
-            ]
+            #
+            # ADR-053: coordination/progress authority belongs to the single
+            # deterministic CANONICAL exact-version task (the ADR-051
+            # selection). Retained noncanonical duplicates and superseded
+            # versions are historical state: they never coordinate the
+            # current goal.
+            canonical = canonical_exact_task(tasks, latest_version)
+            if canonical is not None:
+                authoritative_tasks = [canonical]
+            else:
+                authoritative_tasks = [
+                    task for task in tasks if task.plan_version is None
+                ]
             for position, item in enumerate(plan_summary):
                 index = item.get("index", position) if isinstance(item, dict) else position
                 if isinstance(index, int) and not isinstance(index, bool):
@@ -202,6 +213,40 @@ class DeterministicProgressEvaluator:
             evidence["plan_versions"] = plan_steps
             evidence["latest_plan_version"] = latest_version
             evidence["latest_plan_tasks"] = len(authoritative_tasks)
+
+        # ADR-053: coordination state is scanned ONLY over authoritative
+        # latest-plan work. A superseded or noncanonical task awaiting an
+        # approval or parked on a mutation lock keeps its durable history but
+        # loses the ability to block, park, or redirect current progress.
+        awaiting: list[dict[str, Any]] = []
+        lock_waiters: list[dict[str, Any]] = []
+        for t in authoritative_tasks:
+            st = t.status.value if hasattr(t.status, "value") else str(t.status)
+            if st == TaskStatus.AWAITING_APPROVAL.value:
+                evidence["awaiting_approval"] += 1
+                awaiting.append({
+                    "task_id": t.id,
+                    "step_index": t.current_step,
+                    "plan_version": t.plan_version,
+                })
+            if (st not in (TaskStatus.COMPLETED.value, TaskStatus.FAILED.value)
+                    and getattr(t, "lock_wait", None)):
+                # ADR-022: a task waiting (bounded) on a mutation lock is
+                # its own durable state - distinct from approval-pending,
+                # missing capability, recovery, and terminal failure.
+                evidence["waiting_for_lock"] += 1
+                lock_waiters.append({
+                    "task_id": t.id,
+                    "step_index": t.current_step,
+                    "plan_version": t.plan_version,
+                    "resource_kind": t.lock_wait.get("resource_kind"),
+                    "resource": t.lock_wait.get("resource"),
+                    "waiter_id": t.lock_wait.get("waiter_id"),
+                    "position": t.lock_wait.get("position"),
+                    "deadline": t.lock_wait.get("deadline"),
+                    "attempts": t.lock_wait.get("attempts"),
+                    "next_retry": t.lock_wait.get("next_retry"),
+                })
 
         # Historical totals remain observational. Completion/progress authority
         # is scoped to unique step indices implemented by the latest plan.
