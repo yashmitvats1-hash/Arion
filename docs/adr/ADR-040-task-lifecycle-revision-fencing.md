@@ -155,7 +155,9 @@ finish, and its known step result is retained, but the task cannot become
 `COMPLETED` under a cancelled goal.
 
 `run_task()` also checks durable `REQUIRED` recovery. A split crash leaving a
-pending task is fenced to `FAILED` without capability execution.
+pending task is fenced to `FAILED` without capability execution. ADR-046 later
+wrapped direct task resume in the same per-goal run lease used by ADR-045, while
+owned goal loops call the unchanged task state machine internally.
 
 ### Mutation release ordering
 

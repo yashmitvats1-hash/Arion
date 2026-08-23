@@ -112,7 +112,9 @@ runs only owned goals through the unchanged shared scheduler, returns current
 state for contended goals, and releases owned leases in reverse order.
 
 No lease is held across separate API calls. Approval/recovery/lock clean stops
-release it, so a later invocation may continue normally.
+release it, so a later invocation may continue normally. ADR-046 later extended
+the same lease boundary to direct `run_task`/CLI resume and public `run_tasks`,
+while goal-owned loops use internal owned task methods to avoid self-contention.
 
 ### Compatibility
 

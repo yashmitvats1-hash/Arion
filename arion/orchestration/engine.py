@@ -1573,7 +1573,7 @@ class ArionEngine:
                 if gm.recheck_blockers(goal_id):
                     pending = gm.pending_task(goal_id)
                     if pending is not None:
-                        pending = self.run_task(pending.id)
+                        pending = self._run_task_owned(pending.id)
                         if pending.status in (
                                 TaskStatus.FAILED,
                                 TaskStatus.AWAITING_APPROVAL,
@@ -1617,7 +1617,7 @@ class ArionEngine:
                     return gm.get_goal(goal_id)
                 task = self._plan_for_goal(goal_id, replan_reason=result.evidence.get("reason"))
                 if task is not None:
-                    task = self.run_task(task.id)
+                    task = self._run_task_owned(task.id)
                     if task.status in (TaskStatus.FAILED, TaskStatus.AWAITING_APPROVAL,
                            TaskStatus.RUNNING):  # RUNNING = clean stop
                            # (cross-process capacity exhausted)
@@ -1628,7 +1628,7 @@ class ArionEngine:
             # plan version if one exists (replay safety), else plan + execute.
             pending = gm.pending_task(goal_id)
             if pending is not None:
-                pending = self.run_task(pending.id)
+                pending = self._run_task_owned(pending.id)
                 if pending.status in (
                         TaskStatus.FAILED,
                         TaskStatus.AWAITING_APPROVAL,
@@ -1644,7 +1644,7 @@ class ArionEngine:
                 return gm.get_goal(goal_id)
             task = self._plan_for_goal(goal_id, replan_reason=None)
             if task is not None:
-                task = self.run_task(task.id)
+                task = self._run_task_owned(task.id)
                 if task.status in (TaskStatus.FAILED, TaskStatus.AWAITING_APPROVAL,
                            TaskStatus.RUNNING):  # RUNNING = clean stop
                            # (cross-process capacity exhausted)
@@ -2279,7 +2279,20 @@ class ArionEngine:
         return task
 
     def run_task(self, task_id: str) -> Task:
-        """Resume-or-start a task and drive it to a stopping point.
+        """Resume one task only while holding its goal's durable run lease."""
+        task = self.storage.load_task(task_id)
+        if task is None:
+            raise KeyError(f"task not found: {task_id}")
+        claim = self._acquire_goal_run_lease(task.goal_id)
+        if claim is None:
+            return task
+        try:
+            return self._run_task_owned(task_id)
+        finally:
+            self._release_goal_run_lease(task.goal_id, claim)
+
+    def _run_task_owned(self, task_id: str) -> Task:
+        """Resume-or-start a task with goal-run ownership already held.
 
         Stopping points: COMPLETED, FAILED, or AWAITING_APPROVAL (the task is
         checkpointed and returned so an approval interface can act; calling
@@ -2544,7 +2557,45 @@ class ArionEngine:
     # ---------- ADR-025: shared multi-task / multi-goal execution ----------
 
     def run_tasks(self, task_ids: list[str]) -> dict[str, Task]:
-        """Drive MULTIPLE tasks through the ONE bounded scheduler (ADR-025).
+        """Drive at most one requested task per owned goal-run lease."""
+        tasks: dict[str, Task] = {}
+        grouped: dict[str, list[str]] = {}
+        for task_id in dict.fromkeys(task_ids):
+            task = self.storage.load_task(task_id)
+            if task is None:
+                raise KeyError(f"task not found: {task_id}")
+            tasks[task_id] = task
+            grouped.setdefault(task.goal_id, []).append(task_id)
+
+        claims: dict[str, Any] = {}
+        results: dict[str, Task] = {}
+        owned_task_ids: list[str] = []
+        try:
+            for goal_id, goal_task_ids in grouped.items():
+                claim = self._acquire_goal_run_lease(goal_id)
+                if claim is None:
+                    results.update({task_id: tasks[task_id]
+                                    for task_id in goal_task_ids})
+                    continue
+                claims[goal_id] = claim
+                chosen = next(
+                    (task_id for task_id in goal_task_ids
+                     if tasks[task_id].status not in TASK_TERMINAL_STATUSES),
+                    goal_task_ids[0],
+                )
+                owned_task_ids.append(chosen)
+                results.update({task_id: tasks[task_id]
+                                for task_id in goal_task_ids
+                                if task_id != chosen})
+            if owned_task_ids:
+                results.update(self._run_tasks_owned(owned_task_ids))
+            return results
+        finally:
+            for goal_id in reversed(list(claims)):
+                self._release_goal_run_lease(goal_id, claims[goal_id])
+
+    def _run_tasks_owned(self, task_ids: list[str]) -> dict[str, Task]:
+        """Drive MULTIPLE preclaimed tasks through one scheduler (ADR-025).
 
         Semantics:
 
@@ -3090,7 +3141,7 @@ class ArionEngine:
                     break
                 continue
             before = set(results)
-            self.run_tasks(tasks_to_run)
+            self._run_tasks_owned(tasks_to_run)
             if not self._last_run_progress and not (set(results) - before):
                 # a full cycle claimed nothing and no goal reached a
                 # decision point (e.g. cross-process capacity exhausted):

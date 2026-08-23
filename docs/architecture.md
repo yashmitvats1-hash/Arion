@@ -384,7 +384,9 @@ before evaluating, planning, or creating tasks:
 
 - `run_goal` has one live owner across engine processes;
 - `run_goals` independently claims each distinct goal and runs only owned goals;
-- a contender returns current durable goal state without planner/task/scheduler/
+- ADR-046 extends the same ownership to direct `run_task`/CLI resume and groups
+  public `run_tasks` to at most one requested task per goal;
+- a contender returns current durable goal/task state without planner/scheduler/
   capability activity;
 - active ownership uses the scheduler/process lease duration and heartbeats
   through blocking planning and execution;
@@ -395,7 +397,8 @@ before evaluating, planning, or creating tasks:
   policy, approval, scheduler, recovery, or mutation authority;
 - different goals retain existing shared-scheduler concurrency.
 
-See [`ADR-045`](adr/ADR-045-per-goal-run-lease.md).
+See [`ADR-045`](adr/ADR-045-per-goal-run-lease.md) and
+[`ADR-046`](adr/ADR-046-task-resume-goal-ownership.md).
 
 ## Approval-Gated Goals, BLOCKED Semantics, Second Capability (ADR-017)
 
