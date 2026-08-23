@@ -351,8 +351,10 @@ Learn → Replan`, owned by an authoritative, restart-safe `GoalManager`.
   fails (failure persisted), and replanning is bounded by `max_replans` across
   calls. ADR-045 adds one renewable durable run lease per goal before this
   check/plan/create loop, so concurrent engines cannot turn one goal into
-  duplicate tasks/plans/effects. Superseded-plan failures never block completion
-  once the newer plan is fully handled.
+  duplicate tasks/plans/effects. ADR-048 scopes handled/resumable/failed work to
+  the latest plan's exact task version (legacy unversioned fallback only), so
+  superseded successes cannot complete newer work and superseded failures remain
+  non-blocking.
 - **World-state → replan seam:** material environment fact changes (capability
   registrations, keys the plan depends on) trigger reevaluation → replan;
   unrelated facts (e.g. `system_uptime`) are filtered out. Deterministic and
@@ -418,6 +420,21 @@ PAUSED is a resumable execution stop, not merely an evaluator hint:
   without mutation when pause wins.
 
 See [`ADR-047`](adr/ADR-047-paused-goal-execution-boundary.md).
+
+## Latest-plan completion authority (ADR-048)
+
+Goal completion and progress now distinguish current work from task history:
+
+- exact `task.plan_version == latest.plan_version` tasks own current progress;
+- unversioned tasks are a fallback only when no exact latest task exists;
+- unique SUCCEEDED/SKIPPED step indices must cover every expected latest-plan
+  index before completion;
+- superseded successes remain evidence but cannot satisfy a newer plan;
+- a plan committed before task creation remains outstanding, allowing existing
+  stored-plan reconstruction after restart;
+- latest resumable/failure decisions use the same scoped task set.
+
+See [`ADR-048`](adr/ADR-048-latest-plan-completion-authority.md).
 
 ## Approval-Gated Goals, BLOCKED Semantics, Second Capability (ADR-017)
 

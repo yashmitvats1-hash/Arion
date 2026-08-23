@@ -171,30 +171,70 @@ class DeterministicProgressEvaluator:
                     evidence["skipped"] += 1
 
         plan_steps = 0
+        plan_summary: list[dict[str, Any]] = []
+        latest_version = None
+        authoritative_tasks = list(tasks)
+        expected_indices: set[int] = set()
         if latest_plan is not None:
             try:
-                plan_steps = len(latest_plan.get("plan_summary") or [])
+                plan_summary = list(latest_plan.get("plan_summary") or [])
+                plan_steps = len(plan_summary)
             except (AttributeError, TypeError):
+                plan_summary = []
                 plan_steps = 0
+            latest_version = latest_plan.get("plan_version")
+            exact_latest = [
+                task for task in tasks
+                if task.plan_version == latest_version
+            ]
+            # Revision-era tasks carry an exact version. Unversioned tasks are
+            # accepted only when no exact implementing task exists, preserving
+            # legacy snapshots without letting them inflate current work.
+            authoritative_tasks = exact_latest or [
+                task for task in tasks if task.plan_version is None
+            ]
+            for position, item in enumerate(plan_summary):
+                index = item.get("index", position) if isinstance(item, dict) else position
+                if isinstance(index, int) and not isinstance(index, bool):
+                    expected_indices.add(index)
+                else:
+                    expected_indices.add(position)
             evidence["plan_versions"] = plan_steps
+            evidence["latest_plan_version"] = latest_version
+            evidence["latest_plan_tasks"] = len(authoritative_tasks)
 
-        # Count handled steps (succeeded + skipped) across ALL tasks of the
-        # goal - completion is never inferred from a single successful task.
+        # Historical totals remain observational. Completion/progress authority
+        # is scoped to unique step indices implemented by the latest plan.
         succeeded_steps = 0
         skipped_steps = 0
-        for t in tasks:
-            for s in getattr(t, "steps", []):
-                if s.status == StepStatus.SUCCEEDED:
+        for task in tasks:
+            for step in getattr(task, "steps", []):
+                if step.status == StepStatus.SUCCEEDED:
                     succeeded_steps += 1
-                elif s.status == StepStatus.SKIPPED:
+                elif step.status == StepStatus.SKIPPED:
                     skipped_steps += 1
         evidence["succeeded_steps"] = succeeded_steps
         evidence["skipped_steps_total"] = skipped_steps
-        handled_steps = succeeded_steps + skipped_steps
+
+        latest_succeeded: set[int] = set()
+        latest_skipped: set[int] = set()
+        for task in authoritative_tasks:
+            for step in getattr(task, "steps", []):
+                if step.status == StepStatus.SUCCEEDED:
+                    latest_succeeded.add(step.index)
+                elif step.status == StepStatus.SKIPPED:
+                    latest_skipped.add(step.index)
+        handled_indices = latest_succeeded | latest_skipped
+        evidence["latest_succeeded_steps"] = len(latest_succeeded)
+        evidence["latest_skipped_steps"] = len(latest_skipped)
+        evidence["latest_handled_steps"] = len(handled_indices)
 
         progress = 0.0
-        total_steps = plan_steps or max(succeeded_steps + evidence["failed"], 1)
-        if total_steps:
+        if latest_plan is not None:
+            if plan_steps:
+                progress = min(1.0, len(latest_succeeded) / plan_steps)
+        else:
+            total_steps = max(succeeded_steps + evidence["failed"], 1)
             progress = min(1.0, succeeded_steps / total_steps)
 
         # Rule 3: a task awaiting approval -> stop cleanly (never spin), the
@@ -259,12 +299,10 @@ class DeterministicProgressEvaluator:
         # over a world-change replan - never abandon in-flight work (e.g. an
         # approved step awaiting resume) just because the world changed.
         if latest_plan is not None:
-            latest_version = latest_plan.get("plan_version")
             resumable = [
-                t for t in tasks
-                if t.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
-                and t.status != TaskStatus.AWAITING_APPROVAL
-                and (t.plan_version == latest_version or t.plan_version is None)
+                task for task in authoritative_tasks
+                if task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+                and task.status != TaskStatus.AWAITING_APPROVAL
             ]
             if resumable:
                 return ProgressResult(
@@ -291,21 +329,23 @@ class DeterministicProgressEvaluator:
                 evidence={**evidence, "reason": "initial_plan"},
             )
 
-        latest_version = latest_plan.get("plan_version")
-        # A failed task implementing the LATEST plan version is unresolved
-        # work -> replan (superseded failures from older versions are not
-        # counted once a newer plan is fully handled). A task without a plan
-        # version is treated as belonging to the latest plan (conservative).
+        # A failed task in the authoritative latest-plan task set is unresolved
+        # work. Superseded versions and unversioned rows ignored in favor of an
+        # exact latest implementation cannot block or complete current work.
         latest_failed = [
-            t for t in tasks
-            if t.status == TaskStatus.FAILED
-            and (t.plan_version == latest_version or t.plan_version is None)
+            task for task in authoritative_tasks
+            if task.status == TaskStatus.FAILED
         ]
         evidence["latest_plan_failed"] = len(latest_failed)
 
-        # Rule 8: ALL plan steps of the LATEST version handled (succeeded or
-        # explicitly skipped) with no unresolved failure -> complete.
-        if plan_steps > 0 and handled_steps >= plan_steps and not latest_failed:
+        # Rule 8: every distinct expected step of the LATEST version is handled
+        # by its authoritative task set, with no unresolved latest failure.
+        complete_indices = (
+            plan_steps > 0
+            and len(expected_indices) == plan_steps
+            and expected_indices.issubset(handled_indices)
+        )
+        if complete_indices and not latest_failed:
             return ProgressResult(
                 goal_id=goal.id, progress=1.0, status=GoalStatus.COMPLETED.value,
                 blockers=[], next_action="complete",

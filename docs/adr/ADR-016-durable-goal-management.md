@@ -83,7 +83,8 @@ Completion rule (never single-task): a goal is `complete` only when the
 LATEST plan version's steps are all handled (succeeded or explicitly
 skipped), there is no unresolved failure on that version, and there are no
 blockers. A single successful task never completes a goal with outstanding
-steps.
+steps. ADR-048 later enforced this literally by scoping handled step indices to
+exact latest-version tasks, with unversioned rows only as a legacy fallback.
 
 ### 3. ProgressEvaluator (deterministic seam)
 
