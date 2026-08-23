@@ -78,7 +78,9 @@ managed goals:
 5. emits `plan.produced` and replanning provenance;
 6. checkpoints the published task.
 
-No executable unversioned task row exists between steps 2–4.
+No executable unversioned task row exists between steps 2–4. ADR-051 later
+made step 4 an atomic exact-plan task create/update-or-adopt claim shared with
+stored-plan reconstruction, fencing stale owners and repeated recovery.
 
 ### Plan persistence failure
 

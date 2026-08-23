@@ -1827,8 +1827,50 @@ class ArionEngine:
     def _goal_is_terminal_for_approval(self, task: Task) -> bool:
         return self._terminal_goal_status(task) is not None
 
+    @staticmethod
+    def _step_execution_definition(step: PlanStep | dict[str, Any]) -> dict[str, Any]:
+        candidate = step if isinstance(step, PlanStep) else PlanStep.from_dict(step)
+        return {
+            "index": candidate.index,
+            "intent": candidate.intent,
+            "capability": candidate.capability,
+            "action": candidate.action,
+            "scope": candidate.scope,
+            "params": candidate.params,
+            "verification": {
+                "policy": candidate.verification.policy,
+                "args": candidate.verification.args,
+            },
+            "depends_on": list(candidate.depends_on),
+            "guidance": list(candidate.guidance),
+            "skipped_reason": candidate.skipped_reason,
+            "max_attempts": candidate.max_attempts,
+            "planned_status": (
+                StepStatus.SKIPPED.value
+                if candidate.status == StepStatus.SKIPPED
+                else StepStatus.PENDING.value
+            ),
+        }
+
+    def _task_matches_latest_plan(self, task: Task, latest: dict[str, Any]) -> bool:
+        try:
+            summary = latest.get("plan_summary")
+            if not isinstance(summary, list) or not summary:
+                return False
+            stored = sorted(
+                (self._step_execution_definition(item) for item in summary),
+                key=lambda item: item["index"],
+            )
+            executable = sorted(
+                (self._step_execution_definition(step) for step in task.steps),
+                key=lambda item: item["index"],
+            )
+            return stored == executable
+        except Exception:
+            return False
+
     def _task_implements_latest_plan(self, task: Task) -> bool:
-        """Whether this task is executable authority for the current plan."""
+        """Whether this is the canonical task matching the current plan."""
         if self.goal_manager is None or not task.goal_id:
             return True
         try:
@@ -1836,22 +1878,34 @@ class ArionEngine:
             if latest is None:
                 return True
             latest_version = latest.get("plan_version")
+            goal_tasks = [
+                candidate for candidate in self.storage.list_tasks()
+                if candidate.goal_id == task.goal_id
+            ]
+            exact = sorted(
+                (candidate for candidate in goal_tasks
+                 if candidate.plan_version == latest_version),
+                key=lambda candidate: (candidate.created_at, candidate.id),
+            )
             if task.plan_version == latest_version:
-                return True
+                return bool(exact and exact[0].id == task.id)
             if task.plan_version is not None:
                 return False
-            exact = [
-                candidate for candidate in self.storage.list_tasks()
-                if (candidate.goal_id == task.goal_id
-                    and candidate.plan_version == latest_version)
-            ]
             if exact:
                 return False
-            # Legacy unversioned tasks are a fallback only when they are not
-            # older than the latest plan row. A pre-plan task is safely
-            # reconstructed instead of guessed into current authority.
+            legacy = sorted(
+                (candidate for candidate in goal_tasks
+                 if candidate.plan_version is None),
+                key=lambda candidate: (candidate.created_at, candidate.id),
+            )
+            if not legacy or legacy[0].id != task.id:
+                return False
+            # Legacy unversioned tasks are fallback only when they are not
+            # older than the latest plan row and reproduce its definition.
             latest_created = latest.get("created_at")
-            return not latest_created or task.created_at >= latest_created
+            return bool(
+                not latest_created or task.created_at >= latest_created
+            )
         except Exception:
             return False
 
@@ -2357,8 +2411,20 @@ class ArionEngine:
         if goal is None:
             return None
         latest = gm.latest_plan(goal_id)
-        if latest is not None and not gm._any_task_for_plan(
-                goal_id, latest["plan_version"]):
+        if latest is not None and replan_reason is None:
+            exact = sorted(
+                (task for task in gm.task_history(goal_id)
+                 if task.plan_version == latest["plan_version"]),
+                key=lambda task: (task.created_at, task.id),
+            )
+            if exact:
+                canonical = exact[0]
+                if not self._task_matches_latest_plan(canonical, latest):
+                    raise ValueError(
+                        f"task {canonical.id} diverges from stored plan "
+                        f"v{latest['plan_version']} (fail closed)"
+                    )
+                return canonical
             strategy = latest.get("strategy", "") or ""
             summary = latest.get("plan_summary")
             from arion.cognition.strategy import STRATEGY_NAMES
@@ -2382,21 +2448,39 @@ class ArionEngine:
                         s.status = StepStatus.PENDING
                         s.result = None
                         s.error = None
-                task = self.create_task(goal, plan_version=latest["plan_version"])
-                task.steps = steps
-                task.status = TaskStatus.PLANNED
-                self.storage.save_task(task)
-                self._emit(
-                    "plan.produced",
-                    task_id=task.id,
-                    detail={"steps": self._plan_steps_for_audit(steps),
-                            "stored_plan": True,
-                            "plan_version": latest["plan_version"]},
+                candidate = Task(
+                    id=new_id("task"),
+                    goal_id=goal.id,
+                    description=goal.description,
+                    plan_version=latest["plan_version"],
+                    steps=steps,
+                    status=TaskStatus.PLANNED,
                 )
+                claim_task = getattr(self.storage, "claim_task_for_plan", None)
+                if not callable(claim_task):
+                    raise TaskStateError(
+                        "storage lacks atomic stored-plan task claim "
+                        "(fail closed)"
+                    )
+                task, published = claim_task(candidate)
+                if not self._task_matches_latest_plan(task, latest):
+                    raise ValueError(
+                        f"task {task.id} does not reproduce stored plan "
+                        f"v{latest['plan_version']} (fail closed)"
+                    )
+                if published:
+                    self._emit("task.created", task_id=task.id,
+                               detail={"goal_id": goal.id})
+                    self._emit(
+                        "plan.produced",
+                        task_id=task.id,
+                        detail={"steps": self._plan_steps_for_audit(steps),
+                                "stored_plan": True,
+                                "plan_version": latest["plan_version"]},
+                    )
                 return task
         task = self.create_task(goal)
-        self._plan(task, replan_reason=replan_reason)
-        return task
+        return self._plan(task, replan_reason=replan_reason)
 
     def run_task(self, task_id: str) -> Task:
         """Resume one task only while holding its goal's durable run lease."""
@@ -3447,10 +3531,30 @@ class ArionEngine:
                 self._record_memory(task)
                 return task
 
-        # One publication write carries normalized steps, PLANNED state, and
-        # the claimed plan version. Standalone engines have no GoalManager and
-        # retain compatible unversioned task behavior.
-        self.storage.save_task(task)
+        # One authoritative publication carries normalized steps, PLANNED
+        # state, and exact plan version. A stale/restarted claimant adopts the
+        # existing canonical task instead of creating a second executable row.
+        if self.goal_manager is not None and task.goal_id:
+            claim_task = getattr(self.storage, "claim_task_for_plan", None)
+            if not callable(claim_task):
+                raise TaskStateError(
+                    "storage lacks atomic exact-plan task claim (fail closed)"
+                )
+            canonical, published = claim_task(task)
+            if not published:
+                if (plan_record is not None
+                        and not self._task_matches_latest_plan(
+                            canonical, plan_record
+                        )):
+                    raise TaskStateError(
+                        f"canonical task {canonical.id} diverges from plan "
+                        f"v{canonical.plan_version} (fail closed)"
+                    )
+                task.__dict__.update(canonical.__dict__)
+                return task
+        else:
+            # Standalone engines retain compatible unversioned behavior.
+            self.storage.save_task(task)
         self._emit(
             "plan.produced",
             task_id=task.id,

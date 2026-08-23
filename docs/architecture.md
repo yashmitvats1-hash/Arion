@@ -448,7 +448,10 @@ authority exists:
 
 - normalized steps remain in memory while strategy/reason and plan version are
   durably claimed;
-- one task revision write publishes steps + PLANNED + exact plan version;
+- one `BEGIN IMMEDIATE` exact-plan task claim publishes or adopts the
+  deterministic task for `(goal_id, plan_version)`;
+- one task revision write within that claim carries steps + PLANNED + exact
+  plan version; stale/repeated reconstruction adopts the same task;
 - plan persistence failure terminalizes the task and executes nothing;
 - plan commit followed by task-save failure is recovered by existing stored-plan
   reconstruction;
@@ -457,6 +460,24 @@ authority exists:
   publication.
 
 See [`ADR-050`](adr/ADR-050-plan-task-publication-ordering.md).
+
+## Exact plan-version task claim (ADR-051)
+
+Normal managed publication and stored-plan reconstruction share one SQLite
+create/update-or-adopt boundary:
+
+- task snapshots for a goal are scanned under `BEGIN IMMEDIATE` for exact plan
+  version;
+- a deterministic existing task is returned, otherwise one candidate is
+  inserted or revision-CAS published;
+- repeated and stale-owner reconstruction emits no duplicate task/plan events;
+- stored reconstruction validates executable definition against immutable plan
+  summary;
+- historical duplicate exact tasks remain stored, but ADR-049 permits only the
+  deterministic canonical task to execute;
+- no additive relational plan-version column is required.
+
+See [`ADR-051`](adr/ADR-051-exact-plan-task-claim.md).
 
 ## Approval-Gated Goals, BLOCKED Semantics, Second Capability (ADR-017)
 

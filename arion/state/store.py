@@ -267,6 +267,7 @@ class Storage(Protocol):
     def list_goals(self, status: str | None = None) -> list[Goal]: ...
 
     def save_task(self, task: Task) -> None: ...
+    def claim_task_for_plan(self, task: Task) -> tuple[Task, bool]: ...
     def load_task(self, task_id: str) -> Task | None: ...
     def list_tasks(self, status: str | None = None) -> list[Task]: ...
 
@@ -618,6 +619,107 @@ class SQLiteStorage:
         except Exception:
             self._conn.rollback()
             task.revision = expected
+            task.updated_at = previous_updated_at
+            raise
+
+    @_threadsafe
+    def claim_task_for_plan(self, task: Task) -> tuple[Task, bool]:
+        """Atomically publish or adopt one task for an exact goal plan.
+
+        The task table keeps plan_version inside the full snapshot. Scanning all
+        rows for one goal under BEGIN IMMEDIATE still gives the default SQLite
+        path a single authoritative check/create-or-update decision without an
+        additive schema/index migration (ADR-051).
+        """
+        if (isinstance(task.plan_version, bool)
+                or not isinstance(task.plan_version, int)
+                or task.plan_version < 1
+                or task.status != TaskStatus.PLANNED):
+            raise TaskStateError(
+                "plan task claim requires PLANNED with positive plan_version"
+            )
+        expected_revision = task.revision
+        previous_updated_at = task.updated_at
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            rows = self._conn.execute(
+                "SELECT snapshot, revision, updated_at FROM tasks "
+                "WHERE goal_id=? ORDER BY rowid",
+                (task.goal_id,),
+            ).fetchall()
+            parsed = [self._task_from_storage_row(row) for row in rows]
+            exact = [
+                candidate for candidate in parsed
+                if candidate.plan_version == task.plan_version
+            ]
+            if exact:
+                canonical = min(
+                    exact, key=lambda candidate: (
+                        candidate.created_at, candidate.id
+                    )
+                )
+                self._conn.commit()
+                return canonical, False
+
+            durable = self._conn.execute(
+                "SELECT status, revision FROM tasks WHERE id=?",
+                (task.id,),
+            ).fetchone()
+            now = utcnow()
+            if durable is None:
+                if expected_revision != 0:
+                    raise TaskStateError(
+                        f"task {task.id} missing at revision "
+                        f"{expected_revision} (fail closed)"
+                    )
+                task.revision = 1
+                task.updated_at = now
+                self._conn.execute(
+                    "INSERT INTO tasks (id, goal_id, description, status, "
+                    "snapshot, revision, updated_at) VALUES (?,?,?,?,?,?,?)",
+                    (task.id, task.goal_id, task.description,
+                     task.status.value, json.dumps(task.to_dict()),
+                     task.revision, task.updated_at),
+                )
+            else:
+                durable_status = TaskStatus(durable[0])
+                durable_revision = int(durable[1])
+                if durable_revision != expected_revision:
+                    raise TaskStateError(
+                        f"stale task revision for {task.id}: expected "
+                        f"{expected_revision}, durable {durable_revision} "
+                        f"(fail closed)"
+                    )
+                if durable_status in TASK_TERMINAL_STATUSES:
+                    raise TaskStateError(
+                        f"terminal task {task.id} is immutable "
+                        f"({durable_status.value}; fail closed)"
+                    )
+                if task.status not in TASK_TRANSITIONS[durable_status]:
+                    raise TaskStateError(
+                        f"invalid task transition {durable_status.value} -> "
+                        f"{task.status.value} for {task.id} (fail closed)"
+                    )
+                task.revision = expected_revision + 1
+                task.updated_at = now
+                cursor = self._conn.execute(
+                    "UPDATE tasks SET goal_id=?, description=?, status=?, "
+                    "snapshot=?, revision=?, updated_at=? "
+                    "WHERE id=? AND revision=?",
+                    (task.goal_id, task.description, task.status.value,
+                     json.dumps(task.to_dict()), task.revision,
+                     task.updated_at, task.id, expected_revision),
+                )
+                if cursor.rowcount != 1:
+                    raise TaskStateError(
+                        f"task {task.id} lost plan publication race "
+                        f"(fail closed)"
+                    )
+            self._conn.commit()
+            return task, True
+        except Exception:
+            self._conn.rollback()
+            task.revision = expected_revision
             task.updated_at = previous_updated_at
             raise
 

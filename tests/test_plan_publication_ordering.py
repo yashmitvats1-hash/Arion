@@ -74,17 +74,17 @@ def test_plan_commit_then_task_save_failure_reconstructs_once_after_restart(
         db, first_planner, first_capability
     )
     goal_id = first.submit_goal("append exactly once").id
-    original_save = first_storage.save_task
+    original_claim = first_storage.claim_task_for_plan
 
-    def fail_planned_save(task):
+    def fail_planned_claim(task):
         if task.status is TaskStatus.PLANNED and task.plan_version is not None:
             raise RuntimeError("task publication unavailable")
-        return original_save(task)
+        return original_claim(task)
 
-    first_storage.save_task = fail_planned_save
+    first_storage.claim_task_for_plan = fail_planned_claim
     with pytest.raises(RuntimeError, match="task publication unavailable"):
         first.run_goal(goal_id)
-    first_storage.save_task = original_save
+    first_storage.claim_task_for_plan = original_claim
 
     plans = first_manager.plan_history(goal_id)
     tasks = [task for task in first_storage.list_tasks()
