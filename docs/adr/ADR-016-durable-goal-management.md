@@ -119,7 +119,9 @@ unrelated facts (e.g. `system_uptime`) never trigger a replan.
   `replan_explicit_resume`, ... (bounded, audited in `plan.versioned` +
   `goal.replanned`).
 - `engine.run_goal(goal_id, max_replans=5)` is the long-horizon loop with
-  **per-call cycle semantics**: it evaluates, replans and executes, but
+  **per-call cycle semantics**. ADR-045 later placed one renewable durable
+  per-goal run lease around this loop so concurrent processes cannot both pass
+  pending-task checks and create duplicate work. It evaluates, replans and executes, but
   returns as soon as a task FAILS (goal stays ACTIVE with the failure
   persisted) so the caller decides the next cycle; replanning is bounded
   across calls by `max_replans` (exceeded → goal FAILED with

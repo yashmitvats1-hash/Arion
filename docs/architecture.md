@@ -344,10 +344,12 @@ Learn → Replan`, owned by an authoritative, restart-safe `GoalManager`.
   concurrent claims adopt one canonical plan when no task implements it; an
   equivalent replan after a task references the latest plan creates a new
   version. Gaps from pruning are valid (dense numbering is not required).
-  `run_goal` is a per-call long-horizon cycle: it
-  returns ACTIVE when a task fails (failure persisted), replanning is bounded
-  by `max_replans` across calls. Superseded-plan failures never block
-  completion once the newer plan is fully handled.
+  `run_goal` is a per-call long-horizon cycle: it returns ACTIVE when a task
+  fails (failure persisted), and replanning is bounded by `max_replans` across
+  calls. ADR-045 adds one renewable durable run lease per goal before this
+  check/plan/create loop, so concurrent engines cannot turn one goal into
+  duplicate tasks/plans/effects. Superseded-plan failures never block completion
+  once the newer plan is fully handled.
 - **World-state → replan seam:** material environment fact changes (capability
   registrations, keys the plan depends on) trigger reevaluation → replan;
   unrelated facts (e.g. `system_uptime`) are filtered out. Deterministic and
@@ -367,12 +369,33 @@ Learn → Replan`, owned by an authoritative, restart-safe `GoalManager`.
   `ActionSpec` metadata - old successful decisions are never reused after
   metadata changes (adversarial tests + demo).
 - **Audit:** `goal.created`, `goal.state.changed`, `goal.evaluated`,
-  `goal.replanned`, `progress.evaluated`, `plan.versioned` (plus existing
-  `strategy.selected`, `world.state.changed`); bounded metadata only.
+  `goal.replanned`, `goal.run.claimed|contended|released|ownership_lost`,
+  `progress.evaluated`, `plan.versioned` (plus existing `strategy.selected`,
+  `world.state.changed`); bounded metadata only.
 - **CLI:** `arion goals list|show|progress|pause|resume|cancel [--json]`.
 - **Demo:** `scripts/demo_goal_replan.py` — 3-cycle race demo with a mid-goal
   restart proving state/version/progress/provenance survival, no duplicate
   plan versions, and live-metadata re-authorization. Runs offline.
+
+## Per-goal run ownership (ADR-045)
+
+Long-horizon execution now claims a renewable internal lease keyed by goal ID
+before evaluating, planning, or creating tasks:
+
+- `run_goal` has one live owner across engine processes;
+- `run_goals` independently claims each distinct goal and runs only owned goals;
+- a contender returns current durable goal state without planner/task/scheduler/
+  capability activity;
+- active ownership uses the scheduler/process lease duration and heartbeats
+  through blocking planning and execution;
+- crashed ownership expires and is lazily reclaimed by the existing SQLite
+  lease transaction; internal rows are excluded from public mutation-lock
+  list/bulk-reclaim surfaces;
+- the reserved `arion:goal-run` namespace is coordination only and cannot grant
+  policy, approval, scheduler, recovery, or mutation authority;
+- different goals retain existing shared-scheduler concurrency.
+
+See [`ADR-045`](adr/ADR-045-per-goal-run-lease.md).
 
 ## Approval-Gated Goals, BLOCKED Semantics, Second Capability (ADR-017)
 
@@ -668,8 +691,10 @@ loop (ADR-016):
 - **Scope:** multiple goals/tasks share ONE bounded in-process scheduler
   (`ArionEngine.run_tasks`/`run_goals`) with a global `max_concurrency`
   (default 1 = historical behavior). Total running workers never exceed the
-  bound; independent tasks execute concurrently; a blocked/approval-pending/
-  recovery-gated goal consumes no worker and never stalls the others.
+  bound; independent tasks from different owned goals execute concurrently; a
+  blocked/approval-pending/recovery-gated goal consumes no worker and never
+  stalls the others. ADR-045 serializes only duplicate runners for the same
+  goal ID before task creation.
 - **Durable scheduler registry:** `arion/state/scheduler_work.py` +
   `scheduler_work` table (typed store protocol, no raw SQLite from the
   engine/CLI). States QUEUED/RUNNING/COMPLETED/FAILED/CANCELLED/ABANDONED

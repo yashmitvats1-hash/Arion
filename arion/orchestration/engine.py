@@ -31,6 +31,7 @@ from typing import Any
 from arion.capabilities.observations import normalize_observation
 from arion.capabilities.registry import CapabilityError, CapabilityRegistry
 from arion.state.approvals import ApprovalError, ApprovalRequest, ApprovalStatus, ApprovalStore
+from arion.state.locks import GOAL_RUN_RESOURCE_KIND
 from arion.state.recovery import MutationRecovery, RecoveryError, RecoveryStatus
 from arion.state.scheduler_work import SchedulerStateError, SchedulerWorkStatus
 from arion.intelligence.plan_schema import PlanValidationError
@@ -573,6 +574,97 @@ class ArionEngine:
                 pass
         return self.recovery_store.get_recovery(recovery_id)
 
+    # ---------- per-goal run ownership (ADR-045) ----------
+
+    def _acquire_goal_run_lease(self, goal_id: str):
+        """Claim one durable goal-run owner, or return None on contention.
+
+        This internal namespace reuses the proven SQLite advisory-lease
+        primitive. It is coordination only and never substitutes for task,
+        scheduler, approval, recovery, or mutation-resource authority.
+        """
+        if self.mutation_lock_store is None:
+            return (None, None)  # compatibility for alternate minimal stores
+        from arion.state.locks import MutationLockError
+
+        owner = self._lock_owner()
+        try:
+            lock = self.mutation_lock_store.acquire(
+                GOAL_RUN_RESOURCE_KIND,
+                goal_id,
+                "orchestration.goal",
+                "run",
+                owner,
+                lease_seconds=self.scheduler_lease_seconds,
+                now=self._lock_now(),
+            )
+        except MutationLockError:
+            try:
+                self._emit("goal.run.contended", task_id=None, success=False,
+                           detail={"goal_id": goal_id})
+            except Exception:
+                pass
+            return None
+        heartbeat = self._start_lock_heartbeat(
+            lock, lease_seconds=self.scheduler_lease_seconds
+        )
+        try:
+            self._emit("goal.run.claimed", task_id=None, detail={
+                "goal_id": goal_id,
+                "lock_id": lock.lock_id,
+                "owner_id": lock.owner_id,
+            })
+        except Exception:
+            self._stop_lock_heartbeat(heartbeat)
+            try:
+                self.mutation_lock_store.release(lock.lock_id, lock.owner_id)
+            except Exception:
+                pass
+            raise
+        return lock, heartbeat
+
+    def _release_goal_run_lease(self, goal_id: str, claim) -> None:
+        if claim is None:
+            return
+        lock, heartbeat = claim
+        if lock is None:
+            return
+        state = self._stop_lock_heartbeat(heartbeat)
+        if state.get("error") is not None:
+            try:
+                self._emit("goal.run.ownership_lost", task_id=None,
+                           success=False, detail={
+                               "goal_id": goal_id,
+                               "lock_id": lock.lock_id,
+                               "error_type": type(state["error"]).__name__,
+                           })
+            except Exception:
+                pass
+        try:
+            released = self.mutation_lock_store.release(
+                lock.lock_id, lock.owner_id
+            )
+            self._emit(
+                "goal.run.released" if released else "goal.run.ownership_lost",
+                task_id=None,
+                success=bool(released),
+                detail={
+                    "goal_id": goal_id,
+                    "lock_id": lock.lock_id,
+                    "owner_id": lock.owner_id,
+                },
+            )
+        except Exception as exc:
+            try:
+                self._emit("error", task_id=None, success=False, detail={
+                    "category": "goal_run_release",
+                    "error_type": type(exc).__name__,
+                    "error": "goal run lease release failed",
+                    "goal_id": goal_id,
+                })
+            except Exception:
+                pass
+
     # ---------- advisory mutation locks (ADR-021) ----------
 
     def _lock_now(self) -> str:
@@ -597,35 +689,41 @@ class ArionEngine:
         """Explicit, unique owner/process identity for this engine's locks."""
         return f"proc:{os.getpid()}:{new_id('owner')}"
 
-    def _renew_mutation_lock(self, lock):
+    def _renew_mutation_lock(self, lock, lease_seconds: float | None = None):
         renew = getattr(self.mutation_lock_store, "renew", None)
         if not callable(renew):
             return lock  # compatibility for alternate legacy stores
+        lease = (
+            self.mutation_lock_lease_seconds
+            if lease_seconds is None else max(0.0, float(lease_seconds))
+        )
         renewed = renew(
             lock.lock_id, lock.owner_id,
-            lease_seconds=self.mutation_lock_lease_seconds,
+            lease_seconds=lease,
             now=self._lock_now(),
         )
         lock.expires_at = renewed.expires_at
         return renewed
 
-    def _start_lock_heartbeat(self, lock):
-        """Renew one live mutation owner while capability code is blocking."""
+    def _start_lock_heartbeat(self, lock,
+                              lease_seconds: float | None = None):
+        """Renew one live advisory owner while blocking code runs."""
+        lease = (
+            self.mutation_lock_lease_seconds
+            if lease_seconds is None else max(0.0, float(lease_seconds))
+        )
         if (lock is None or self.mutation_lock_store is None
                 or not callable(getattr(self.mutation_lock_store, "renew", None))
-                or self.mutation_lock_lease_seconds <= 0):
+                or lease <= 0):
             return None
         stop = _threading.Event()
         state: dict[str, Any] = {"error": None}
-        interval = max(
-            0.01,
-            min(5.0, float(self.mutation_lock_lease_seconds) / 3.0),
-        )
+        interval = max(0.01, min(5.0, lease / 3.0))
 
         def heartbeat() -> None:
             while not stop.wait(interval):
                 try:
-                    self._renew_mutation_lock(lock)
+                    self._renew_mutation_lock(lock, lease_seconds=lease)
                 except Exception as exc:
                     state["error"] = exc
                     return
@@ -1408,7 +1506,23 @@ class ArionEngine:
         return task
 
     def run_goal(self, goal_id: str, max_replans: int = 5) -> Goal:
-        """Long-horizon goal loop (ADR-016/017):
+        """Run one goal only while holding its durable run lease."""
+        gm = self.goal_manager
+        if gm is None:
+            raise ValueError("goal manager not wired; use execute_goal instead")
+        claim = self._acquire_goal_run_lease(goal_id)
+        if claim is None:
+            goal = gm.get_goal(goal_id)
+            if goal is None:
+                raise KeyError(f"goal not found: {goal_id}")
+            return goal
+        try:
+            return self._run_goal_owned(goal_id, max_replans=max_replans)
+        finally:
+            self._release_goal_run_lease(goal_id, claim)
+
+    def _run_goal_owned(self, goal_id: str, max_replans: int = 5) -> Goal:
+        """Long-horizon goal loop (ADR-016/017), with ownership preclaimed:
 
           Goal -> Goal State -> Strategy -> Plan -> Execute -> Observe ->
           Learn -> Replan
@@ -2857,7 +2971,34 @@ class ArionEngine:
         self._cancel_waiters_for_task(task)
 
     def run_goals(self, goal_ids: list[str], max_replans: int = 5) -> dict[str, Goal]:
-        """Drive MULTIPLE goals through the shared scheduler (ADR-025).
+        """Drive only goals whose durable run lease this engine owns."""
+        gm = self.goal_manager
+        if gm is None:
+            raise ValueError("goal manager not wired; use execute_goal instead")
+        unique_goal_ids = list(dict.fromkeys(goal_ids))
+        claims: dict[str, Any] = {}
+        results: dict[str, Goal] = {}
+        try:
+            for goal_id in unique_goal_ids:
+                claim = self._acquire_goal_run_lease(goal_id)
+                if claim is None:
+                    goal = gm.get_goal(goal_id)
+                    if goal is None:
+                        raise KeyError(f"goal not found: {goal_id}")
+                    results[goal_id] = goal
+                else:
+                    claims[goal_id] = claim
+            if claims:
+                results.update(self._run_goals_owned(
+                    list(claims), max_replans=max_replans
+                ))
+            return results
+        finally:
+            for goal_id in reversed(list(claims)):
+                self._release_goal_run_lease(goal_id, claims[goal_id])
+
+    def _run_goals_owned(self, goal_ids: list[str], max_replans: int = 5) -> dict[str, Goal]:
+        """Drive MULTIPLE preclaimed goals through the shared scheduler (ADR-025).
 
         Each goal keeps its existing long-horizon lifecycle (ADR-016/017):
         evaluate -> plan -> execute -> observe -> replan/complete, but the

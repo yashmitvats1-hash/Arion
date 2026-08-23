@@ -37,7 +37,13 @@ from arion.state.models import (
     utcnow,
 )
 from arion.state.recovery import MutationRecovery
-from arion.state.locks import LockWaiter, LockWaiterStatus, MutationLock, MutationLockError
+from arion.state.locks import (
+    INTERNAL_LOCK_RESOURCE_KINDS,
+    LockWaiter,
+    LockWaiterStatus,
+    MutationLock,
+    MutationLockError,
+)
 from arion.state.scheduler_work import (
     SchedulerRegistryError,
     SchedulerStateError,
@@ -1441,6 +1447,13 @@ class SQLiteStorage:
         if resource_kind:
             clauses.append("resource_kind = ?")
             params.append(resource_kind)
+        else:
+            # Public mutation-lock enumeration excludes internal orchestration
+            # lease namespaces. Explicit-kind queries remain available to the
+            # owning engine and focused tests (ADR-045).
+            placeholders = ",".join("?" * len(INTERNAL_LOCK_RESOURCE_KINDS))
+            clauses.append(f"resource_kind NOT IN ({placeholders})")
+            params.extend(sorted(INTERNAL_LOCK_RESOURCE_KINDS))
         if resource:
             clauses.append("resource = ?")
             params.append(resource)
@@ -1463,6 +1476,10 @@ class SQLiteStorage:
         if resource_kind:
             clauses.append("resource_kind = ?")
             params.append(resource_kind)
+        else:
+            placeholders = ",".join("?" * len(INTERNAL_LOCK_RESOURCE_KINDS))
+            clauses.append(f"resource_kind NOT IN ({placeholders})")
+            params.extend(sorted(INTERNAL_LOCK_RESOURCE_KINDS))
         if resource:
             clauses.append("resource = ?")
             params.append(resource)

@@ -36,6 +36,13 @@ from typing import Any, Protocol
 from arion.state.models import new_id, utcnow
 
 
+# Reserved orchestration coordination namespace. Internal goal-run leases share
+# the proven SQLite lease primitive but are not capability mutation locks and
+# therefore stay out of public mutation-lock listing/reclaim APIs (ADR-045).
+GOAL_RUN_RESOURCE_KIND = "arion:goal-run"
+INTERNAL_LOCK_RESOURCE_KINDS = frozenset({GOAL_RUN_RESOURCE_KIND})
+
+
 class MutationLockStatus(str, Enum):
     HELD = "held"      # owned by a live lease
     EXPIRED = "expired"  # lease elapsed; reclaimable (derived from expires_at)

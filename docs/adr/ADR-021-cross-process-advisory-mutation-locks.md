@@ -163,6 +163,10 @@ bypass the real lock store).
 - Explicit statements:
   **A mutation lock is coordination, not authorization.**
   **Authorization is evaluated independently for every mutation attempt.**
+- ADR-045 later reuses the same proven lease table under the disjoint internal
+  `arion:goal-run` resource kind to serialize long-horizon runners for one goal.
+  That internal lease is also coordination only and never substitutes for the
+  capability mutation-resource lock or authorization.
 
 ## Deferred
 
