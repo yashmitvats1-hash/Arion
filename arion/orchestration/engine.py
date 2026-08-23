@@ -31,6 +31,7 @@ from typing import Any
 
 from arion.capabilities.observations import normalize_observation
 from arion.capabilities.registry import CapabilityError, CapabilityRegistry
+from arion.cognition.goals import GoalPlanLineageError
 from arion.state.approvals import ApprovalError, ApprovalRequest, ApprovalStatus, ApprovalStore
 from arion.state.locks import GOAL_RUN_RESOURCE_KIND
 from arion.state.recovery import MutationRecovery, RecoveryError, RecoveryStatus
@@ -1779,7 +1780,30 @@ class ArionEngine:
                 if not self._goal_run_lease_current(
                         goal_id, goal_run_claim, "goal completion"):
                     return gm.get_goal(goal_id)
-                gm.complete_goal(goal_id, reason="all_work_complete")
+                try:
+                    gm.complete_goal(
+                        goal_id,
+                        reason="all_work_complete",
+                        expect_plan_version=(
+                            result.evidence.get("latest_plan_version")
+                            if isinstance(result.evidence, dict) else None
+                        ),
+                    )
+                except GoalPlanLineageError:
+                    # ADR-054: the completion decision's plan authority is
+                    # stale - a newer immutable plan became latest inside the
+                    # evaluate -> transition window. Fail closed: no
+                    # completion, no failure, no new authority; re-evaluate
+                    # against current durable state.
+                    self._emit("goal.completion.fenced", task_id=None, detail={
+                        "goal_id": goal_id,
+                        "expected_plan_version": (
+                            result.evidence.get("latest_plan_version")
+                            if isinstance(result.evidence, dict) else None
+                        ),
+                        "reason": "plan lineage advanced before completion",
+                    })
+                    continue
                 return gm.get_goal(goal_id)
 
             if action == "replan":
@@ -3676,7 +3700,29 @@ class ArionEngine:
                             gid, goal_run_claim, "shared goal completion"):
                         results[gid] = gm.get_goal(gid)
                         continue
-                    gm.complete_goal(gid, reason="all_work_complete")
+                    try:
+                        gm.complete_goal(
+                            gid,
+                            reason="all_work_complete",
+                            expect_plan_version=(
+                                result.evidence.get("latest_plan_version")
+                                if isinstance(result.evidence, dict) else None
+                            ),
+                        )
+                    except GoalPlanLineageError:
+                        # ADR-054 (shared loop): stale plan authority for the
+                        # completion decision. Fail closed; the goal stays
+                        # non-terminal and is re-evaluated against current
+                        # durable state on the next cycle/invocation.
+                        self._emit("goal.completion.fenced", task_id=None, detail={
+                            "goal_id": gid,
+                            "expected_plan_version": (
+                                result.evidence.get("latest_plan_version")
+                                if isinstance(result.evidence, dict) else None
+                            ),
+                            "reason": "plan lineage advanced before completion",
+                        })
+                        continue
                     results[gid] = gm.get_goal(gid)
                     continue
                 if action == "await_approval":

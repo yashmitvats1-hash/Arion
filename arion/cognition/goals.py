@@ -48,6 +48,17 @@ from arion.state.models import (
 _GOAL_CAS_MAX_ATTEMPTS = 8
 
 
+class GoalPlanLineageError(GoalStateError):
+    """A transition's expected immutable plan lineage no longer matches the
+    authoritative latest plan (ADR-054; fail closed, nothing mutated).
+
+    Raised when a terminal completion request carries the plan version its
+    evaluation assessed but a NEWER immutable plan version has become the
+    authoritative latest before the transition commits. Goal-row CAS cannot
+    detect this: plan commits intentionally never bump ``goal.version``.
+    """
+
+
 class GoalManager:
     """Authoritative, persistent goal state machine (ADR-016)."""
 
@@ -162,7 +173,8 @@ class GoalManager:
             columns=("last_replan_reason",), op="set_replan_reason")
 
     def transition(self, goal_id: str, to_state: str, reason: str, actor: str = "system",
-                   fields: dict[str, Any] | None = None) -> Goal:
+                   fields: dict[str, Any] | None = None,
+                   expect_plan_version: int | None = None) -> Goal:
         """Validate + persist a goal state transition (fail closed).
 
         On a CAS miss the canonical row is reloaded and the transition
@@ -170,10 +182,24 @@ class GoalManager:
         only after the write commits. ``fields`` (e.g. last_replan_reason
         on fail_goal) are applied in the SAME successful write so the
         version increments exactly once.
+
+        ADR-054 plan-lineage fence: when ``expect_plan_version`` is given,
+        EVERY CAS attempt re-reads the authoritative latest immutable plan
+        and the transition is refused (``GoalPlanLineageError``, no state
+        mutated) unless that version is still latest. ``goal.version`` CAS
+        proves only row concurrency - plan commits never bump it - so this
+        is the boundary where evaluated plan authority is revalidated.
         """
         to_state = to_state.value if isinstance(to_state, GoalStatus) else to_state
         if to_state not in GOAL_TRANSITIONS:
             raise GoalStateError(f"unknown goal state {to_state!r}")
+        if expect_plan_version is not None and (
+                isinstance(expect_plan_version, bool)
+                or not isinstance(expect_plan_version, int)
+                or expect_plan_version < 1):
+            raise ValueError(
+                f"expect_plan_version must be a positive integer, got "
+                f"{expect_plan_version!r} (fail closed)")
         for _ in range(_GOAL_CAS_MAX_ATTEMPTS):
             goal = self.get_goal(goal_id)
             if goal is None:
@@ -183,6 +209,18 @@ class GoalManager:
                 raise GoalStateError(
                     f"invalid goal transition {goal.status.value!r} -> {to_state!r} for goal {goal_id}"
                 )
+            if expect_plan_version is not None:
+                # ADR-054: checked INSIDE the retry loop so a CAS retry can
+                # never reuse stale plan authority from an earlier attempt.
+                latest = self.latest_plan(goal_id)
+                latest_version = latest["plan_version"] if latest else None
+                if latest_version != expect_plan_version:
+                    raise GoalPlanLineageError(
+                        f"goal {goal_id} transition {to_state!r} denied: "
+                        f"evaluated plan {expect_plan_version} is no longer "
+                        f"the latest immutable plan (latest={latest_version}); "
+                        f"fail closed"
+                    )
             old_state = goal.status.value
             expected = goal.version
             goal.status = GoalStatus(to_state)
@@ -237,8 +275,13 @@ class GoalManager:
             fields={"last_replan_reason": reason},
         )
 
-    def complete_goal(self, goal_id: str, reason: str = "all_work_complete") -> Goal:
-        return self.transition(goal_id, GoalStatus.COMPLETED.value, reason)
+    def complete_goal(self, goal_id: str, reason: str = "all_work_complete",
+                      expect_plan_version: int | None = None) -> Goal:
+        """Terminal completion; ADR-054: pass the immutable plan version the
+        completion decision evaluated (``evidence["latest_plan_version"]``)
+        so the transition can refuse stale plan authority."""
+        return self.transition(goal_id, GoalStatus.COMPLETED.value, reason,
+                               expect_plan_version=expect_plan_version)
 
     def set_blocked(self, goal_id: str, blocker: dict[str, Any], reason: str = "blocker") -> Goal:
         """Attach a blocker (upsert by key) and move ACTIVE -> BLOCKED.

@@ -37,6 +37,7 @@ EVENT_KINDS = (
     "goal.run.contended",
     "goal.run.released",
     "goal.run.ownership_lost",
+    "goal.completion.fenced",
     "capability.unavailable",
     "capability.available",
     "task.approval.resumed",
