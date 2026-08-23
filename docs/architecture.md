@@ -432,9 +432,13 @@ Goal completion and progress now distinguish current work from task history:
 - superseded successes remain evidence but cannot satisfy a newer plan;
 - a plan committed before task creation remains outstanding, allowing existing
   stored-plan reconstruction after restart;
-- latest resumable/failure decisions use the same scoped task set.
+- latest resumable/failure decisions use the same scoped task set;
+- ADR-049 applies the same authority to approval and execution: superseded
+  requests are denied, stale tasks fail before capability start, and newer plans
+  committed during authorization/lock wait win.
 
-See [`ADR-048`](adr/ADR-048-latest-plan-completion-authority.md).
+See [`ADR-048`](adr/ADR-048-latest-plan-completion-authority.md) and
+[`ADR-049`](adr/ADR-049-latest-plan-execution-authority.md).
 
 ## Approval-Gated Goals, BLOCKED Semantics, Second Capability (ADR-017)
 
@@ -1252,6 +1256,8 @@ Human decisions and executable task state now transition as one durable unit:
 - configured TTL is enforced when deciding, not only by explicit expiry sweeps;
 - terminal/cancelled goals cannot be revived through pending or previously
   approved work;
+- superseded-plan requests cannot approve/reconcile obsolete tasks; pending
+  requests are atomically denied with the task (ADR-049);
 - approval persistence failure fails the task closed instead of creating an
   awaiting task with no resolvable request;
 - compatibility `update_request` is status/provenance preserving, and

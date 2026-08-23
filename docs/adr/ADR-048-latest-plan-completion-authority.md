@@ -113,7 +113,9 @@ progress retains historical behavior.
 
 Latest resumable and failed-task decisions use the same authoritative task set.
 An unversioned stale row cannot override an exact latest implementation;
-superseded explicit versions remain non-blocking.
+superseded explicit versions remain non-blocking. ADR-049 later applied the same
+latest-plan predicate to approval and capability-execution boundaries, preventing
+obsolete tasks from producing effects as well as completion.
 
 ## Compatibility
 

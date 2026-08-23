@@ -158,7 +158,9 @@ at the same execution boundaries without failing the task.
 `run_task()` also checks durable `REQUIRED` recovery. A split crash leaving a
 pending task is fenced to `FAILED` without capability execution. ADR-046 later
 wrapped direct task resume in the same per-goal run lease used by ADR-045, while
-owned goal loops call the unchanged task state machine internally.
+owned goal loops call the unchanged task state machine internally. ADR-049 adds
+latest-plan fencing before task/worker/mutation execution; superseded failures
+remain historical under ADR-048.
 
 ### Mutation release ordering
 

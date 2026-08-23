@@ -126,6 +126,9 @@ human decision have one deterministic winner.
   and request-only transitions to DENIED/EXPIRED cleanup; historical raw
   APPROVED split rows remain reconcilable, but current compatibility APIs cannot
   manufacture them.
+- ADR-049 rejects approval/reconciliation when the referenced task implements an
+  explicitly superseded plan; a pending request is denied atomically with its
+  task before any obsolete effect can execute.
 - No destructive migration, workflow engine, voting model, or policy redesign.
 - Alternate stores may implement the conditional protocol; the default SQLite
   path is authoritative. Missing atomic support fails closed for durable queue

@@ -1141,6 +1141,8 @@ class ArionEngine:
         relevant changed). Returns True when the step may proceed; False when
         the step was paused (fresh approval queued) or denied - the caller
         must NOT execute the capability."""
+        if self._fence_task_for_superseded_plan(task):
+            return False
         if self._observe_goal_pause(task):
             if waited:
                 # Lock acquisition cleared durable wait coordination in memory.
@@ -1825,6 +1827,78 @@ class ArionEngine:
     def _goal_is_terminal_for_approval(self, task: Task) -> bool:
         return self._terminal_goal_status(task) is not None
 
+    def _task_implements_latest_plan(self, task: Task) -> bool:
+        """Whether this task is executable authority for the current plan."""
+        if self.goal_manager is None or not task.goal_id:
+            return True
+        try:
+            latest = self.goal_manager.latest_plan(task.goal_id)
+            if latest is None:
+                return True
+            latest_version = latest.get("plan_version")
+            if task.plan_version == latest_version:
+                return True
+            if task.plan_version is not None:
+                return False
+            exact = [
+                candidate for candidate in self.storage.list_tasks()
+                if (candidate.goal_id == task.goal_id
+                    and candidate.plan_version == latest_version)
+            ]
+            if exact:
+                return False
+            # Legacy unversioned tasks are a fallback only when they are not
+            # older than the latest plan row. A pre-plan task is safely
+            # reconstructed instead of guessed into current authority.
+            latest_created = latest.get("created_at")
+            return not latest_created or task.created_at >= latest_created
+        except Exception:
+            return False
+
+    def _fence_task_for_superseded_plan(self, task: Task) -> bool:
+        """Terminalize non-current task work without executing a capability."""
+        if (task.status in TASK_TERMINAL_STATUSES
+                or self._task_implements_latest_plan(task)):
+            return False
+        reason = "task superseded by a newer goal plan; execution denied"
+        step = task.active_step
+        if (task.status == TaskStatus.AWAITING_APPROVAL
+                and step is not None and self.approval_store is not None):
+            pending = self._pending_request_for_step(task.id, step.index)
+            if pending is not None:
+                self._apply_approval_status(
+                    pending,
+                    ApprovalStatus.DENIED,
+                    "system:superseded_plan",
+                    reason,
+                )
+                canonical = self.storage.load_task(task.id)
+                if canonical is not None:
+                    task.__dict__.update(canonical.__dict__)
+                return True
+        if step is not None and step.status in (
+                StepStatus.PENDING, StepStatus.RUNNING):
+            step.status = StepStatus.FAILED
+            step.error = reason
+        task.status = TaskStatus.FAILED
+        task.error = reason
+        task.lock_wait = None
+        task.completed_at = utcnow()
+        try:
+            self.storage.save_task(task)
+        except TaskStateError:
+            canonical = self.storage.load_task(task.id)
+            if canonical is not None:
+                task.__dict__.update(canonical.__dict__)
+        self._cancel_waiters_for_task(task)
+        self._emit("task.failed", task_id=task.id, detail={
+            "step_index": step.index if step is not None else None,
+            "error": reason,
+            "superseded_plan": True,
+        })
+        self._record_memory(task)
+        return True
+
     def _goal_is_paused(self, task: Task) -> bool:
         """Return current PAUSED authority; read failures stop work safely."""
         if self.goal_manager is None or not task.goal_id:
@@ -1904,6 +1978,12 @@ class ArionEngine:
         req = self.approval_store.get_request(approval_id)
         if req is None:
             raise ApprovalError(f"unknown approval id: {approval_id}")
+        candidate_task = self.storage.load_task(req.task_id)
+        if (candidate_task is not None
+                and self._fence_task_for_superseded_plan(candidate_task)):
+            raise ApprovalError(
+                f"approval {approval_id} cannot revive a superseded plan task"
+            )
         target = (
             ApprovalStatus.APPROVED
             if outcome == ApprovalOutcome.APPROVED else ApprovalStatus.DENIED
@@ -2344,6 +2424,8 @@ class ArionEngine:
         task = self.storage.load_task(task_id)
         if task is None:
             raise KeyError(f"task not found: {task_id}")
+        if self._fence_task_for_superseded_plan(task):
+            return self.storage.load_task(task.id) or task
         if self._goal_is_paused(task):
             return task
 
@@ -2472,6 +2554,8 @@ class ArionEngine:
         # reproduces the historical sequential behavior exactly.
         self._skipped_emitted = getattr(self, "_skipped_emitted", set())
         while True:
+            if self._fence_task_for_superseded_plan(task):
+                return self.storage.load_task(task.id) or task
             if self._goal_is_paused(task):
                 return self.storage.load_task(task.id) or task
             # emit step.skipped provenance for skipped steps we walk past
@@ -2693,8 +2777,13 @@ class ArionEngine:
             plan: dict[str, dict[str, Any]] = {}
             for tid in order:
                 task = tasks[tid]
-                if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED,
-                                   TaskStatus.AWAITING_APPROVAL):
+                if task.status in TASK_TERMINAL_STATUSES:
+                    results[tid] = task
+                    continue
+                if self._fence_task_for_superseded_plan(task):
+                    results[tid] = self.storage.load_task(task.id) or task
+                    continue
+                if task.status == TaskStatus.AWAITING_APPROVAL:
                     results[tid] = task
                     continue
                 if self._goal_is_paused(task):
@@ -3501,6 +3590,7 @@ class ArionEngine:
         try:
             if (not self._fail_task_for_terminal_goal(
                     task, step, phase="worker start")
+                    and not self._fence_task_for_superseded_plan(task)
                     and not self._observe_goal_pause(task)
                     and self._task_step_is_current(task, step)):
                 self._execute_step(task, step)
@@ -3509,6 +3599,7 @@ class ArionEngine:
                 # but no next step/completion begins while paused.
                 self._fail_task_for_terminal_goal(
                     task, step, phase="worker completion")
+                self._fence_task_for_superseded_plan(task)
                 self._observe_goal_pause(task)
         finally:
             heartbeat_state = self._stop_lock_heartbeat(scheduler_heartbeat)
@@ -3627,9 +3718,11 @@ class ArionEngine:
             if not self._handle_approval(task, step, request, decision):
                 return  # denied or paused (task will be checkpointed by the caller)
 
-        # 3. Execute with retries, then 4. verify. A pause committed during
-        # authorization/approval is authoritative before capability start.
-        if self._observe_goal_pause(task):
+        # 3. Execute with retries, then 4. verify. A newer plan or pause
+        # committed during authorization/approval is authoritative before
+        # capability start.
+        if (self._fence_task_for_superseded_plan(task)
+                or self._observe_goal_pause(task)):
             return
         self._execute_with_retries(task, step, capability, spec)
 
