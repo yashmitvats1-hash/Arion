@@ -114,7 +114,9 @@ unrelated facts (e.g. `system_uptime`) never trigger a replan.
 ### 4. Plan versioning + replanning loop
 
 - `record_plan_version` appends a NEW version (monotonic `plan_version`
-  starting at 1); previous versions are immutable and never rewritten.
+  starting at 1); previous versions are immutable and never rewritten. ADR-050
+  later made this claim precede publication of managed task steps/PLANNED state,
+  so plan persistence failure cannot leave executable unversioned work.
 - **Replay-safe:** if the latest version matches (strategy, summary, reason)
   AND no task implements it yet, the existing version is returned instead of
   duplicating it. A failure against the latest version always yields a

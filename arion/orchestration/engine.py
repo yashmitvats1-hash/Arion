@@ -3398,19 +3398,16 @@ class ArionEngine:
                 s.error = None
         task.steps = steps
         task.status = TaskStatus.PLANNED
-        self.storage.save_task(task)
-        self._emit(
-            "plan.produced",
-            task_id=task.id,
-            detail={"steps": self._plan_steps_for_audit(steps)},
-        )
+        plan_reason: str | None = None
+        plan_record: dict[str, Any] | None = None
+        strategy_name = "direct"
 
-        # Long-horizon goal management (ADR-016): record an IMMUTABLE plan
-        # version + strategy against the goal; previous plans are never
-        # mutated. The task carries its plan_version for replay safety.
+        # For managed goals, the immutable plan claim is execution authority.
+        # Publish it BEFORE the task becomes durably PLANNED/executable. If
+        # task persistence later fails, restart reconstructs from the stored
+        # plan; the inverse task-without-plan state must never execute.
         if self.goal_manager is not None and task.goal_id:
             try:
-                strategy_name = "direct"
                 if context is not None and getattr(context, "strategy", None) is not None:
                     strategy_name = context.strategy.name
                 elif self.strategy_selector is not None:
@@ -3418,38 +3415,60 @@ class ArionEngine:
                     env_state = self.world_monitor.current_state() if self.world_monitor else {}
                     guidance = list(getattr(context, "guidance", []) or [])
                     outcome_history: list = []
-                    if self.goal_manager is not None:
-                        try:
-                            outcome_history = self.goal_manager.strategy_outcomes(limit=50)
-                        except Exception:
-                            outcome_history = []
+                    try:
+                        outcome_history = self.goal_manager.strategy_outcomes(limit=50)
+                    except Exception:
+                        outcome_history = []
                     strategy_name = self.strategy_selector.select(
                         task.description, beliefs, env_state, guidance,
                         outcome_history=outcome_history,
                     ).name
                 history = self.goal_manager.plan_history(task.goal_id)
-                reason = "initial_plan" if not history else (
+                plan_reason = "initial_plan" if not history else (
                     f"replan_{replan_reason}" if replan_reason else "replan"
                 )
-                record = self.goal_manager.record_plan_version(
-                    task.goal_id, strategy_name, [s.to_dict() for s in steps], reason
+                plan_record = self.goal_manager.record_plan_version(
+                    task.goal_id, strategy_name,
+                    [step.to_dict() for step in steps], plan_reason,
                 )
-                task.plan_version = record["plan_version"]
+                task.plan_version = plan_record["plan_version"]
+            except Exception as exc:
+                task.status = TaskStatus.FAILED
+                task.error = "planning persistence failed; execution denied"
+                task.completed_at = utcnow()
                 self.storage.save_task(task)
-                if reason.startswith("replan"):
-                    self._emit("goal.replanned", task_id=task.id, detail={
-                        "goal_id": task.goal_id,
-                        "plan_version": record["plan_version"],
-                        "strategy": strategy_name,
-                        "reason": reason[:200],
-                    })
-                    # keep the goal row's replan provenance in sync (the plan
-                    # history is the source of truth; this mirrors the reason
-                    # on the goal for CLI/debugging, ADR-016)
-                    try:
-                        self.goal_manager.set_replan_reason(task.goal_id, reason)
-                    except Exception:
-                        pass
+                self._emit("error", task_id=task.id, success=False, detail={
+                    "error": task.error,
+                    "error_type": type(exc).__name__,
+                    "category": "plan_persistence",
+                })
+                self._emit("task.failed", task_id=task.id,
+                           detail={"error": task.error})
+                self._record_memory(task)
+                return task
+
+        # One publication write carries normalized steps, PLANNED state, and
+        # the claimed plan version. Standalone engines have no GoalManager and
+        # retain compatible unversioned task behavior.
+        self.storage.save_task(task)
+        self._emit(
+            "plan.produced",
+            task_id=task.id,
+            detail={"steps": self._plan_steps_for_audit(steps)},
+        )
+
+        if plan_record is not None and plan_reason is not None \
+                and plan_reason.startswith("replan"):
+            self._emit("goal.replanned", task_id=task.id, detail={
+                "goal_id": task.goal_id,
+                "plan_version": plan_record["plan_version"],
+                "strategy": strategy_name,
+                "reason": plan_reason[:200],
+            })
+            # Plan history is authoritative; this goal field is a best-effort
+            # read-model mirror for CLI/debugging.
+            try:
+                self.goal_manager.set_replan_reason(task.goal_id, plan_reason)
             except Exception:
                 pass
         # Audit memory-driven plan transformation (non-mutating, provenance-

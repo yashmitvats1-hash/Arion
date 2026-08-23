@@ -189,6 +189,9 @@ No task/checkpoint/scheduler mega-transaction is introduced.
 - Scheduler schema, capacity policy, weights, reservations, and ceilings are
   unchanged.
 - Checkpoint representation and retention bound are unchanged.
+- ADR-050 later orders managed plan claim before executable task publication;
+  plan-before-task failure reuses stored-plan reconstruction, while plan-claim
+  failure terminalizes the non-executable task.
 
 ## Explicit limitations
 

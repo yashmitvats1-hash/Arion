@@ -117,6 +117,9 @@ The fence runs:
 - Exact latest tasks execute unchanged.
 - Unversioned tasks created after their plan remain a legacy fallback.
 - Stored-plan reconstruction creates exact versioned tasks and is unchanged.
+- ADR-050 later prevents managed planners from publishing executable
+  unversioned tasks at all; this ADR's unversioned rule remains only for legacy
+  and standalone compatibility.
 - Public method signatures and return types remain unchanged.
 
 ## Explicit limitations

@@ -354,7 +354,8 @@ Learn → Replan`, owned by an authoritative, restart-safe `GoalManager`.
   duplicate tasks/plans/effects. ADR-048 scopes handled/resumable/failed work to
   the latest plan's exact task version (legacy unversioned fallback only), so
   superseded successes cannot complete newer work and superseded failures remain
-  non-blocking.
+  non-blocking. ADR-050 publishes immutable plan authority before a managed task
+  becomes durably PLANNED/executable.
 - **World-state → replan seam:** material environment fact changes (capability
   registrations, keys the plan depends on) trigger reevaluation → replan;
   unrelated facts (e.g. `system_uptime`) are filtered out. Deterministic and
@@ -439,6 +440,23 @@ Goal completion and progress now distinguish current work from task history:
 
 See [`ADR-048`](adr/ADR-048-latest-plan-completion-authority.md) and
 [`ADR-049`](adr/ADR-049-latest-plan-execution-authority.md).
+
+## Plan/task publication ordering (ADR-050)
+
+Goal-managed planner output becomes executable only after immutable plan
+authority exists:
+
+- normalized steps remain in memory while strategy/reason and plan version are
+  durably claimed;
+- one task revision write publishes steps + PLANNED + exact plan version;
+- plan persistence failure terminalizes the task and executes nothing;
+- plan commit followed by task-save failure is recovered by existing stored-plan
+  reconstruction;
+- standalone engines without GoalManager retain unversioned task behavior;
+- `plan.produced`, replan provenance, and checkpoints follow authoritative task
+  publication.
+
+See [`ADR-050`](adr/ADR-050-plan-task-publication-ordering.md).
 
 ## Approval-Gated Goals, BLOCKED Semantics, Second Capability (ADR-017)
 
