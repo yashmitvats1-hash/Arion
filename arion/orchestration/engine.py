@@ -1141,8 +1141,20 @@ class ArionEngine:
         relevant changed). Returns True when the step may proceed; False when
         the step was paused (fresh approval queued) or denied - the caller
         must NOT execute the capability."""
+        if self._observe_goal_pause(task):
+            if waited:
+                # Lock acquisition cleared durable wait coordination in memory.
+                # Persist that cleanup before stopping on PAUSED, otherwise a
+                # restart can remain parked behind an already-acquired waiter.
+                try:
+                    self.storage.save_task(task)
+                except TaskStateError:
+                    canonical = self.storage.load_task(task.id)
+                    if canonical is not None:
+                        task.__dict__.update(canonical.__dict__)
+            return False
         if not waited:
-            return True  # no contention: worker preflight already validated
+            return True  # no contention: worker/authz pause checks validated
         if (self._fail_task_for_terminal_goal(
                 task, step, phase="post-lock-wait")
                 or self._fence_task_on_open_recovery(task)
@@ -1813,6 +1825,34 @@ class ArionEngine:
     def _goal_is_terminal_for_approval(self, task: Task) -> bool:
         return self._terminal_goal_status(task) is not None
 
+    def _goal_is_paused(self, task: Task) -> bool:
+        """Return current PAUSED authority; read failures stop work safely."""
+        if self.goal_manager is None or not task.goal_id:
+            return False
+        try:
+            goal = self.goal_manager.get_goal(task.goal_id)
+            return goal is not None and goal.status == GoalStatus.PAUSED
+        except Exception:
+            return True
+
+    def _observe_goal_pause(self, task: Task) -> bool:
+        if not self._goal_is_paused(task):
+            return False
+        # Coordination-only marker shared by this in-process execution round;
+        # Task.to_dict deliberately ignores dynamic attributes.
+        setattr(task, "_goal_pause_observed", True)
+        return True
+
+    @staticmethod
+    def _consume_goal_pause(task: Task) -> bool:
+        observed = bool(getattr(task, "_goal_pause_observed", False))
+        if observed:
+            try:
+                delattr(task, "_goal_pause_observed")
+            except AttributeError:
+                pass
+        return observed
+
     def _fail_task_for_terminal_goal(
         self,
         task: Task,
@@ -2304,6 +2344,8 @@ class ArionEngine:
         task = self.storage.load_task(task_id)
         if task is None:
             raise KeyError(f"task not found: {task_id}")
+        if self._goal_is_paused(task):
+            return task
 
         # The durable task row is the terminal authority.  A checkpoint is a
         # recovery snapshot, never a way to move terminal work backwards.
@@ -2387,6 +2429,8 @@ class ArionEngine:
 
         if not task.steps:
             task = self._plan(task)
+            if self._goal_is_paused(task):
+                return self.storage.load_task(task.id) or task
             if task.status == TaskStatus.FAILED:
                 self._record_memory(task)
                 return task
@@ -2428,6 +2472,8 @@ class ArionEngine:
         # reproduces the historical sequential behavior exactly.
         self._skipped_emitted = getattr(self, "_skipped_emitted", set())
         while True:
+            if self._goal_is_paused(task):
+                return self.storage.load_task(task.id) or task
             # emit step.skipped provenance for skipped steps we walk past
             for st in task.steps:
                 if st.status == StepStatus.SKIPPED and (task.id, st.index) not in self._skipped_emitted:
@@ -2444,6 +2490,8 @@ class ArionEngine:
 
             pending = [i for i, st in enumerate(task.steps) if st.status == StepStatus.PENDING]
             if not pending:
+                if self._observe_goal_pause(task):
+                    return self.storage.load_task(task.id) or task
                 # every step handled -> terminal COMPLETED (existing semantics)
                 skipped = sum(1 for st in task.steps if st.status == StepStatus.SKIPPED)
                 task.status = TaskStatus.COMPLETED
@@ -2521,6 +2569,10 @@ class ArionEngine:
                     # than spin, without replacing the live owner's snapshot.
                     canonical.status = TaskStatus.RUNNING
                 return canonical
+
+            if (self._consume_goal_pause(task)
+                    or self._goal_is_paused(task)):
+                return self.storage.load_task(task.id) or task
 
             cstep = task.steps[cursor]
             if task.status == TaskStatus.FAILED:
@@ -2645,6 +2697,9 @@ class ArionEngine:
                                    TaskStatus.AWAITING_APPROVAL):
                     results[tid] = task
                     continue
+                if self._goal_is_paused(task):
+                    results[tid] = self.storage.load_task(task.id) or task
+                    continue
                 if self._fail_task_for_terminal_goal(
                         task, phase="shared execution dispatch"):
                     results[tid] = task
@@ -2654,6 +2709,9 @@ class ArionEngine:
                     continue
                 if not task.steps:
                     task = self._plan(task)
+                    if self._goal_is_paused(task):
+                        results[tid] = self.storage.load_task(task.id) or task
+                        continue
                     if task.status == TaskStatus.FAILED:
                         results[tid] = task
                         continue
@@ -2726,6 +2784,10 @@ class ArionEngine:
             # ---------------- post-round per task -----------------------------
             for tid, info in plan.items():
                 task = info["task"]
+                if (self._consume_goal_pause(task)
+                        or self._goal_is_paused(task)):
+                    results[tid] = self.storage.load_task(task.id) or task
+                    continue
                 cstep = task.steps[info["cursor"]]
                 if task.status == TaskStatus.FAILED:
                     results[tid] = self.storage.load_task(task.id) or task
@@ -3009,6 +3071,8 @@ class ArionEngine:
         if self._fail_task_for_terminal_goal(
                 task, phase="shared completion"):
             return
+        if self._observe_goal_pause(task):
+            return
         if self._fence_task_on_open_recovery(task):
             return
         skipped = sum(1 for st in task.steps if st.status == StepStatus.SKIPPED)
@@ -3211,6 +3275,11 @@ class ArionEngine:
                 detail=detail,
             )
             self._emit("task.failed", task_id=task.id, detail={"error": task.error})
+            return task
+        if self._goal_is_paused(task):
+            canonical = self.storage.load_task(task.id)
+            if canonical is not None:
+                task.__dict__.update(canonical.__dict__)
             return task
         if self._fail_task_for_terminal_goal(
                 task, phase="planning"):
@@ -3432,13 +3501,15 @@ class ArionEngine:
         try:
             if (not self._fail_task_for_terminal_goal(
                     task, step, phase="worker start")
+                    and not self._observe_goal_pause(task)
                     and self._task_step_is_current(task, step)):
                 self._execute_step(task, step)
-                # Capability code is not preemptible.  Recheck authority after
-                # it returns so cancellation cannot be reported as ordinary
-                # task completion.
+                # Capability code is not preemptible. Recheck terminal and
+                # pause authority after it returns; a known result is persisted
+                # but no next step/completion begins while paused.
                 self._fail_task_for_terminal_goal(
                     task, step, phase="worker completion")
+                self._observe_goal_pause(task)
         finally:
             heartbeat_state = self._stop_lock_heartbeat(scheduler_heartbeat)
             if heartbeat_state.get("error") is not None:
@@ -3556,7 +3627,10 @@ class ArionEngine:
             if not self._handle_approval(task, step, request, decision):
                 return  # denied or paused (task will be checkpointed by the caller)
 
-        # 3. Execute with retries, then 4. verify
+        # 3. Execute with retries, then 4. verify. A pause committed during
+        # authorization/approval is authoritative before capability start.
+        if self._observe_goal_pause(task):
+            return
         self._execute_with_retries(task, step, capability, spec)
 
     # ---------- authorization helpers ----------

@@ -152,7 +152,8 @@ The engine rechecks terminal goal authority:
 Task cancellation continues to be represented by terminal `FAILED` task state;
 `CANCELLED` remains a goal-level state. A capability that already started may
 finish, and its known step result is retained, but the task cannot become
-`COMPLETED` under a cancelled goal.
+`COMPLETED` under a cancelled goal. ADR-047 later added resumable PAUSED checks
+at the same execution boundaries without failing the task.
 
 `run_task()` also checks durable `REQUIRED` recovery. A split crash leaving a
 pending task is fenced to `FAILED` without capability execution. ADR-046 later

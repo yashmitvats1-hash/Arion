@@ -328,7 +328,10 @@ Learn → Replan`, owned by an authoritative, restart-safe `GoalManager`.
   revalidate; distinct blocker keys merge; a progress / strategy /
   replan-reason patch cannot clobber a committed transition. A successful
   transition increments `goal.version` exactly once and emits
-  `goal.state.changed` only after the CAS commits.
+  `goal.state.changed` only after the CAS commits. ADR-047 makes PAUSED
+  authoritative at task/planner/worker/post-lock boundaries: no new capability
+  starts until resume, while already-running results are persisted without
+  starting another step or completing the task.
 - **ProgressEvaluator (deterministic seam):** `DeterministicProgressEvaluator`
   evaluates completed/failed/skipped work, blockers, outstanding latest-plan
   steps, and material world-state changes → `ProgressResult` with progress,
@@ -399,6 +402,22 @@ before evaluating, planning, or creating tasks:
 
 See [`ADR-045`](adr/ADR-045-per-goal-run-lease.md) and
 [`ADR-046`](adr/ADR-046-task-resume-goal-ownership.md).
+
+## Paused goal execution boundary (ADR-047)
+
+PAUSED is a resumable execution stop, not merely an evaluator hint:
+
+- direct/bulk task entry returns durable task state without execution;
+- a pause committed while planning prevents the returned plan from dispatching;
+- workers and post-authorization/post-lock-wait paths recheck pause immediately
+  before capability execution;
+- an already-running capability may finish and persist its result, but no next
+  step or task completion occurs until PAUSED→ACTIVE;
+- resume continues remaining PENDING work without replaying SUCCEEDED steps;
+- waited mutation-lock coordination is cleared and the acquired lock released
+  without mutation when pause wins.
+
+See [`ADR-047`](adr/ADR-047-paused-goal-execution-boundary.md).
 
 ## Approval-Gated Goals, BLOCKED Semantics, Second Capability (ADR-017)
 

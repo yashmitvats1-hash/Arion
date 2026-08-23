@@ -89,7 +89,8 @@ owns each task's goal lease.
 
 `execute_goal` continues through public `run_task` and therefore receives the
 same ownership. The already-owned `run_goal` loop calls `_run_task_owned`
-directly to avoid reentrant lock acquisition.
+directly to avoid reentrant lock acquisition. ADR-047 later made `_run_task_owned`
+return current durable state whenever the goal is PAUSED.
 
 ### Public `run_tasks`
 

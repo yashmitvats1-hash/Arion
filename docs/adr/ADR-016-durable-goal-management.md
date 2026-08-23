@@ -60,6 +60,10 @@ validates every transition and raises `GoalStateError` on invalid ones
   `actor`.
 
 Terminal states (completed/failed/cancelled) have no outgoing transitions.
+ADR-047 later made resumable PAUSED state authoritative at planner/task/worker
+execution boundaries, including direct task resume and post-lock-wait mutation
+revalidation; already-running capability results remain durable but no new work
+starts until ACTIVE.
 
 ### 2. GoalManager — authoritative, persistent
 
