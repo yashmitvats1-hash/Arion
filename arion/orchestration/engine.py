@@ -1822,7 +1822,30 @@ class ArionEngine:
                     if not self._goal_run_lease_current(
                             goal_id, goal_run_claim, "goal failure"):
                         return gm.get_goal(goal_id)
-                    gm.fail_goal(goal_id, reason="max_replans_exceeded")
+                    try:
+                        gm.fail_goal(
+                            goal_id,
+                            reason="max_replans_exceeded",
+                            expect_plan_version=(
+                                result.evidence.get("latest_plan_version")
+                                if isinstance(result.evidence, dict) else None
+                            ),
+                        )
+                    except GoalPlanLineageError:
+                        # ADR-055: the failure decision's plan authority is
+                        # stale - a newer immutable plan became latest inside
+                        # the evaluate -> transition window. Fail closed: no
+                        # failure, no new authority; re-evaluate so the fresh
+                        # replan count decides against the current lineage.
+                        self._emit("goal.failure.fenced", task_id=None, detail={
+                            "goal_id": goal_id,
+                            "expected_plan_version": (
+                                result.evidence.get("latest_plan_version")
+                                if isinstance(result.evidence, dict) else None
+                            ),
+                            "reason": "plan lineage advanced before failure",
+                        })
+                        continue
                     return gm.get_goal(goal_id)
                 if self._block_on_missing_capability(goal_id, gm):
                     return gm.get_goal(goal_id)
@@ -3755,7 +3778,29 @@ class ArionEngine:
                                 "shared goal failure"):
                             results[gid] = gm.get_goal(gid)
                             continue
-                        gm.fail_goal(gid, reason="max_replans_exceeded")
+                        try:
+                            gm.fail_goal(
+                                gid,
+                                reason="max_replans_exceeded",
+                                expect_plan_version=(
+                                    result.evidence.get("latest_plan_version")
+                                    if isinstance(result.evidence, dict) else None
+                                ),
+                            )
+                        except GoalPlanLineageError:
+                            # ADR-055 (shared loop): stale plan authority for
+                            # the failure decision. Fail closed; the goal
+                            # stays non-terminal and is re-evaluated against
+                            # current durable state on the next cycle.
+                            self._emit("goal.failure.fenced", task_id=None, detail={
+                                "goal_id": gid,
+                                "expected_plan_version": (
+                                    result.evidence.get("latest_plan_version")
+                                    if isinstance(result.evidence, dict) else None
+                                ),
+                                "reason": "plan lineage advanced before failure",
+                            })
+                            continue
                         results[gid] = gm.get_goal(gid)
                         continue
                     if self._block_on_missing_capability(gid, gm):

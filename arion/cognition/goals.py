@@ -269,10 +269,16 @@ class GoalManager:
     def cancel(self, goal_id: str, reason: str = "explicit_cancel") -> Goal:
         return self.transition(goal_id, GoalStatus.CANCELLED.value, reason)
 
-    def fail_goal(self, goal_id: str, reason: str = "goal_failed") -> Goal:
+    def fail_goal(self, goal_id: str, reason: str = "goal_failed",
+                  expect_plan_version: int | None = None) -> Goal:
+        """Terminal failure; ADR-055: pass the immutable plan version the
+        failure decision evaluated (``evidence["latest_plan_version"]``) so
+        the ADR-054 transition-level lineage fence can refuse stale plan
+        authority (same mechanism as completion fencing)."""
         return self.transition(
             goal_id, GoalStatus.FAILED.value, reason,
             fields={"last_replan_reason": reason},
+            expect_plan_version=expect_plan_version,
         )
 
     def complete_goal(self, goal_id: str, reason: str = "all_work_complete",
