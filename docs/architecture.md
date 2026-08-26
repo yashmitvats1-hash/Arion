@@ -507,6 +507,133 @@ No schema, authorization, approval, recovery, scheduler, or mutation-lock
 semantics change. See
 [`ADR-052`](adr/ADR-052-goal-run-lease-ownership-fencing.md).
 
+## Latest-plan coordination authority (ADR-053)
+
+Coordination and progress signals are scoped to the canonical task for the
+latest immutable plan; superseded or noncanonical tasks retain their rows but
+hold no authority over the current goal:
+
+- `DeterministicProgressEvaluator` derives its authoritative coordination set
+  first — exact-version tasks reduce to the single canonical task ordered by
+  `(created_at, task_id)`, the same selection as ADR-049/051 execution
+  authority — and scans only that set for awaiting-approval, lock-wait, and
+  latest-plan-failure signals; historical task-status totals remain
+  observational over the full history;
+- `GoalManager.pending_task()` returns the canonical non-terminal exact-version
+  task; noncanonical duplicates are never selected as current work;
+- the live goal-run owner (ADR-052) runs
+  `_reconcile_superseded_coordination()` inside both engine loops (single-goal
+  and bulk/shared) before each evaluation: any non-terminal superseded or
+  noncanonical task carrying coordination state — a queued
+  `AWAITING_APPROVAL` step or durable mutation-lock wait metadata — is fenced
+  through the existing ADR-049 `_fence_task_for_superseded_plan()` primitive
+  (pending approval denied as `system:superseded_plan`, task terminally
+  FAILED, lock-wait metadata cleared, queued waiters cancelled); no capability
+  runs and no historical row is deleted;
+- the reconciliation is idempotent; a transient failure is retried by the
+  next owned cycle; paused and terminal goals are untouched; tasks without
+  coordination state (e.g. PLANNED history) keep relying on their existing
+  execution-boundary fences.
+
+No schema, DDL, plan, task, approval, recovery, scheduler, lock, checkpoint,
+or event format changes. Coordination authority and execution authority use
+the same canonical-task definition. See
+[`ADR-053`](adr/ADR-053-latest-plan-coordination-authority.md).
+
+## Plan-version-fenced goal completion (ADR-054)
+
+Terminal goal completion is guarded by the immutable plan version the
+evaluation assessed. `goal.version` CAS and plan lineage are independent CAS
+domains — plan commits intentionally never bump `goal.version` — so a
+goal-row CAS win cannot reveal that the authoritative plan advanced
+underneath the evaluation:
+
+- `GoalManager.evaluate()` carries the evaluated plan version in
+  `evidence["latest_plan_version"]`; both engine loops (single-goal and
+  bulk/shared) forward that value to
+  `complete_goal(..., expect_plan_version=...)`;
+- `complete_goal()` passes the expectation to `transition()`, which, on
+  EVERY CAS attempt after state-legality validation and BEFORE any mutation
+  or commit, re-reads the authoritative latest plan and raises
+  `GoalPlanLineageError` (a `GoalStateError`) if the version no longer
+  matches; because plan lineage only advances, a mismatch fails closed
+  immediately and never retries;
+- on mismatch: no completion, no failure, no blocker, no task mutation, no
+  strategy-outcome write, `goal.version` untouched; the engine catches
+  `GoalPlanLineageError` at the completion boundary, emits one bounded
+  `goal.completion.fenced` audit event, and continues the loop — the goal
+  re-evaluates against current durable state and the newer plan's work
+  proceeds through the existing ADR-050/051/053 paths;
+- CAS-miss retries (row contention) re-run the lineage check against fresh
+  state; legacy/direct callers without an expected version retain existing
+  behavior.
+
+The fence closes the entire evaluate-to-transition window. ADR-056
+eliminates the residual cross-connection timing gap by moving the lineage
+read into the same `BEGIN IMMEDIATE` transaction as the goal CAS (see below).
+No schema or DDL change. See
+[`ADR-054`](adr/ADR-054-plan-version-fenced-goal-completion.md).
+
+## Plan-version-fenced goal failure (ADR-055)
+
+Evaluation-driven terminal failure — the `max_replans_exceeded` path — receives
+the same plan-version authority fence as completion (ADR-054). The mechanism
+is identical: no second fencing primitive was introduced.
+
+- Both engine loops pass `result.evidence["latest_plan_version"]` to
+  `fail_goal(..., expect_plan_version=...)`; `fail_goal()` forwards the
+  expectation to `transition()`, where the single ADR-054 lineage fence
+  re-reads the latest plan inside every CAS attempt and raises
+  `GoalPlanLineageError` on mismatch;
+- on mismatch: no failure, no completion, no blocker, no task mutation, no
+  replan-count mutation, no strategy-outcome write, `goal.version` untouched;
+  the engine catches `GoalPlanLineageError` at the failure boundary, emits
+  one bounded `goal.failure.fenced` audit event, and continues the loop;
+- the fresh `replan_count` is re-derived per cycle from current durable
+  state, so a genuinely exhausted lineage still fails — never on stale
+  authority;
+- direct/legacy `fail_goal` calls without an expectation retain existing
+  behavior; operator-explicit pause, cancel, and resume semantics are
+  unchanged.
+
+A stale `max_replans_exceeded` decision cannot terminally fail a goal whose
+authoritative latest plan was committed after the evaluation and has never
+been executed. ADR-056 closes the residual timing gap for this path as well
+(same `transition()` primitive). See
+[`ADR-055`](adr/ADR-055-plan-version-fenced-goal-failure.md).
+
+## Atomic terminal-transition lineage fence (ADR-056)
+
+ADR-054 and ADR-055 documented a residual cross-connection timing gap: the
+lineage read (`goal_plans` SELECT on `cog._conn`) and the goal lifecycle CAS
+(`goals` UPDATE on `storage._conn`) were separate statements on separate
+connections, so a `claim_goal_plan` commit could land between them. ADR-056
+closes this gap without a schema change:
+
+- `SQLiteStorage` and `SQLiteCognitiveStore` both open connections to the
+  **same physical WAL database file**; all tables — including `goals` and
+  `goal_plans` — are visible to either connection;
+- `SQLiteStorage.cas_goal_terminal_fenced()` reads `goal_plans` and updates
+  `goals` inside **one `BEGIN IMMEDIATE` transaction** on `storage._conn`;
+  SQLite's database-level write lock prevents any concurrent `claim_goal_plan`
+  (`BEGIN IMMEDIATE` on `cog._conn`) from committing between those two steps;
+- `GoalManager.transition()` delegates to this method when
+  `expect_plan_version` is set and the backend supplies it; the returned
+  `validated_plan_version` (authoritative at the moment of commit) is used
+  directly for `_record_strategy_outcome`, replacing the post-commit
+  `latest_plan()` re-read that could attribute a false outcome to an
+  unexecuted newer plan;
+- storage backends without the method fall back to the ADR-054/055 two-step
+  path (backward compatibility for test doubles and legacy stores);
+- `GoalPlanLineageError`, engine catch-sites, audit events, and all other
+  authority mechanisms are unchanged.
+
+No ordering of the atomic commit and a concurrent plan publish can allow a
+stale terminal transition to succeed: if the plan commits first the lineage
+read sees it and fences; if the transition holds `BEGIN IMMEDIATE` first the
+plan publish blocks until after the commit. See
+[`ADR-056`](adr/ADR-056-atomic-terminal-transition-lineage-fence.md).
+
 ## Approval-Gated Goals, BLOCKED Semantics, Second Capability (ADR-017)
 
 Hardening around the existing approval seam (ADR-009) and the durable goal

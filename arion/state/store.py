@@ -263,6 +263,13 @@ class Storage(Protocol):
     def save_goal(self, goal: Goal) -> None: ...
     def cas_goal(self, goal: Goal, expected_version: int) -> bool: ...
     def cas_goal_fields(self, goal_id: str, expected_version: int, fields: dict) -> bool: ...
+    def cas_goal_terminal_fenced(
+        self,
+        goal_id: str,
+        expected_goal_version: int,
+        expect_plan_version: int,
+        fields: dict,
+    ) -> tuple[str, int | None]: ...
     def load_goal(self, goal_id: str) -> Goal | None: ...
     def list_goals(self, status: str | None = None) -> list[Goal]: ...
 
@@ -518,6 +525,133 @@ class SQLiteStorage:
                 return False
             self._conn.commit()
             return True
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_threadsafe
+    def cas_goal_terminal_fenced(
+        self,
+        goal_id: str,
+        expected_goal_version: int,
+        expect_plan_version: int,
+        fields: dict,
+    ) -> tuple[str, int | None]:
+        """Atomic terminal-transition CAS with plan-lineage validation (ADR-056).
+
+        Reads ``goal_plans`` (latest plan version) and updates ``goals``
+        inside ONE ``BEGIN IMMEDIATE`` transaction on the storage connection
+        so the two operations are serialized at the SQLite file level.  No
+        concurrent ``claim_goal_plan`` write (which also uses ``BEGIN
+        IMMEDIATE``) can land between the lineage read and the goal UPDATE,
+        closing the cross-connection timing gap accepted in ADR-054/055.
+
+        Returns a 2-tuple ``(outcome, validated_plan_version)`` where
+        ``outcome`` is one of:
+
+        ``"ok"``
+            The transition committed.  ``validated_plan_version`` is the
+            plan version that was authoritative at the time of the commit
+            (equals ``expect_plan_version``); use it for strategy-outcome
+            attribution instead of a second post-commit lineage re-read.
+
+        ``"lineage_mismatch"``
+            The latest committed plan version differs from
+            ``expect_plan_version``.  Nothing was mutated.
+            ``validated_plan_version`` is the actual latest version (or
+            ``None`` when no plan exists); the caller should raise
+            ``GoalPlanLineageError``.
+
+        ``"cas_miss"``
+            The goal row's version no longer equals
+            ``expected_goal_version``.  Nothing was mutated.
+            ``validated_plan_version`` is ``None``; the caller's retry
+            loop should reload the goal and re-validate.
+
+        ``fields`` must be a non-empty dict of goal columns to update (same
+        contract as ``cas_goal_fields``); it must include ``"status"`` and
+        ``"version"`` (``expected_goal_version + 1``).  The ``"blockers"``,
+        ``"progress_metadata"``, and ``"updated_at"`` keys are
+        JSON-serialised if present, exactly as in ``cas_goal_fields``.
+
+        Fail closed: any unexpected exception rolls back and re-raises.
+        """
+        import json as _json
+
+        if isinstance(expected_goal_version, bool) or not isinstance(expected_goal_version, int):
+            raise ValueError(
+                f"expected_goal_version must be an int, got "
+                f"{expected_goal_version!r} (fail closed)")
+        if expected_goal_version < 1:
+            raise ValueError(
+                f"expected_goal_version must be >= 1, got "
+                f"{expected_goal_version!r} (fail closed)")
+        if (isinstance(expect_plan_version, bool)
+                or not isinstance(expect_plan_version, int)
+                or expect_plan_version < 1):
+            raise ValueError(
+                f"expect_plan_version must be a positive integer, got "
+                f"{expect_plan_version!r} (fail closed)")
+        allowed_cols = {
+            "description", "source", "status", "version", "strategy",
+            "blockers", "progress_metadata", "last_evaluated_at",
+            "last_replan_reason", "updated_at",
+        }
+        if not fields or not isinstance(fields, dict):
+            raise ValueError("cas_goal_terminal_fenced requires a non-empty fields dict")
+        unknown = set(fields) - allowed_cols
+        if unknown:
+            raise ValueError(
+                f"cas_goal_terminal_fenced unknown column(s) {sorted(unknown)} (fail closed)")
+        if "version" not in fields or fields["version"] != expected_goal_version + 1:
+            raise ValueError(
+                f"cas_goal_terminal_fenced requires fields['version'] == "
+                f"expected_goal_version + 1 (fail closed)")
+
+        values = dict(fields)
+        if "blockers" in values:
+            values["blockers"] = _json.dumps(values["blockers"])
+        if "progress_metadata" in values:
+            values["progress_metadata"] = _json.dumps(values["progress_metadata"])
+        if "updated_at" not in values:
+            values["updated_at"] = utcnow()
+        cols = list(values)
+        assignments = ", ".join(f"{c}=?" for c in cols)
+        update_params = [values[c] for c in cols] + [goal_id, expected_goal_version]
+
+        try:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+
+            # ── Lineage fence: read goal_plans inside the transaction ──────
+            # goal_plans is written by SQLiteCognitiveStore via a separate
+            # connection that also uses BEGIN IMMEDIATE.  Holding BEGIN
+            # IMMEDIATE here prevents any concurrent claim_goal_plan from
+            # committing a new plan version between this read and the goals
+            # UPDATE below (ADR-056 invariant).
+            row = self._conn.execute(
+                "SELECT plan_version FROM goal_plans "
+                "WHERE goal_id=? ORDER BY plan_version DESC LIMIT 1",
+                (goal_id,),
+            ).fetchone()
+            latest_plan_version: int | None = int(row[0]) if row is not None else None
+
+            if latest_plan_version != expect_plan_version:
+                self._conn.rollback()
+                return ("lineage_mismatch", latest_plan_version)
+
+            # ── Goal CAS ───────────────────────────────────────────────────
+            cur = self._conn.execute(
+                f"UPDATE goals SET {assignments} WHERE id=? AND version=?",
+                update_params,
+            )
+            if cur.rowcount != 1:
+                self._conn.rollback()
+                return ("cas_miss", None)
+
+            self._conn.commit()
+            return ("ok", expect_plan_version)
+
         except Exception:
             self._conn.rollback()
             raise
