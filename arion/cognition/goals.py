@@ -189,6 +189,16 @@ class GoalManager:
         mutated) unless that version is still latest. ``goal.version`` CAS
         proves only row concurrency - plan commits never bump it - so this
         is the boundary where evaluated plan authority is revalidated.
+
+        ADR-056 atomic fence: when ``expect_plan_version`` is given and the
+        storage backend supplies ``cas_goal_terminal_fenced``, the lineage
+        read and the goal CAS execute inside ONE ``BEGIN IMMEDIATE``
+        transaction on the storage connection, eliminating the
+        cross-connection timing gap documented in ADR-054/055.  The
+        validated plan version is used directly for strategy-outcome
+        attribution, replacing the post-commit ``latest_plan`` re-read.
+        For storage backends that do not supply the method (test doubles,
+        legacy) the original two-step behaviour is preserved unchanged.
         """
         to_state = to_state.value if isinstance(to_state, GoalStatus) else to_state
         if to_state not in GOAL_TRANSITIONS:
@@ -200,6 +210,16 @@ class GoalManager:
             raise ValueError(
                 f"expect_plan_version must be a positive integer, got "
                 f"{expect_plan_version!r} (fail closed)")
+
+        # ADR-056: if the storage backend exposes the atomic fenced CAS,
+        # use it for every attempt when a plan-version expectation is set.
+        # This collapses the lineage read + goal UPDATE into one BEGIN
+        # IMMEDIATE, closing the cross-connection gap accepted in ADR-054/055.
+        _fenced_cas = (
+            getattr(self.storage, "cas_goal_terminal_fenced", None)
+            if expect_plan_version is not None else None
+        )
+
         for _ in range(_GOAL_CAS_MAX_ATTEMPTS):
             goal = self.get_goal(goal_id)
             if goal is None:
@@ -209,18 +229,7 @@ class GoalManager:
                 raise GoalStateError(
                     f"invalid goal transition {goal.status.value!r} -> {to_state!r} for goal {goal_id}"
                 )
-            if expect_plan_version is not None:
-                # ADR-054: checked INSIDE the retry loop so a CAS retry can
-                # never reuse stale plan authority from an earlier attempt.
-                latest = self.latest_plan(goal_id)
-                latest_version = latest["plan_version"] if latest else None
-                if latest_version != expect_plan_version:
-                    raise GoalPlanLineageError(
-                        f"goal {goal_id} transition {to_state!r} denied: "
-                        f"evaluated plan {expect_plan_version} is no longer "
-                        f"the latest immutable plan (latest={latest_version}); "
-                        f"fail closed"
-                    )
+
             old_state = goal.status.value
             expected = goal.version
             goal.status = GoalStatus(to_state)
@@ -229,14 +238,62 @@ class GoalManager:
             if to_state == GoalStatus.ACTIVE.value and goal.blockers:
                 # resuming/unblocking clears resolved blockers
                 goal.blockers = []
-            extra = None
+            extra: dict[str, Any] = {}
             if fields:
-                extra = {}
                 for key, value in fields.items():
                     setattr(goal, key, value)
                     extra[key] = value
-            if not self._commit_goal(goal, expected, extra=extra):
-                continue
+
+            validated_plan_version: int | None = None
+
+            if _fenced_cas is not None:
+                # ── ADR-056 atomic path ────────────────────────────────────
+                # Build the fields payload exactly as _commit_goal / cas_goal_fields
+                # would, then delegate to the one-transaction storage method.
+                import json as _json
+                payload: dict[str, Any] = {
+                    "status": goal.status_value,
+                    "blockers": list(goal.blockers or []),
+                    "version": goal.version,
+                    "updated_at": goal.updated_at,
+                }
+                if extra:
+                    payload.update(extra)
+                outcome, result_version = _fenced_cas(
+                    goal_id, expected, expect_plan_version, payload
+                )
+                if outcome == "lineage_mismatch":
+                    raise GoalPlanLineageError(
+                        f"goal {goal_id} transition {to_state!r} denied: "
+                        f"evaluated plan {expect_plan_version} is no longer "
+                        f"the latest immutable plan (latest={result_version}); "
+                        f"fail closed"
+                    )
+                if outcome == "cas_miss":
+                    # Goal row was concurrently modified; retry from fresh state.
+                    continue
+                # outcome == "ok": committed successfully.
+                validated_plan_version = result_version  # authoritative at commit
+            else:
+                # ── Original two-step path (ADR-054/055) ──────────────────
+                # Used when storage does not supply cas_goal_terminal_fenced
+                # (test doubles, legacy stores).  Retains the prior behaviour
+                # exactly, including the accepted cross-connection timing gap.
+                if expect_plan_version is not None:
+                    # ADR-054: checked INSIDE the retry loop so a CAS retry can
+                    # never reuse stale plan authority from an earlier attempt.
+                    latest = self.latest_plan(goal_id)
+                    latest_version = latest["plan_version"] if latest else None
+                    if latest_version != expect_plan_version:
+                        raise GoalPlanLineageError(
+                            f"goal {goal_id} transition {to_state!r} denied: "
+                            f"evaluated plan {expect_plan_version} is no longer "
+                            f"the latest immutable plan (latest={latest_version}); "
+                            f"fail closed"
+                        )
+                if not self._commit_goal(goal, expected, extra=extra or None):
+                    continue
+
             self._emit("goal.state.changed", goal_id=goal_id, detail={
                 "goal_id": goal_id,
                 "from": old_state,
@@ -249,14 +306,33 @@ class GoalManager:
             # (latest) plan version's outcome - succeeded on completion, failed
             # on failure. Informational, best-effort, idempotent (UNIQUE
             # goal_id+plan_version); never breaks the state machine.
+            #
+            # ADR-056: when the atomic path ran, ``validated_plan_version`` is
+            # the plan version that was authoritative at the moment the goal CAS
+            # committed (returned by cas_goal_terminal_fenced).  Use it directly
+            # instead of a second post-commit latest_plan() re-read so that the
+            # strategy outcome correctly records the version that was authoritative
+            # at transition time, not any newer version committed in the interim.
             if to_state in (GoalStatus.COMPLETED.value, GoalStatus.FAILED.value):
-                latest = self.latest_plan(goal_id)
-                if latest is not None:
-                    outcome = ("succeeded" if to_state == GoalStatus.COMPLETED.value
-                               else "failed")
+                if validated_plan_version is not None:
+                    # ADR-056 path: use the authoritative plan version from the
+                    # atomic commit.  Read strategy from cognitive store for the
+                    # outcome record (informational, best-effort, idempotent).
+                    latest = self.latest_plan(goal_id)
+                    strategy = (latest.get("strategy", "") if latest else "") or ""
+                    outcome_str = ("succeeded" if to_state == GoalStatus.COMPLETED.value
+                                   else "failed")
                     self._record_strategy_outcome(
-                        goal_id, latest["plan_version"],
-                        latest.get("strategy", ""), outcome, reason)
+                        goal_id, validated_plan_version, strategy, outcome_str, reason)
+                else:
+                    # Original path: re-read latest_plan post-commit.
+                    latest = self.latest_plan(goal_id)
+                    if latest is not None:
+                        outcome_str = ("succeeded" if to_state == GoalStatus.COMPLETED.value
+                                       else "failed")
+                        self._record_strategy_outcome(
+                            goal_id, latest["plan_version"],
+                            latest.get("strategy", ""), outcome_str, reason)
             return goal
         raise self._contention_error(goal_id, "transition")
 

@@ -123,6 +123,19 @@ and re-validates at the authoritative commit/retry boundary; the residual
 cross-connection gap is accepted and documented rather than introducing a
 cross-store transaction architecture. No schema or DDL change is made.
 
+**Update (ADR-056):** The cross-connection timing gap described above was
+subsequently closed. ADR-056 introduced
+`SQLiteStorage.cas_goal_terminal_fenced()`, which performs both the
+plan-lineage read (`SELECT` from `goal_plans`) and the goal-row UPDATE
+inside a single `BEGIN IMMEDIATE` transaction on `storage._conn`. Because
+SQLite's write lock is database-level, any concurrent `claim_goal_plan`
+commit (which also uses `BEGIN IMMEDIATE` on `cog._conn`) is serialized
+with respect to this transaction, eliminating the residual gap. **This
+section is superseded by ADR-056 §"Invariant (strengthened)"** for
+production `SQLiteStorage` backends; the original two-step path is
+retained only as a compatibility fallback for stores that do not implement
+the atomic method.
+
 ## Why stale failure is not included
 
 ``max_replans_exceeded`` failure can stamp a newer plan ``failed`` through the

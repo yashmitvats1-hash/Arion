@@ -130,5 +130,9 @@ occurring when the operator thread commits nothing in time.
   ownership (ADR-052), coordination authority (ADR-053), scheduler leases,
   mutation locks, recovery architecture, approvals, or operator-explicit
   pause/cancel semantics.
-- The residual cross-connection timing boundary documented in ADR-054 applies
-  unchanged to the failure fence.
+- ~~The residual cross-connection timing boundary documented in ADR-054 applies
+  unchanged to the failure fence.~~ **Superseded by ADR-056:** the failure
+  fence uses the same `GoalManager.transition()` path as the completion
+  fence, so ADR-056's `cas_goal_terminal_fenced()` closes this gap for
+  failure transitions as well. The original two-step path is retained only
+  as a fallback for storage backends that do not implement the atomic method.
