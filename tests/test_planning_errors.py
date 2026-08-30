@@ -25,6 +25,7 @@ from arion.intelligence.errors import (
     PlanningError,
     ProviderAuthenticationError,
     ProviderConfigurationError,
+    ProviderRateLimitError,
     ProviderUnavailableError,
 )
 from arion.intelligence.model_planner import RealModelPlanner
@@ -53,14 +54,17 @@ def _router_with_status(status=200, content=None):
         payload = {"choices": [{"message": {"content": content}}]}
         return status, json.dumps(payload)
 
-    return OpenAICompatModelRouter(model="m", api_key="", transport=transport)
+    # max_retries=0: these tests assert single-attempt typed error mapping;
+    # retry behavior has its own suite (tests/test_transport_retry.py).
+    return OpenAICompatModelRouter(model="m", api_key="", transport=transport, max_retries=0)
 
 
 def _router_with_raising_transport(exc):
     def transport(url, headers, body):
         raise exc
 
-    return OpenAICompatModelRouter(model="m", api_key="", transport=transport)
+    # max_retries=0: see _router_with_status; avoids real backoff sleeps.
+    return OpenAICompatModelRouter(model="m", api_key="", transport=transport, max_retries=0)
 
 
 def _router_with_raw_response(text):
@@ -177,15 +181,16 @@ def test_wrong_param_type_is_capability_error(sandbox):
 def test_categories_are_distinguishable():
     classes = [
         ProviderUnavailableError,
+        ProviderRateLimitError,
         ProviderAuthenticationError,
         ProviderConfigurationError,
         MalformedProviderResponseError,
         PlanSchemaValidationError,
         PlanCapabilityValidationError,
     ]
-    categories = {cls().category for cls in classes}
+    categories = {cls("test").category for cls in classes}
     assert len(categories) == len(classes)  # all distinct
-    assert all(isinstance(cls(), PlanningError) for cls in classes)
+    assert all(isinstance(cls("test"), PlanningError) for cls in classes)
 
 
 # --- orchestration records the typed category ---

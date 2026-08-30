@@ -48,7 +48,7 @@ def _router(content, status=200, usage=None, sink=None):
 
     return OpenAICompatModelRouter(
         model="test-model", base_url="https://example.test/v1", api_key="",
-        transport=transport, sink=sink,
+        transport=transport, sink=sink, max_retries=0,
     )
 
 

@@ -1,9 +1,10 @@
-"""Typed planning errors (ADR-011, amended).
+"""Typed planning errors (ADR-011, amended; ADR-057 M1).
 
 A useful error taxonomy so orchestration, audit events and future recovery
 logic can tell WHY planning failed, without conflating categories:
 
 - provider unavailable            (network, timeout, HTTP 5xx)
+- provider rate limit             (HTTP 429 / quota)
 - provider authentication/config  (HTTP 401/403, missing key, HTTP 4xx)
 - malformed provider response     (unparseable envelope/content)
 - schema validation failure       (model returned a structurally invalid plan)
@@ -19,6 +20,7 @@ Hierarchy (kept compatible with pre-existing names):
    │   └─ PlanCapabilityValidationError (category "capability_validation")
    └─ ModelPlanError                 (provider base)
        ├─ ProviderUnavailableError        (category "provider_unavailable")
+       ├─ ProviderRateLimitError          (category "provider_rate_limit")
        ├─ ProviderAuthenticationError     (category "provider_auth")
        ├─ ProviderConfigurationError      (category "provider_config")
        └─ MalformedProviderResponseError  (category "malformed_response")
@@ -62,6 +64,21 @@ class ProviderUnavailableError(ModelPlanError):
     """The provider endpoint could not be reached (network/timeout/HTTP 5xx)."""
 
     category = "provider_unavailable"
+
+
+class ProviderRateLimitError(ModelPlanError):
+    """The provider rate-limited the request (HTTP 429 / quota; ADR-057 M1).
+
+    `retry_after_seconds` carries the provider's Retry-After hint when the
+    transport could observe it; the router honors it within the retry budget,
+    capped by `retry_backoff_max`. Never carries response bodies.
+    """
+
+    category = "provider_rate_limit"
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
 
 
 class ProviderAuthenticationError(ModelPlanError):
