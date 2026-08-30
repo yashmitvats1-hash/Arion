@@ -28,6 +28,8 @@ from arion.cognition.store import SQLiteCognitiveStore
 from arion.cognition.strategy import StrategySelector
 from arion.cognition.world_state import WorldStateMonitor
 from arion.intelligence.planner import DeterministicPlanner
+from arion.intelligence.config import load_model_config
+from arion.intelligence.model_planner import RealModelPlanner
 from arion.intelligence.providers import build_router
 from arion.intelligence.router import DeterministicRouter
 from arion.observability.events import EventLogger, JsonlFileSink
@@ -86,10 +88,29 @@ def build_engine(
 
         # Planners (DeterministicPlanner, RealModelPlanner, future planners) are
         # interchangeable; the router follows the same ModelRouter abstraction.
+        # ADR-057 M5 (runtime opt-in): when no explicit model_config is given,
+        # read the environment. A configured+enabled provider selects the
+        # model-backed path (RealModelPlanner + shared model router + optional
+        # ModelReflector); no provider keeps the deterministic spine
+        # byte-for-byte. An EXPLICIT planner=/router= always wins over
+        # environment-driven selection.
+        resolved_config = model_config
+        if resolved_config is None:
+            resolved_config = load_model_config()
+        model_router = None
+        if resolved_config.enabled:
+            model_router = build_router(resolved_config, sink=events)
         if planner is None:
-            planner = DeterministicPlanner()
+            if model_router is not None:
+                planner = RealModelPlanner(
+                    model_router,
+                    events=events,
+                    fallback_enabled=resolved_config.fallback_enabled,
+                )
+            else:
+                planner = DeterministicPlanner()
         if router is None:
-            router = DeterministicRouter(planner)
+            router = model_router if model_router is not None else DeterministicRouter(planner)
 
         # Fail-closed by default: the filesystem resource kind gets an explicit
         # boundary (relative, non-traversal paths - the capability enforces the
@@ -111,19 +132,18 @@ def build_engine(
                 "memory.store", SQLiteMemoryStore(db_path)
             )
 
-        # Reflector selection (ADR-057 M4, additive): an EXPLICIT reflector
-        # always wins. Otherwise a model reflector is selected only when a
-        # provider is actually configured AND reflection is enabled; anything
-        # else keeps the existing deterministic reflector (memory on) or None
-        # (memory off). This is selection-only wiring - the model reflection
-        # path remains informational and never touches authorization.
+        # Reflector selection (ADR-057 M4/M5): an EXPLICIT reflector always
+        # wins. Otherwise a model reflector is selected only when a provider
+        # is actually configured AND reflection is enabled (sharing the
+        # planner's model router); anything else keeps the existing
+        # deterministic reflector (memory on) or None (memory off). This is
+        # selection-only wiring - the model reflection path remains
+        # informational and never touches authorization.
         if reflector is None and memory:
-            if (model_config is not None
-                    and getattr(model_config, "enabled", False)
-                    and getattr(model_config, "reflection_enabled", True)):
-                model_router = build_router(model_config, sink=events)
-                if model_router is not None:
-                    reflector = ModelReflector(model_router, events=events)
+            if (resolved_config.enabled
+                    and model_router is not None
+                    and resolved_config.reflection_enabled):
+                reflector = ModelReflector(model_router, events=events)
             if reflector is None:
                 reflector = DeterministicReflector()
 

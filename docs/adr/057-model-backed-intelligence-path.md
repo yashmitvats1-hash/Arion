@@ -2,8 +2,8 @@
 
 - **Status:** Approved (2026-08-29) — M1 (Provider Configuration + Bounded
   Transport Retry), M2 (Model Output Size / Depth Limits),
-  M3 (Fallback Composition) and M4 (Reflection Wiring) implemented;
-  M5 pending approval.
+  M3 (Fallback Composition), M4 (Reflection Wiring) and
+  M5 (Opt-in Runtime + Live Harness) implemented (2026-08-30).
 - **Date:** 2026-08-29
 - **Deciders:** ChatGPT (architect/manager), Arena AI (engineering agent)
 - **Baseline checkpoint:** M0 accepted — 1,478 passed / 2 skipped / 23/23 demos /
@@ -610,14 +610,30 @@ none touches the authority model or schema.
   deterministic fallback; `ARION_LLM_REFLECTION=0`; engine offline with no
   provider.
   *Gate:* new tests green; full suite green.
-- **M5 — Opt-in runtime + live harness.** `bootstrap`/CLI env-driven wiring;
-  replace the single smoke test with a scripted live-provider harness
-  (offline-skippable scenarios: happy path, malformed, provider down,
-  fallback, strict mode); end-to-end model → plan → authorization →
-  approval → lock → execute → verify → memory.
-  *Test strategy:* harness scenarios; adversarial no-self-authorization;
-  persistence/recovery of model plans; coverage gate ≥ 87% (baseline);
-  full suite + all demos green.
+- **M5 — Opt-in runtime + live harness (implemented).**
+  `bootstrap.build_engine(model_config=None)` now reads the environment via
+  `load_model_config()`: a configured+enabled provider selects
+  `RealModelPlanner` (with `fallback_enabled` from config) + a shared model
+  router (`OpenAICompatModelRouter`), and `ModelReflector` only when the
+  provider is enabled AND `reflection_enabled`; no provider keeps the
+  deterministic planner/router/reflector byte-for-byte. Explicit
+  `planner=` / `router=` / `reflector=` always win over env selection. No
+  new env vars (reuses `ARION_LLM_*`), no CLI changes, no startup logging.
+  The single env-gated live smoke test was replaced with a two-tier
+  harness: scripted local-server scenarios (offline, always run: happy
+  path, malformed response, provider down, fallback, strict mode
+  `ARION_LLM_FALLBACK=0`) plus the externally gated live-provider scenario
+  (only when `ARION_LLM_BASE_URL`/`ARION_LLM_API_KEY` are configured).
+  *Test strategy:* offline runtime wiring matrix (`tests/test_model_runtime_wiring.py`,
+  16 tests: env selection + shared router, deterministic default,
+  explicit overrides, strict mode, reflection off, malformed config typed
+  failure, model-plan persistence/restart zero re-query, full
+  model→plan→authorization→approval→lock→execute→verify→memory chain,
+  compromised-model no-self-authorization, fallback cannot bypass
+  authorization, hostile reflection cannot affect authority, secrets
+  absent from events/JSONL/checkpoints/memory/repr, reflection no-retry,
+  deterministic default regression); harness B smoke scenarios; coverage
+  gate ≥ 87% (baseline); full suite + all demos green.
   *Gate:* M5 acceptance criteria met; report to operator.
 
 ## Unresolved questions
@@ -633,8 +649,11 @@ none touches the authority model or schema.
    max=8.0 (M1); MAX_MODEL_RESPONSE_BYTES=262_144, MAX_JSON_DEPTH=10,
    MAX_PLAN_STEPS=100, MAX_PARAMS_PER_STEP=32, MAX_STEP_STRING=2000 (M2).
    All remain configurable; no evidence surfaced during M1/M2 to adjust them.
-4. **CLI flags vs env-only:** env-only chosen; a `--llm` flag family may be
-   added if operators need per-invocation overrides.
+4. **CLI flags vs env-only:** env-only chosen and locked by M5 decision 4
+   (model configuration is environment-driven via the existing
+   `ARION_LLM_*` surface; no CLI flags, no startup logging); a `--llm`
+   flag family may still be added later if operators need per-invocation
+   overrides, but it is out of scope for ADR-057.
 5. **Catalog size budget:** `capabilities_summary()` grows with the catalog;
    a bounded `max_catalog_chars` truncation in `RealModelPlanner` remains
    open (not part of M2 — M2 bounded model OUTPUT, not planner INPUT;
