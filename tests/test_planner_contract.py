@@ -118,17 +118,22 @@ def test_model_proposed_unregistered_capability_never_executed(tmp_path, sandbox
     storage = SQLiteStorage(tmp_path / "evil.db")
     registry = CapabilityRegistry()
     registry.register(FilesystemReadCapability(sandbox))
-    planner = RealModelPlanner(router=EvilRouter())
+    events = EventLogger(sinks=[storage])
+    planner = RealModelPlanner(router=EvilRouter(), events=events)
     engine = ArionEngine(
         storage=storage, registry=registry, planner=planner,
-        router=EvilRouter(), events=EventLogger(sinks=[storage]),
+        router=EvilRouter(), events=events,
         policy=ResourcePolicy(boundaries={FS: RelativePathBoundary()}),
     )
     task = engine.execute_goal("do whatever the model wants")
     assert task.status == TaskStatus.FAILED
-    assert "shell.exec" in (task.error or "")  # capability_validation failure
-    # nothing was ever executed
+    # ADR-057 M3: the model's forged capability is discarded by validation;
+    # the deterministic fallback authority then fails closed too (the goal is
+    # not decomposable), so the task fails durably. The model's shell.exec
+    # NEVER reaches authorization or execution - that is the invariant.
     assert [e.kind for e in storage.list_events()].count("capability.executed") == 0
+    assert [e.kind for e in storage.list_events()].count("permission.checked") == 0
+    assert "model.fallback" in [e.kind for e in storage.list_events()]
     storage.close()
 
 

@@ -54,6 +54,7 @@ class DeterministicPlanner:
     def __init__(self, router: ModelRouter | None = None):
         self._router = router  # reserved: planner can consult the router later
         self.last_transformation = None  # PlanTransformation | None (audit, ADR-013)
+        self.last_source: str | None = "deterministic"  # ADR-057 D3 source marker
 
     def plan(
         self,
@@ -170,6 +171,7 @@ class DeterministicPlanner:
             )
             self.last_transformation = transformation
             steps = transformation.transformed
+        self.last_source = "deterministic"  # ADR-057 D3 source marker (reaffirmed)
         return steps
 
     @staticmethod

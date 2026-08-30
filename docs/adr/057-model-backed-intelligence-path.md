@@ -1,8 +1,8 @@
 # ADR-057 — Model-Backed Intelligence Path
 
 - **Status:** Approved (2026-08-29) — M1 (Provider Configuration + Bounded
-  Transport Retry) and M2 (Model Output Size / Depth Limits) implemented;
-  M3–M5 pending approval.
+  Transport Retry), M2 (Model Output Size / Depth Limits) and
+  M3 (Fallback Composition) implemented; M4–M5 pending approval.
 - **Date:** 2026-08-29
 - **Deciders:** ChatGPT (architect/manager), Arena AI (engineering agent)
 - **Baseline checkpoint:** M0 accepted — 1,478 passed / 2 skipped / 23/23 demos /

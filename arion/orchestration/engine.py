@@ -2782,6 +2782,7 @@ class ArionEngine:
                         task_id=task.id,
                         detail={"steps": self._plan_steps_for_audit(steps),
                                 "stored_plan": True,
+                                "source": "stored",  # ADR-057 D3 (additive)
                                 "plan_version": latest["plan_version"]},
                     )
                 return task
@@ -3920,6 +3921,10 @@ class ArionEngine:
             )
             self._emit("task.failed", task_id=task.id, detail={"error": task.error})
             return task
+        # ADR-057 D3 (additive): plan provenance source marker. The planner
+        # records whether the plan came from model cognition or deterministic
+        # fallback; unknown/legacy planners default to "deterministic".
+        plan_source = getattr(self.planner, "last_source", None) or "deterministic"
         # Planner/model calls may block for longer than the goal lease. The
         # exact owner must still be live before immutable plan authority can
         # be minted; ownership loss is a clean stop, not planning failure.
@@ -3995,6 +4000,7 @@ class ArionEngine:
                 plan_record = self.goal_manager.record_plan_version(
                     task.goal_id, strategy_name,
                     [step.to_dict() for step in steps], plan_reason,
+                    source=plan_source,  # ADR-057 D3 (additive)
                 )
                 task.plan_version = plan_record["plan_version"]
             except Exception as exc:
@@ -4042,7 +4048,10 @@ class ArionEngine:
         self._emit(
             "plan.produced",
             task_id=task.id,
-            detail={"steps": self._plan_steps_for_audit(steps)},
+            detail={
+                "steps": self._plan_steps_for_audit(steps),
+                "source": plan_source,  # ADR-057 D3 (additive)
+            },
         )
 
         if plan_record is not None and plan_reason is not None \
@@ -5047,6 +5056,11 @@ class ArionEngine:
                     "guidance_categories": sorted({g.category for g in ctx.guidance}),
                     "guidance_count": len(ctx.guidance),
                     "deterministic": True,
+                    # ADR-057 D3 (additive): the memory-influence pipeline is a
+                    # deterministic mechanism regardless of whether the
+                    # planner itself is model-backed. The legacy boolean stays
+                    # for compatibility.
+                    "source": "deterministic",
                 },
             )
 

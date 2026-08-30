@@ -446,8 +446,11 @@ def test_byte_limit_rejection_is_not_retried():
 
 
 def test_rejection_does_not_invoke_fallback():
-    # fallback is M3-owned; there is no model.fallback event kind today
-    assert "model.fallback" not in EVENT_KINDS
+    # M3 registers the fallback event kind, but fallback is PLANNER-owned:
+    # the router itself never emits it - a rejection here surfaces as a
+    # typed planning failure to the planner layer (which decides whether to
+    # retry/fall back per ADR-057 M3).
+    assert "model.fallback" in EVENT_KINDS
     plan = _plan(steps=[_step(i) for i in range(MAX_PLAN_STEPS + 1)])
     router = _router(CountingTransport(_ok_envelope(plan)))
     with pytest.raises(PlanningError):  # typed planning failure, nothing else

@@ -62,11 +62,21 @@ VALID_PLAN = {
 }
 
 
-def _build_engine(db_path, sandbox, router, policy=None, events=None):
+def _build_engine(db_path, sandbox, router, policy=None, events=None,
+                  fallback_enabled=True):
     storage = SQLiteStorage(db_path)
     registry = CapabilityRegistry()
     registry.register(FilesystemReadCapability(sandbox))
-    planner = RealModelPlanner(router, events=events or EventLogger(sinks=[storage]))
+    # ADR-057 M3: fallback (deterministic planner on model failure) is the
+    # default. Adversarial model-failure tests opt into strict mode
+    # (fallback_enabled=False) so their "typed durable failure, nothing
+    # executes" assertions remain exact; the fallback-enabled adversarial
+    # path is covered in tests/test_model_fallback.py.
+    planner = RealModelPlanner(
+        router,
+        events=events or EventLogger(sinks=[storage]),
+        fallback_enabled=fallback_enabled,
+    )
     return ArionEngine(
         storage=storage,
         registry=registry,
@@ -116,7 +126,7 @@ def test_integration_scope_spoofing_rejected(sandbox, db_path):
     """The model emits scope=shell:exec: the schema rejects it before execution."""
     bad = json.loads(json.dumps(VALID_PLAN))
     bad["steps"][0]["scope"] = "shell:exec"
-    engine = _build_engine(db_path, sandbox, FakeModelRouter(bad))
+    engine = _build_engine(db_path, sandbox, FakeModelRouter(bad), fallback_enabled=False)
 
     task = engine.execute_goal("Inspect this repository")
 
@@ -131,7 +141,7 @@ def test_integration_scope_spoofing_rejected(sandbox, db_path):
 def test_integration_unknown_capability_rejected(sandbox, db_path):
     bad = json.loads(json.dumps(VALID_PLAN))
     bad["steps"][0]["capability"] = "shell.exec"
-    engine = _build_engine(db_path, sandbox, FakeModelRouter(bad))
+    engine = _build_engine(db_path, sandbox, FakeModelRouter(bad), fallback_enabled=False)
 
     task = engine.execute_goal("Inspect this repository")
     assert task.status == TaskStatus.FAILED
@@ -141,7 +151,7 @@ def test_integration_unknown_capability_rejected(sandbox, db_path):
 def test_integration_unknown_action_rejected(sandbox, db_path):
     bad = json.loads(json.dumps(VALID_PLAN))
     bad["steps"][0]["action"] = "delete"
-    engine = _build_engine(db_path, sandbox, FakeModelRouter(bad))
+    engine = _build_engine(db_path, sandbox, FakeModelRouter(bad), fallback_enabled=False)
 
     task = engine.execute_goal("Inspect this repository")
     assert task.status == TaskStatus.FAILED
@@ -151,7 +161,7 @@ def test_integration_unknown_action_rejected(sandbox, db_path):
 def test_integration_wrong_param_type_rejected(sandbox, db_path):
     bad = json.loads(json.dumps(VALID_PLAN))
     bad["steps"][0]["params"] = {"path": 123}
-    engine = _build_engine(db_path, sandbox, FakeModelRouter(bad))
+    engine = _build_engine(db_path, sandbox, FakeModelRouter(bad), fallback_enabled=False)
 
     task = engine.execute_goal("Inspect this repository")
     assert task.status == TaskStatus.FAILED
@@ -161,7 +171,7 @@ def test_integration_wrong_param_type_rejected(sandbox, db_path):
 def test_integration_missing_required_param_rejected(sandbox, db_path):
     bad = json.loads(json.dumps(VALID_PLAN))
     bad["steps"][0]["params"] = {}
-    engine = _build_engine(db_path, sandbox, FakeModelRouter(bad))
+    engine = _build_engine(db_path, sandbox, FakeModelRouter(bad), fallback_enabled=False)
 
     task = engine.execute_goal("Inspect this repository")
     assert task.status == TaskStatus.FAILED
@@ -171,7 +181,7 @@ def test_integration_missing_required_param_rejected(sandbox, db_path):
 def test_integration_resource_param_smuggling_rejected(sandbox, db_path):
     bad = json.loads(json.dumps(VALID_PLAN))
     bad["steps"][1]["params"] = {"Path": "README.md"}
-    engine = _build_engine(db_path, sandbox, FakeModelRouter(bad))
+    engine = _build_engine(db_path, sandbox, FakeModelRouter(bad), fallback_enabled=False)
 
     task = engine.execute_goal("Inspect this repository")
     assert task.status == TaskStatus.FAILED
@@ -207,7 +217,7 @@ def test_integration_path_prefix_denial(sandbox, db_path):
 def test_integration_injected_arbitrary_args_rejected(sandbox, db_path):
     bad = json.loads(json.dumps(VALID_PLAN))
     bad["steps"][0]["params"] = {"path": ".", "chmod": "777"}
-    engine = _build_engine(db_path, sandbox, FakeModelRouter(bad))
+    engine = _build_engine(db_path, sandbox, FakeModelRouter(bad), fallback_enabled=False)
 
     task = engine.execute_goal("Inspect this repository")
     assert task.status == TaskStatus.FAILED

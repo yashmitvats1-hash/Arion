@@ -201,7 +201,10 @@ def _build_engine(db_path, sandbox, router):
     registry = CapabilityRegistry()
     registry.register(FilesystemReadCapability(sandbox))
     events = EventLogger(sinks=[storage])
-    planner = RealModelPlanner(router, events=events)
+    # ADR-057 M3: this file asserts typed durable failure categories, so the
+    # planner is built in strict mode (fallback disabled); the fallback path
+    # is covered in tests/test_model_fallback.py.
+    planner = RealModelPlanner(router, events=events, fallback_enabled=False)
     return ArionEngine(
         storage=storage, registry=registry, planner=planner, router=router,
         events=events, policy=ResourcePolicy(boundaries={"filesystem:path": RelativePathBoundary()}),
