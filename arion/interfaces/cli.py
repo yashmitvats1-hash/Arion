@@ -49,6 +49,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("goal", help="the goal description, e.g. 'summarize this repository'")
     run.add_argument("--source", default="cli")
 
+    api = sub.add_parser("api", help="run the authenticated approval API server (M6-A)", parents=[common])
+    api.add_argument("--port", type=int, default=8972, help="port to bind the API server")
+    api.add_argument("--host", default="127.0.0.1", help="host to bind the API server")
+
     resume = sub.add_parser("resume", help="resume a persisted task after a process restart", parents=[common])
     resume.add_argument("task_id", help="task id to resume")
 
@@ -401,6 +405,8 @@ def _dispatch_command(args, engine: ArionEngine) -> int:
         return _cognition_command(args, engine)
     elif args.command == "goals":
         return _goals_command(args, engine)
+    elif args.command == "api":
+        return _api_command(args, engine)
     elif args.command == "approvals":
         return _approvals_command(args, engine)
     elif args.command == "recovery":
@@ -1718,3 +1724,34 @@ def _memory_command(args, engine) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+def _api_command(args, engine) -> int:
+    import threading
+    from http.server import ThreadingHTTPServer
+    from arion.interfaces.approval_api import ApprovalAPIHandler, load_api_tokens, APIConfigError
+
+    try:
+        tokens = load_api_tokens()
+    except APIConfigError as e:
+        print(f"API configuration error: {e}")
+        return 1
+
+    if not tokens:
+        print("Warning: ARION_API_TOKENS is empty; API endpoints requiring authentication will reject all requests.")
+
+    class Handler(ApprovalAPIHandler):
+        pass
+
+    Handler.engine = engine
+    Handler.tokens = tokens
+
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"Approval API server running on http://{args.host}:{args.port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("Shutting down API server...")
+    finally:
+        server.shutdown()
+        server.server_close()
+    return 0
