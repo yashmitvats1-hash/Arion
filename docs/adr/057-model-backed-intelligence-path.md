@@ -1,8 +1,9 @@
 # ADR-057 — Model-Backed Intelligence Path
 
 - **Status:** Approved (2026-08-29) — M1 (Provider Configuration + Bounded
-  Transport Retry), M2 (Model Output Size / Depth Limits) and
-  M3 (Fallback Composition) implemented; M4–M5 pending approval.
+  Transport Retry), M2 (Model Output Size / Depth Limits),
+  M3 (Fallback Composition) and M4 (Reflection Wiring) implemented;
+  M5 pending approval.
 - **Date:** 2026-08-29
 - **Deciders:** ChatGPT (architect/manager), Arena AI (engineering agent)
 - **Baseline checkpoint:** M0 accepted — 1,478 passed / 2 skipped / 23/23 demos /
@@ -596,9 +597,15 @@ none touches the authority model or schema.
   cannot authorize itself"; deterministic replay tests (stored plan → no
   re-query); `max_replans_exceeded` path; source markers asserted.
   *Gate:* new tests green; full suite green; demos green.
-- **M4 — Reflection wiring.** `reflector` passthrough in `build_engine`;
-  `ARION_LLM_REFLECTION`; ModelReflector selected when provider configured;
-  `reflection.created` source marker.
+- **M4 — Reflection wiring (implemented).** `reflector` passthrough in
+  `build_engine`; explicit `reflector=` wins; ModelReflector selected only
+  when a provider is configured AND `reflection_enabled` (consumes
+  `ARION_LLM_REFLECTION` via `load_model_config`); deterministic reflector
+  otherwise (memory on) / None (memory off); additive `last_source`
+  provenance seam ("model" | "deterministic"); `reflection.created` carries
+  the additive `"source"` marker; engine-created deterministic fallback is
+  always marked "deterministic". Model reflection: exactly one provider
+  call, no retries, immediate deterministic fallback on any failure.
   *Test strategy:* model reflection success; malformed/forbidden → immediate
   deterministic fallback; `ARION_LLM_REFLECTION=0`; engine offline with no
   provider.

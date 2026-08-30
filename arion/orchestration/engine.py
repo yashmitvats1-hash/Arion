@@ -5226,9 +5226,21 @@ class ArionEngine:
             # if it fails or produces something invalid, fall back to the
             # deterministic reflector so the loop stays offline-capable.
             reflection = None
+            # ADR-057 M4 (additive provenance): the reflection.created source
+            # marker. A model reflector exposes last_source="model" on
+            # success; anything else (deterministic reflector, explicit
+            # custom reflectors, and the ENGINE-CREATED deterministic
+            # fallback below) is marked "deterministic". This is audit
+            # metadata only - it never influences authorization or the
+            # deterministic guidance authority model.
+            reflection_source = "deterministic"
             try:
                 if self.reflector is not None:
                     reflection = self.reflector.reflect(episode)
+                    reflection_source = (
+                        getattr(self.reflector, "last_source", None)
+                        or "deterministic"
+                    )
             except Exception as exc:
                 summary = summarize_error(
                     exc,
@@ -5245,6 +5257,7 @@ class ArionEngine:
                 )
             if reflection is None:
                 reflection = DeterministicReflector().reflect(episode)
+                reflection_source = "deterministic"
             # DURABLE REFLECTION CLAIM (one reflection per episode, ADR-013
             # addendum): the store keeps the FIRST reflection inserted for
             # the episode; a concurrent worker that already reflected wins
@@ -5269,10 +5282,15 @@ class ArionEngine:
             except Exception:
                 pass
             if created_reflection:
+                detail = {
+                    "reflection_id": reflection.reflection_id,
+                    "episode_id": episode.episode_id,
+                    "source": reflection_source,  # ADR-057 M4 (additive)
+                }
                 self._emit(
                     "reflection.created",
                     task_id=task.id,
-                    detail={"reflection_id": reflection.reflection_id, "episode_id": episode.episode_id},
+                    detail=detail,
                 )
 
             # Cognitive state: derive + store beliefs (semantic/procedural)
