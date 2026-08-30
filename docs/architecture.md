@@ -918,7 +918,7 @@ loop (ADR-016):
   RLock (`check_same_thread=False`); cross-process authority is unchanged
   (`BEGIN IMMEDIATE` + WAL), so in-process threads and other processes
   compete on exactly the same lock/queue authority.
-- **Demo:** `scripts/demo_adr024_concurrency.py` (30 checks, deterministic,
+- **Demo:** `scripts/demo_adr024_concurrency.py` (31 checks, deterministic,
   offline): parallel reads, same-resource FIFO serialization, different-
   resource concurrency, blocked mutation not stalling reads, restart/cancel/
   shutdown with no orphan work.
@@ -1617,8 +1617,21 @@ until real service boundaries require them.
 
 ## Security boundary (first slice)
 
-No shell, no writes, no network. Filesystem access is read-only and confined
-to the repository root; every action passes the permission gate (ADR-006).
+No shell, no subprocess, no dynamic code execution anywhere in the core.
+Every action passes the permission gate (ADR-006/009); the default policy is
+fail-closed:
+
+- **Filesystem access is confined to the sandbox root** (`filesystem.read`,
+  `filesystem.write`, `filesystem.append` all enforce `_resolve_inside`
+  containment — traversal, absolute-path and symlink escapes fail closed).
+- **Mutating capabilities are registered but DENIED by the default policy**
+  (`allowed_scopes` has no `filesystem:write`): no write/append mutation
+  without explicit operator authorization, and mutations additionally require
+  live re-authorization, the durable mutation lock (ADR-021) and, when
+  configured, approval.
+- **Network access is registered but DENIED by default**: `http.get` has no
+  `url` boundary configured, so off-allowlist access is impossible until an
+  operator explicitly configures a `UrlBoundary` (fail closed).
 
 ## Not built yet (by decision)
 

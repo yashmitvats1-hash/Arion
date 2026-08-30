@@ -37,6 +37,55 @@ _CTX_STOP = {"a", "an", "the", "this", "that", "of", "in", "on", "for",
              "to", "and", "or", "with", "my", "your", "please", "can",
              "you", "me", "i", "it", "is", "are"}
 
+# Common file-extension suffixes (ADR-017 rule 1). A bare dotted token whose
+# LAST dot-part is one of these is a file reference (README.md, package.json,
+# notes.log), never a capability name: capability actions are verbs like
+# read/write/get/list/append/search, not extensions. Registered capabilities
+# are never in the missing set, so excluding extension-like suffixes cannot
+# hide a missing REGISTERED capability mention; the engine additionally gates
+# planning on planner.required_capabilities() (authoritative, unchanged).
+_FILE_EXTENSION_SUFFIXES = frozenset({
+    # text / markup / config
+    "md", "markdown", "rst", "txt", "json", "toml", "yaml", "yml", "ini",
+    "cfg", "conf", "config", "csv", "tsv", "log", "xml", "html", "htm",
+    "css", "scss", "sass", "js", "mjs", "cjs", "ts", "jsx", "tsx", "vue",
+    "py", "pyw", "pyc", "sh", "bash", "zsh", "fish", "bat", "cmd", "ps1",
+    "env", "lock", "gitignore", "gitattributes", "editorconfig", "sql",
+    "db", "sqlite", "ipynb", "tex", "bib", "aux",
+    # images / media
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp", "tif",
+    "tiff", "avif", "heic", "pdf", "mp3", "wav", "ogg", "flac", "aac",
+    "mp4", "mkv", "mov", "avi", "webm",
+    # archives / binaries
+    "zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "iso", "img",
+    "bin", "dat", "exe", "dll", "so", "dylib", "class", "jar", "war",
+    "deb", "rpm", "apk",
+    # office / docs
+    "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp",
+    "pages", "numbers", "key", "epub", "mobi",
+    # misc
+    "bak", "tmp", "swp", "orig", "rej",
+})
+
+
+def _looks_like_capability_token(token: str) -> bool:
+    """True iff a bare dotted token could be a capability identifier
+    (family.action) rather than a file/version reference.
+
+    Deterministic heuristic (ADR-017 rule 1): every dot-separated part must
+    look like a lowercase identifier (start with a letter), and the final
+    part must not be a common file-extension suffix. This keeps ordinary
+    file names (README.md, package.json, notes.log), path fragments
+    (docs/design.md - already excluded by the '/' check) and version
+    strings (v1.2.3) from being misread as missing capabilities.
+    """
+    parts = token.split(".")
+    if len(parts) < 2:
+        return False
+    if not all(re.fullmatch(r"[a-z][a-z0-9_]*", part) for part in parts):
+        return False
+    return parts[-1] not in _FILE_EXTENSION_SUFFIXES
+
 
 def _goal_context_similar(a: str, b: str, threshold: float = 0.5) -> bool:
     """Deterministic token-overlap similarity of two goal descriptions."""
@@ -174,14 +223,23 @@ class StrategySelector:
             provenance["previous_strategies"] = previous_strategies[-10:]
 
         # Rule 1: environment missing a capability mentioned in the goal.
-        # Dotted tokens containing '/' are file paths, not capability names
-        # (e.g. "docs/design.md") - never treated as capabilities (ADR-017).
+        # Only tokens that LOOK like capability names are considered: a
+        # capability identifier is family.action (lowercase identifier parts,
+        # non-extension suffix). Ordinary dotted tokens such as file names
+        # ("README.md", "package.json", "notes.log") and versions ("v1.2.3")
+        # are never mistaken for missing capabilities (ADR-017).
         env = environment if isinstance(environment, dict) else {}
         reg = env.get("registered_capabilities", {})
         caps = reg.get("value", []) if isinstance(reg, dict) else []
         if caps:
-            needed = {w for w in goal_description.lower().split() if "." in w and "/" not in w}
-            missing = [c for c in needed if c not in caps]
+            needed = {
+                w for w in goal_description.lower().split()
+                if "." in w and "/" not in w
+                and _looks_like_capability_token(w)
+            }
+            # sorted() keeps the missing-capability list stable across
+            # interpreter runs (set iteration order is hash-dependent).
+            missing = sorted(c for c in needed if c not in caps)
             if missing:
                 return Strategy(
                     strategy_id=new_id("strat"),
