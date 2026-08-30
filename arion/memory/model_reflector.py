@@ -58,6 +58,10 @@ class ModelReflector:
     def __init__(self, router: Any, events: Any | None = None):
         self.router = router
         self.events = events  # duck-typed EventLogger (any object with .emit)
+        # ADR-057 M4 (additive provenance): the engine reads this for the
+        # reflection.created source marker. Informational audit metadata
+        # only - it never influences authorization or cognition authority.
+        self.last_source: str | None = "model"
 
     def reflect(self, episode: Episode) -> Reflection:
         if self.events is not None:
@@ -79,6 +83,7 @@ class ModelReflector:
         except json.JSONDecodeError as exc:
             raise ReflectionValidationError(f"malformed reflection JSON: {exc}") from exc
         reflection = validate_reflection_dict(obj, episode_id=episode.episode_id)
+        self.last_source = "model"  # ADR-057 M4 (additive provenance)
         if self.events is not None:
             self._emit("reflection.validation.passed", episode.episode_id,
                        {"reflection_id": reflection.reflection_id})

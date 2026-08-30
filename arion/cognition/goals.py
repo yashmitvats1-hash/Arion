@@ -628,8 +628,12 @@ class GoalManager:
         strategy: str,
         plan_summary: list[dict],
         reason: str,
+        source: str | None = None,
     ) -> dict[str, Any]:
         """Record a NEW (immutable) plan version for a goal.
+
+        `source` (ADR-057 D3, additive): "model" | "deterministic" | "stored"
+        provenance for the plan.versioned event. None omits the key.
 
         Delegates version allocation to the authoritative store funnel
         ``claim_goal_plan`` (one ``BEGIN IMMEDIATE`` transaction,
@@ -683,13 +687,16 @@ class GoalManager:
                     columns=("strategy",), op="record_plan_version")
             except GoalStateError:
                 pass  # informational follow-up; plan lineage already committed
-        self._emit("plan.versioned", goal_id=goal_id, detail={
+        detail: dict[str, Any] = {
             "goal_id": goal_id,
             "plan_version": record["plan_version"],
             "strategy": strategy,
             "reason": reason[:200],
             "steps": len(plan_summary),
-        })
+        }
+        if source is not None:  # ADR-057 D3 additive source marker
+            detail["source"] = source
+        self._emit("plan.versioned", goal_id=goal_id, detail=detail)
         return record
 
     def _any_task_for_plan(self, goal_id: str, plan_version: int) -> bool:

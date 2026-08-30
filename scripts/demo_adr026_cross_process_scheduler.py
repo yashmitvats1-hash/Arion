@@ -223,7 +223,7 @@ def main() -> int:
     except SchedulerStateError:
         check(True, "A: forged worker heartbeat rejected (ownership checked)")
     store.mark_terminal(row.work_id, SchedulerWorkStatus.COMPLETED,
-                        owner_worker_id="worker:1")
+                        now=T0, owner_worker_id="worker:1")
     check(store.get_work(row.work_id).status == SchedulerWorkStatus.COMPLETED,
           "A: owner completes the work normally")
     store.close()
@@ -377,7 +377,7 @@ def main() -> int:
     except SchedulerStateError:
         check(True, "F: stale owner handoff rejected (ownership checked)")
     store.mark_terminal(fb.work_id, SchedulerWorkStatus.COMPLETED,
-                        owner_worker_id="worker-F")
+                        now=_iso_plus(T0, 3), owner_worker_id="worker-F")
     store.close()
 
     # ---------------------------------------------------------------- G -----

@@ -18,6 +18,7 @@ import json
 from typing import Any
 
 from arion.memory.models import Reflection
+from arion.state.models import utcnow
 
 REFLECTION_SCHEMA_VERSION = "1.0"
 
@@ -110,7 +111,11 @@ def validate_reflection_dict(d: Any, episode_id: str | None = None) -> Reflectio
         recommendation=d["recommendation"][:1000],
         confidence=confidence,
         importance=float(importance),
-        created_at=d.get("created_at"),
+        # Model output omits created_at by contract (the reflection schema
+        # fields are the informational ones); default to now so the durable
+        # reflections.created_at NOT NULL insert never fails on a
+        # well-formed model reflection (ADR-057 M4).
+        created_at=d.get("created_at") or utcnow(),
     )
 
 

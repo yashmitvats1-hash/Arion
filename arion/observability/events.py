@@ -58,6 +58,8 @@ EVENT_KINDS = (
     "approval.expired",
     "planning.requested",
     "model.response.received",
+    "model.retry",
+    "model.fallback",
     "plan.validation.passed",
     "plan.validation.failed",
     "memory.episode.recorded",

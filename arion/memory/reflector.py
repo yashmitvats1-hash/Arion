@@ -20,7 +20,14 @@ CONFIDENCES = ("low", "medium", "high")
 
 
 class Reflector(Protocol):
-    """Produces a structured reflection from an episode."""
+    """Produces a structured reflection from an episode.
+
+    Implementations may expose an optional additive provenance attribute
+    `last_source: str` ("deterministic" | "model" | custom) read by the
+    engine for the `reflection.created` source marker (ADR-057 M4). It is
+    informational audit metadata only - it never influences authorization
+    or cognition authority.
+    """
 
     def reflect(self, episode: Episode) -> Reflection: ...
 
@@ -31,6 +38,11 @@ class DeterministicReflector:
     Distinguishes success vs failure vs denial and builds structured lessons
     from the episode's data - no model, no magic.
     """
+
+    def __init__(self):
+        # ADR-057 M4 (additive provenance): the engine reads this for the
+        # reflection.created source marker.
+        self.last_source: str | None = "deterministic"
 
     def reflect(self, episode: Episode) -> Reflection:
         goal = episode.goal[:200] if episode.goal else "(unknown goal)"
@@ -74,6 +86,9 @@ class DeterministicReflector:
             lesson = f"Goal {goal!r} failed and may need a different plan, capability, or authorization."
             recommendation = "Retry with adjusted parameters or a different approach; verify prerequisites first."
             confidence = "medium"
+
+        # ADR-057 M4 (additive provenance): reaffirmed on every reflection.
+        self.last_source = "deterministic"
 
         return Reflection(
             reflection_id=new_id("refl"),
