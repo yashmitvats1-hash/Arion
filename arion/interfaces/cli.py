@@ -1739,11 +1739,32 @@ def _api_command(args, engine) -> int:
     if not tokens:
         print("Warning: ARION_API_TOKENS is empty; API endpoints requiring authentication will reject all requests.")
 
-    class Handler(ApprovalAPIHandler):
+    # M6-B (ADR-059 D15): the webhook admin surface is mounted on the SAME
+    # server and port. It requires ADMIN privilege from the separate
+    # ARION_API_ADMIN_TOKENS surface; ARION_API_TOKENS keeps its exact
+    # existing grammar and meaning (approver).
+    from arion.interfaces.api_authz import TokenRegistry
+    from arion.interfaces.webhook_api import WebhookAPI, WebhookAPIHandlerMixin
+    from arion.notifications.config import WebhookConfigError, load_webhook_config
+
+    try:
+        registry = TokenRegistry.from_env()
+        webhook_config = load_webhook_config()
+    except (APIConfigError, WebhookConfigError) as e:
+        print(f"API configuration error: {e}")
+        return 1
+
+    class Handler(WebhookAPIHandlerMixin, ApprovalAPIHandler):
         pass
 
     Handler.engine = engine
     Handler.tokens = tokens
+    Handler.webhook_api = WebhookAPI(engine.storage, webhook_config, registry)
+    if webhook_config.enabled and not registry.has_admin_credentials:
+        print(
+            "Warning: webhooks are enabled but ARION_API_ADMIN_TOKENS is empty; "
+            "all webhook administration requests will be refused (fail closed)."
+        )
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Approval API server running on http://{args.host}:{args.port}")

@@ -11,7 +11,7 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 
 def _threadsafe(method):
@@ -254,6 +254,62 @@ CREATE INDEX IF NOT EXISTS idx_sched_events_type ON scheduler_events(event_type)
 CREATE INDEX IF NOT EXISTS idx_sched_events_work ON scheduler_events(work_id);
 CREATE INDEX IF NOT EXISTS idx_sched_events_goal ON scheduler_events(goal_id);
 CREATE INDEX IF NOT EXISTS idx_sched_events_sched ON scheduler_events(scheduler_id);
+CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+    subscription_id       TEXT PRIMARY KEY,
+    url                   TEXT NOT NULL,
+    event_kinds           TEXT NOT NULL,
+    enabled               INTEGER NOT NULL DEFAULT 1,
+    description           TEXT NOT NULL DEFAULT '',
+    created_by            TEXT NOT NULL DEFAULT 'system',
+    active_secret_version INTEGER NOT NULL DEFAULT 1,
+    created_at            TEXT NOT NULL,
+    updated_at            TEXT NOT NULL,
+    deleted_at            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_subs_enabled ON webhook_subscriptions(enabled);
+CREATE TABLE IF NOT EXISTS webhook_secret_versions (
+    subscription_id TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    secret          TEXT,
+    status          TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    retiring_at     TEXT,
+    retired_at      TEXT,
+    PRIMARY KEY (subscription_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_secrets_status
+    ON webhook_secret_versions(subscription_id, status);
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    delivery_id          TEXT PRIMARY KEY,
+    subscription_id      TEXT NOT NULL,
+    event_id             TEXT NOT NULL,
+    event_kind           TEXT NOT NULL,
+    occurred_at          TEXT NOT NULL,
+    sequence             INTEGER NOT NULL,
+    secret_version       INTEGER NOT NULL,
+    body_bytes           BLOB NOT NULL,
+    url                  TEXT NOT NULL,
+    status               TEXT NOT NULL,
+    attempts             INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at      TEXT NOT NULL,
+    lease_owner          TEXT,
+    lease_expires_at     TEXT,
+    last_error           TEXT,
+    retry_eligible_until TEXT,
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL,
+    completed_at         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_claim
+    ON webhook_deliveries(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_sub
+    ON webhook_deliveries(subscription_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_secret
+    ON webhook_deliveries(subscription_id, secret_version, status);
+CREATE TABLE IF NOT EXISTS webhook_sequence (
+    id    INTEGER PRIMARY KEY CHECK (id = 1),
+    value INTEGER NOT NULL
+);
 """
 
 
@@ -4376,6 +4432,667 @@ class SQLiteStorage:
             raise
         return self.get_goal_ceiling_config(goal_id)
 
+    # ------------------------------------------------------------------ #
+    # Webhook notifications (ADR-059, M6-B)
+    #
+    # Coordination + delivery state only. NEVER authorization: a webhook row
+    # says nothing about whether any capability may touch the world. Claim /
+    # fence / reclaim follow the proven scheduler_work lease pattern
+    # (BEGIN IMMEDIATE + conditional UPDATE + rowcount), but scheduler_work
+    # itself is deliberately NOT reused (ADR-059 R2).
+    # ------------------------------------------------------------------ #
+
+    _WH_SUB_COLS = (
+        "subscription_id", "url", "event_kinds", "enabled", "description",
+        "created_by", "active_secret_version", "created_at", "updated_at",
+        "deleted_at",
+    )
+    _WH_DELIVERY_COLS = (
+        "delivery_id", "subscription_id", "event_id", "event_kind",
+        "occurred_at", "sequence", "secret_version", "body_bytes", "url",
+        "status", "attempts", "next_attempt_at", "lease_owner",
+        "lease_expires_at", "last_error", "retry_eligible_until",
+        "created_at", "updated_at", "completed_at",
+    )
+    _WH_SECRET_COLS = (
+        "subscription_id", "version", "secret", "status", "created_at",
+        "retiring_at", "retired_at",
+    )
+
+    @_threadsafe
+    def create_webhook_subscription(
+        self,
+        subscription: "WebhookSubscription",
+        secret: str,
+    ) -> "WebhookSubscription":
+        """Create one subscription plus its initial ACTIVE secret version."""
+        from arion.notifications.models import SecretVersionStatus
+
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(
+                "INSERT INTO webhook_subscriptions "
+                f"({', '.join(self._WH_SUB_COLS)}) "
+                f"VALUES ({', '.join('?' * len(self._WH_SUB_COLS))})",
+                _wh_sub_row(subscription),
+            )
+            self._conn.execute(
+                "INSERT INTO webhook_secret_versions "
+                f"({', '.join(self._WH_SECRET_COLS)}) VALUES (?,?,?,?,?,?,?)",
+                (subscription.subscription_id, subscription.active_secret_version,
+                 secret, SecretVersionStatus.ACTIVE.value,
+                 subscription.created_at, None, None),
+            )
+            self._conn.commit()
+            return subscription
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_threadsafe
+    def get_webhook_subscription(
+        self, subscription_id: str, *, include_deleted: bool = False,
+    ) -> "WebhookSubscription | None":
+        clause = "" if include_deleted else " AND deleted_at IS NULL"
+        row = self._conn.execute(
+            f"SELECT {', '.join(self._WH_SUB_COLS)} FROM webhook_subscriptions "
+            f"WHERE subscription_id=?{clause}",
+            (subscription_id,),
+        ).fetchone()
+        return _wh_sub_from_row(row) if row is not None else None
+
+    @_threadsafe
+    def list_webhook_subscriptions(
+        self,
+        *,
+        enabled_only: bool = False,
+        include_deleted: bool = False,
+        limit: int | None = None,
+        after_id: str | None = None,
+    ) -> list["WebhookSubscription"]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if not include_deleted:
+            clauses.append("deleted_at IS NULL")
+        if enabled_only:
+            clauses.append("enabled=1")
+        if after_id:
+            clauses.append("subscription_id > ?")
+            params.append(after_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = (
+            f"SELECT {', '.join(self._WH_SUB_COLS)} FROM webhook_subscriptions "
+            f"{where} ORDER BY subscription_id"
+        )
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        rows = self._conn.execute(sql, params).fetchall()
+        return [_wh_sub_from_row(r) for r in rows]
+
+    @_threadsafe
+    def update_webhook_subscription(
+        self, subscription_id: str, fields: dict[str, Any],
+        now: str | None = None,
+    ) -> "WebhookSubscription | None":
+        """Update mutable subscription content (url / event_kinds / enabled /
+        description). Security bounds are NEVER settable here (ADR-059 D14)."""
+        allowed = {"url", "event_kinds", "enabled", "description"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"unsupported subscription fields: {sorted(unknown)}")
+        if not fields:
+            return self.get_webhook_subscription(subscription_id)
+        now = now or utcnow()
+        assignments = []
+        params: list[Any] = []
+        for key, value in fields.items():
+            if key == "event_kinds":
+                assignments.append("event_kinds=?")
+                params.append(json.dumps(sorted(value)))
+            elif key == "enabled":
+                assignments.append("enabled=?")
+                params.append(1 if value else 0)
+            else:
+                assignments.append(f"{key}=?")
+                params.append(value)
+        assignments.append("updated_at=?")
+        params.append(now)
+        params.append(subscription_id)
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            cur = self._conn.execute(
+                f"UPDATE webhook_subscriptions SET {', '.join(assignments)} "
+                "WHERE subscription_id=? AND deleted_at IS NULL",
+                params,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        if cur.rowcount == 0:
+            return None
+        return self.get_webhook_subscription(subscription_id)
+
+    @_threadsafe
+    def delete_webhook_subscription(
+        self, subscription_id: str, now: str | None = None,
+    ) -> bool:
+        """Delete one subscription (ADR-059 D16).
+
+        Atomically: mark the subscription deleted, CANCEL its non-terminal
+        PENDING deliveries, and transition every live secret version to
+        RETIRING. Secret MATERIAL is NOT destroyed here: retained
+        failed/dead_letter history may still be within its retry horizon and
+        must remain signable (ADR-059 D11.3, invariant 24). Destruction is
+        performed later by the retirement sweep once no retained delivery
+        referencing a version still has retry capability.
+        """
+        from arion.notifications.models import DeliveryStatus, SecretVersionStatus
+
+        now = now or utcnow()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            cur = self._conn.execute(
+                "UPDATE webhook_subscriptions SET deleted_at=?, enabled=0, "
+                "updated_at=? WHERE subscription_id=? AND deleted_at IS NULL",
+                (now, now, subscription_id),
+            )
+            if cur.rowcount == 0:
+                self._conn.rollback()
+                return False
+            # PENDING -> CANCELLED (terminal, never retryable).
+            self._conn.execute(
+                "UPDATE webhook_deliveries SET status=?, completed_at=?, "
+                "updated_at=?, retry_eligible_until=?, lease_owner=NULL, "
+                "lease_expires_at=NULL "
+                "WHERE subscription_id=? AND status=?",
+                (DeliveryStatus.CANCELLED.value, now, now, now,
+                 subscription_id, DeliveryStatus.PENDING.value),
+            )
+            # Live versions -> RETIRING (material preserved).
+            self._conn.execute(
+                "UPDATE webhook_secret_versions SET status=?, retiring_at=? "
+                "WHERE subscription_id=? AND status=?",
+                (SecretVersionStatus.RETIRING.value, now, subscription_id,
+                 SecretVersionStatus.ACTIVE.value),
+            )
+            self._conn.commit()
+            return True
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_threadsafe
+    def rotate_webhook_secret(
+        self, subscription_id: str, secret: str, *,
+        max_live_versions: int, now: str | None = None,
+    ) -> int:
+        """Rotate to a new ACTIVE secret version (ADR-059 D11.2 rule 3).
+
+        The previous ACTIVE version becomes RETIRING with its material
+        intact. Rejects with WebhookStateError when the live-version limit
+        would be exceeded (rule 11), naming the earliest clearing timestamp.
+        """
+        from arion.notifications.models import (
+            SecretVersionStatus,
+            WebhookStateError,
+        )
+
+        now = now or utcnow()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            sub = self._conn.execute(
+                "SELECT active_secret_version FROM webhook_subscriptions "
+                "WHERE subscription_id=? AND deleted_at IS NULL",
+                (subscription_id,),
+            ).fetchone()
+            if sub is None:
+                self._conn.rollback()
+                raise WebhookStateError(
+                    f"unknown or deleted subscription {subscription_id}")
+            live = self._conn.execute(
+                "SELECT COUNT(*) FROM webhook_secret_versions "
+                "WHERE subscription_id=? AND status IN (?,?)",
+                (subscription_id, SecretVersionStatus.ACTIVE.value,
+                 SecretVersionStatus.RETIRING.value),
+            ).fetchone()[0]
+            if int(live) >= int(max_live_versions):
+                horizon = self._conn.execute(
+                    "SELECT MAX(retry_eligible_until) FROM webhook_deliveries "
+                    "WHERE subscription_id=?", (subscription_id,),
+                ).fetchone()[0]
+                self._conn.rollback()
+                raise WebhookStateError(
+                    f"subscription {subscription_id} already holds "
+                    f"{live} live secret versions (limit {max_live_versions}); "
+                    f"rotation blocked until retained retryable deliveries "
+                    f"clear (earliest {horizon or 'unknown'})")
+            max_version = self._conn.execute(
+                "SELECT MAX(version) FROM webhook_secret_versions "
+                "WHERE subscription_id=?", (subscription_id,),
+            ).fetchone()[0]
+            new_version = int(max_version or 0) + 1
+            self._conn.execute(
+                "UPDATE webhook_secret_versions SET status=?, retiring_at=? "
+                "WHERE subscription_id=? AND status=?",
+                (SecretVersionStatus.RETIRING.value, now, subscription_id,
+                 SecretVersionStatus.ACTIVE.value),
+            )
+            self._conn.execute(
+                "INSERT INTO webhook_secret_versions "
+                f"({', '.join(self._WH_SECRET_COLS)}) VALUES (?,?,?,?,?,?,?)",
+                (subscription_id, new_version, secret,
+                 SecretVersionStatus.ACTIVE.value, now, None, None),
+            )
+            self._conn.execute(
+                "UPDATE webhook_subscriptions SET active_secret_version=?, "
+                "updated_at=? WHERE subscription_id=?",
+                (new_version, now, subscription_id),
+            )
+            self._conn.commit()
+            return new_version
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_threadsafe
+    def get_webhook_secret_version(
+        self, subscription_id: str, version: int,
+    ) -> "WebhookSecretVersion | None":
+        row = self._conn.execute(
+            f"SELECT {', '.join(self._WH_SECRET_COLS)} "
+            "FROM webhook_secret_versions WHERE subscription_id=? AND version=?",
+            (subscription_id, int(version)),
+        ).fetchone()
+        return _wh_secret_from_row(row) if row is not None else None
+
+    @_threadsafe
+    def list_webhook_secret_versions(
+        self, subscription_id: str,
+    ) -> list["WebhookSecretVersion"]:
+        rows = self._conn.execute(
+            f"SELECT {', '.join(self._WH_SECRET_COLS)} "
+            "FROM webhook_secret_versions WHERE subscription_id=? "
+            "ORDER BY version",
+            (subscription_id,),
+        ).fetchall()
+        return [_wh_secret_from_row(r) for r in rows]
+
+    @_threadsafe
+    def enqueue_webhook_deliveries(
+        self,
+        deliveries: list["WebhookDelivery"],
+        body_builder: "Callable[[WebhookDelivery], bytes] | None" = None,
+    ) -> list["WebhookDelivery"]:
+        """Insert delivery rows and allocate monotonic sequence values.
+
+        ONE bounded transaction; called on the emitting thread from the
+        outbox sink, so it must stay small and perform no I/O (ADR-059 D3).
+        `sequence` comes from an explicitly declared counter, never from the
+        implicit SQLite rowid (ADR-059 D6).
+        """
+        if not deliveries:
+            return []
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                "SELECT value FROM webhook_sequence WHERE id=1").fetchone()
+            current = int(row[0]) if row is not None else 0
+            for delivery in deliveries:
+                current += 1
+                delivery.sequence = current
+                if body_builder is not None:
+                    # The signed body embeds `sequence`, which only exists
+                    # inside this transaction, so the frozen bytes are built
+                    # here rather than in a second pass that could commit a
+                    # row whose stored body disagreed with its own sequence.
+                    delivery.body_bytes = body_builder(delivery)
+                self._conn.execute(
+                    "INSERT INTO webhook_deliveries "
+                    f"({', '.join(self._WH_DELIVERY_COLS)}) "
+                    f"VALUES ({', '.join('?' * len(self._WH_DELIVERY_COLS))})",
+                    _wh_delivery_row(delivery),
+                )
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO webhook_sequence (id, value) VALUES (1, ?)",
+                    (current,))
+            else:
+                self._conn.execute(
+                    "UPDATE webhook_sequence SET value=? WHERE id=1", (current,))
+            self._conn.commit()
+            return deliveries
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_threadsafe
+    def claim_next_webhook_delivery(
+        self, worker_id: str, lease_seconds: float, now: str | None = None,
+    ) -> "WebhookDelivery | None":
+        """Atomically claim the oldest due PENDING delivery (ADR-059 D9).
+
+        BEGIN IMMEDIATE + conditional UPDATE + rowcount: exactly one owner
+        under any in-process or cross-process race. Never check-then-act.
+        """
+        from arion.notifications.models import DeliveryStatus
+
+        now = now or utcnow()
+        expires = _iso_plus(now, max(0.0, float(lease_seconds)))
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                "SELECT delivery_id FROM webhook_deliveries "
+                "WHERE status=? AND next_attempt_at<=? "
+                "ORDER BY sequence LIMIT 1",
+                (DeliveryStatus.PENDING.value, now),
+            ).fetchone()
+            if row is None:
+                self._conn.rollback()
+                return None
+            delivery_id = row[0]
+            cur = self._conn.execute(
+                "UPDATE webhook_deliveries SET status=?, lease_owner=?, "
+                "lease_expires_at=?, attempts=attempts+1, updated_at=? "
+                "WHERE delivery_id=? AND status=? AND next_attempt_at<=?",
+                (DeliveryStatus.DELIVERING.value, worker_id, expires, now,
+                 delivery_id, DeliveryStatus.PENDING.value, now),
+            )
+            if cur.rowcount != 1:
+                self._conn.rollback()
+                return None
+            claimed = self._conn.execute(
+                f"SELECT {', '.join(self._WH_DELIVERY_COLS)} "
+                "FROM webhook_deliveries WHERE delivery_id=?",
+                (delivery_id,),
+            ).fetchone()
+            self._conn.commit()
+            return _wh_delivery_from_row(claimed)
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_threadsafe
+    def finalize_webhook_delivery(
+        self, delivery_id: str, owner_worker_id: str,
+        status: "DeliveryStatus", *, error: str | None = None,
+        retry_window_days: float = 0.0, now: str | None = None,
+    ) -> bool:
+        """Fenced terminal transition (ADR-059 D9, invariant 10).
+
+        Requires the CURRENT owner AND a live lease: a stale worker whose
+        lease expired can never finalize a row another worker now owns.
+        Sets `retry_eligible_until` per ADR-059 D11.3 - the horizon that
+        simultaneously bounds manual retry, retention pruning, and secret
+        retirement.
+        """
+        from arion.notifications.models import (
+            DeliveryStatus,
+            MANUALLY_RETRYABLE_STATUSES,
+            iso_plus_days,
+        )
+
+        now = now or utcnow()
+        if status in MANUALLY_RETRYABLE_STATUSES:
+            horizon = iso_plus_days(now, retry_window_days)
+        else:
+            horizon = now
+        # A subscription deleted mid-flight forces CANCELLED instead of a
+        # return to PENDING; terminal outcomes are recorded as observed.
+        cur = self._conn.execute(
+            "UPDATE webhook_deliveries SET status=?, completed_at=?, "
+            "updated_at=?, last_error=?, retry_eligible_until=?, "
+            "lease_owner=NULL, lease_expires_at=NULL "
+            "WHERE delivery_id=? AND status=? AND lease_owner=? "
+            "AND lease_expires_at IS NOT NULL AND lease_expires_at > ?",
+            (status.value, now, now, (error or None), horizon,
+             delivery_id, DeliveryStatus.DELIVERING.value, owner_worker_id, now),
+        )
+        self._conn.commit()
+        return cur.rowcount == 1
+
+    @_threadsafe
+    def reschedule_webhook_delivery(
+        self, delivery_id: str, owner_worker_id: str, *,
+        next_attempt_at: str, error: str | None = None,
+        now: str | None = None,
+    ) -> bool:
+        """Fenced retryable-failure transition: DELIVERING -> PENDING with a
+        computed backoff deadline. Same ownership + live-lease fence as
+        finalize, so a stale worker cannot reschedule a reclaimed row."""
+        from arion.notifications.models import DeliveryStatus
+
+        now = now or utcnow()
+        cur = self._conn.execute(
+            "UPDATE webhook_deliveries SET status=?, next_attempt_at=?, "
+            "updated_at=?, last_error=?, lease_owner=NULL, "
+            "lease_expires_at=NULL "
+            "WHERE delivery_id=? AND status=? AND lease_owner=? "
+            "AND lease_expires_at IS NOT NULL AND lease_expires_at > ?",
+            (DeliveryStatus.PENDING.value, next_attempt_at, now,
+             (error or None), delivery_id, DeliveryStatus.DELIVERING.value,
+             owner_worker_id, now),
+        )
+        self._conn.commit()
+        return cur.rowcount == 1
+
+    @_threadsafe
+    def reclaim_stale_webhook_deliveries(
+        self, now: str | None = None,
+    ) -> list[str]:
+        """DELIVERING rows whose lease expired -> PENDING (crash recovery).
+
+        Because LEASE_SECONDS >= TIMEOUT_SECONDS + 5 is enforced at config
+        load (ADR-059 D14.1), an expired lease can only mean a dead or
+        over-budget worker - never merely a slow-but-healthy attempt.
+        """
+        from arion.notifications.models import DeliveryStatus
+
+        now = now or utcnow()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            rows = self._conn.execute(
+                "SELECT delivery_id FROM webhook_deliveries "
+                "WHERE status=? AND lease_expires_at IS NOT NULL "
+                "AND lease_expires_at<=?",
+                (DeliveryStatus.DELIVERING.value, now),
+            ).fetchall()
+            reclaimed = [r[0] for r in rows]
+            if reclaimed:
+                self._conn.execute(
+                    "UPDATE webhook_deliveries SET status=?, lease_owner=NULL, "
+                    "lease_expires_at=NULL, next_attempt_at=?, updated_at=? "
+                    "WHERE status=? AND lease_expires_at IS NOT NULL "
+                    "AND lease_expires_at<=?",
+                    (DeliveryStatus.PENDING.value, now, now,
+                     DeliveryStatus.DELIVERING.value, now),
+                )
+            self._conn.commit()
+            return reclaimed
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_threadsafe
+    def get_webhook_delivery(self, delivery_id: str) -> "WebhookDelivery | None":
+        row = self._conn.execute(
+            f"SELECT {', '.join(self._WH_DELIVERY_COLS)} "
+            "FROM webhook_deliveries WHERE delivery_id=?",
+            (delivery_id,),
+        ).fetchone()
+        return _wh_delivery_from_row(row) if row is not None else None
+
+    @_threadsafe
+    def list_webhook_deliveries(
+        self, *, subscription_id: str | None = None,
+        status: "DeliveryStatus | None" = None,
+        limit: int | None = None, after_sequence: int | None = None,
+    ) -> list["WebhookDelivery"]:
+        """Paginated delivery listing.
+
+        Deliberately resolves against `webhook_deliveries.subscription_id`
+        only: retained history remains queryable after the subscription row
+        is gone (ADR-059 D15.4, invariant 26).
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if subscription_id is not None:
+            clauses.append("subscription_id=?")
+            params.append(subscription_id)
+        if status is not None:
+            clauses.append("status=?")
+            params.append(status.value)
+        if after_sequence is not None:
+            clauses.append("sequence > ?")
+            params.append(int(after_sequence))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = (
+            f"SELECT {', '.join(self._WH_DELIVERY_COLS)} FROM webhook_deliveries "
+            f"{where} ORDER BY sequence"
+        )
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        rows = self._conn.execute(sql, params).fetchall()
+        return [_wh_delivery_from_row(r) for r in rows]
+
+    @_threadsafe
+    def manual_retry_webhook_delivery(
+        self, delivery_id: str, now: str | None = None,
+    ) -> bool:
+        """Admin-initiated retry: FAILED/DEAD_LETTER -> PENDING.
+
+        Permitted only while `now <= retry_eligible_until` (ADR-059 D11.3).
+        Resets `attempts` to zero (ADR-059 D10). Reuses the recorded
+        `secret_version` and the frozen `body_bytes` untouched.
+        """
+        from arion.notifications.models import DeliveryStatus
+
+        now = now or utcnow()
+        cur = self._conn.execute(
+            "UPDATE webhook_deliveries SET status=?, attempts=0, "
+            "next_attempt_at=?, updated_at=?, completed_at=NULL, "
+            "lease_owner=NULL, lease_expires_at=NULL "
+            "WHERE delivery_id=? AND status IN (?,?) "
+            "AND retry_eligible_until IS NOT NULL AND retry_eligible_until >= ?",
+            (DeliveryStatus.PENDING.value, now, now, delivery_id,
+             DeliveryStatus.FAILED.value, DeliveryStatus.DEAD_LETTER.value,
+             now),
+        )
+        self._conn.commit()
+        return cur.rowcount == 1
+
+    @_threadsafe
+    def prune_webhook_deliveries(
+        self, *, delivered_retention_days: float,
+        failed_retention_days: float, now: str | None = None,
+    ) -> int:
+        """Bounded, deterministic retention prune (ADR-059 D17).
+
+        Non-terminal rows are NEVER pruned. A terminal row is pruned only
+        when it is past BOTH its outcome retention window AND its
+        `retry_eligible_until` horizon (invariant 25) - the horizon check is
+        explicit rather than relying on the two windows coinciding.
+        """
+        from arion.notifications.models import DeliveryStatus, iso_plus_days
+
+        now = now or utcnow()
+        delivered_cutoff = iso_plus_days(now, -abs(float(delivered_retention_days)))
+        failed_cutoff = iso_plus_days(now, -abs(float(failed_retention_days)))
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            cur = self._conn.execute(
+                "DELETE FROM webhook_deliveries WHERE "
+                "((status=? AND completed_at IS NOT NULL AND completed_at<=?) "
+                " OR (status IN (?,?,?) AND completed_at IS NOT NULL "
+                "     AND completed_at<=?)) "
+                "AND (retry_eligible_until IS NULL OR retry_eligible_until < ?)",
+                (DeliveryStatus.DELIVERED.value, delivered_cutoff,
+                 DeliveryStatus.FAILED.value, DeliveryStatus.DEAD_LETTER.value,
+                 DeliveryStatus.CANCELLED.value, failed_cutoff, now),
+            )
+            self._conn.commit()
+            return cur.rowcount
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_threadsafe
+    def count_retry_capable_deliveries_for_secret(
+        self, subscription_id: str, version: int, now: str | None = None,
+    ) -> int:
+        """Reference count for ADR-059 D11.2 rule 7/8.
+
+        Counts retained deliveries referencing this secret version that
+        STILL have retry capability: non-terminal, or failed/dead_letter
+        within `retry_eligible_until`. Deliberately independent of
+        subscription liveness.
+        """
+        from arion.notifications.models import DeliveryStatus
+
+        now = now or utcnow()
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM webhook_deliveries "
+            "WHERE subscription_id=? AND secret_version=? AND ("
+            "  status IN (?,?) "
+            "  OR (status IN (?,?) AND retry_eligible_until IS NOT NULL "
+            "      AND retry_eligible_until >= ?))",
+            (subscription_id, int(version),
+             DeliveryStatus.PENDING.value, DeliveryStatus.DELIVERING.value,
+             DeliveryStatus.FAILED.value, DeliveryStatus.DEAD_LETTER.value,
+             now),
+        ).fetchone()
+        return int(row[0])
+
+    @_threadsafe
+    def retire_webhook_secret_versions(self, now: str | None = None) -> int:
+        """Destroy secret material for RETIRING versions that no retained
+        retry-capable delivery references (ADR-059 D11.2 rule 8/10).
+
+        Invariant 23: a secret version remains available for as long as any
+        retained delivery referencing it can still be manually retried. The
+        version RECORD is kept for audit; only the material is destroyed.
+        """
+        from arion.notifications.models import DeliveryStatus, SecretVersionStatus
+
+        now = now or utcnow()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            candidates = self._conn.execute(
+                "SELECT subscription_id, version FROM webhook_secret_versions "
+                "WHERE status=?", (SecretVersionStatus.RETIRING.value,),
+            ).fetchall()
+            retired = 0
+            for subscription_id, version in candidates:
+                referenced = self._conn.execute(
+                    "SELECT COUNT(*) FROM webhook_deliveries "
+                    "WHERE subscription_id=? AND secret_version=? AND ("
+                    "  status IN (?,?) "
+                    "  OR (status IN (?,?) AND retry_eligible_until IS NOT NULL "
+                    "      AND retry_eligible_until >= ?))",
+                    (subscription_id, int(version),
+                     DeliveryStatus.PENDING.value,
+                     DeliveryStatus.DELIVERING.value,
+                     DeliveryStatus.FAILED.value,
+                     DeliveryStatus.DEAD_LETTER.value, now),
+                ).fetchone()[0]
+                if int(referenced) > 0:
+                    continue
+                self._conn.execute(
+                    "UPDATE webhook_secret_versions SET secret=NULL, "
+                    "status=?, retired_at=? "
+                    "WHERE subscription_id=? AND version=? AND status=?",
+                    (SecretVersionStatus.RETIRED.value, now, subscription_id,
+                     int(version), SecretVersionStatus.RETIRING.value),
+                )
+                retired += 1
+            self._conn.commit()
+            return retired
+        except Exception:
+            self._conn.rollback()
+            raise
+
 
 _GOAL_COLS = ["id", "description", "source", "status", "version", "strategy", "blockers",
               "progress_metadata", "last_evaluated_at", "last_replan_reason", "created_at", "updated_at"]
@@ -4414,6 +5131,87 @@ def _approval_from_row(row: tuple[Any, ...]) -> "ApprovalRequest":
     except (TypeError, json.JSONDecodeError):
         d["fingerprint"] = {}
     return ApprovalRequest.from_dict(d)
+
+
+def _wh_sub_row(subscription: "WebhookSubscription") -> tuple[Any, ...]:
+    return (
+        subscription.subscription_id, subscription.url,
+        json.dumps(sorted(subscription.event_kinds)),
+        1 if subscription.enabled else 0, subscription.description,
+        subscription.created_by, int(subscription.active_secret_version),
+        subscription.created_at, subscription.updated_at,
+        subscription.deleted_at,
+    )
+
+
+def _wh_sub_from_row(row: tuple[Any, ...]) -> "WebhookSubscription":
+    from arion.notifications.models import WebhookSubscription
+
+    d = {c: v for c, v in zip(SQLiteStorage._WH_SUB_COLS, row)}
+    try:
+        d["event_kinds"] = json.loads(d["event_kinds"])
+    except (TypeError, json.JSONDecodeError):
+        d["event_kinds"] = []
+    d["enabled"] = bool(d["enabled"])
+    return WebhookSubscription.from_dict(d)
+
+
+def _wh_secret_from_row(row: tuple[Any, ...]) -> "WebhookSecretVersion":
+    from arion.notifications.models import (
+        SecretVersionStatus,
+        WebhookSecretVersion,
+    )
+
+    d = {c: v for c, v in zip(SQLiteStorage._WH_SECRET_COLS, row)}
+    return WebhookSecretVersion(
+        subscription_id=d["subscription_id"],
+        version=int(d["version"]),
+        secret=d["secret"],
+        status=SecretVersionStatus(d["status"]),
+        created_at=d["created_at"],
+        retiring_at=d["retiring_at"],
+        retired_at=d["retired_at"],
+    )
+
+
+def _wh_delivery_row(delivery: "WebhookDelivery") -> tuple[Any, ...]:
+    return (
+        delivery.delivery_id, delivery.subscription_id, delivery.event_id,
+        delivery.event_kind, delivery.occurred_at, int(delivery.sequence),
+        int(delivery.secret_version), delivery.body_bytes, delivery.url,
+        delivery.status.value, int(delivery.attempts),
+        delivery.next_attempt_at, delivery.lease_owner,
+        delivery.lease_expires_at, delivery.last_error,
+        delivery.retry_eligible_until, delivery.created_at,
+        delivery.updated_at, delivery.completed_at,
+    )
+
+
+def _wh_delivery_from_row(row: tuple[Any, ...]) -> "WebhookDelivery":
+    from arion.notifications.models import DeliveryStatus, WebhookDelivery
+
+    d = {c: v for c, v in zip(SQLiteStorage._WH_DELIVERY_COLS, row)}
+    return WebhookDelivery(
+        delivery_id=d["delivery_id"],
+        subscription_id=d["subscription_id"],
+        event_id=d["event_id"],
+        event_kind=d["event_kind"],
+        occurred_at=d["occurred_at"],
+        sequence=int(d["sequence"]),
+        secret_version=int(d["secret_version"]),
+        body_bytes=bytes(d["body_bytes"]),
+        url=d["url"],
+        status=DeliveryStatus(d["status"]),
+        attempts=int(d["attempts"]),
+        next_attempt_at=d["next_attempt_at"],
+        lease_owner=d["lease_owner"],
+        lease_expires_at=d["lease_expires_at"],
+        last_error=d["last_error"],
+        retry_eligible_until=d["retry_eligible_until"],
+        created_at=d["created_at"],
+        updated_at=d["updated_at"],
+        completed_at=d["completed_at"],
+    )
 
 
 def _recovery_row(recovery: "MutationRecovery") -> tuple[Any, ...]:
