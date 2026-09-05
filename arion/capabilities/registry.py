@@ -22,6 +22,36 @@ class CapabilityError(Exception):
     """Raised when a capability fails to execute its action."""
 
 
+@dataclass(frozen=True)
+class ResourceRole:
+    """One named resource slot of an action (ADR-061 D1).
+
+    `role` is BOTH the human-facing role name shown on the approval surface
+    ("source", "dest") AND the params key holding the value: an action may not
+    call a slot one thing and read another, because a second naming axis would
+    be a second source of truth (ADR-061 D1).
+    """
+
+    role: str
+    kind: str
+
+    @property
+    def param(self) -> str:
+        """The params key holding this role's resource identifier."""
+        return self.role
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"role": self.role, "kind": self.kind}
+
+
+class ResourceDeclarationError(ValueError):
+    """Raised when an ActionSpec declares an ambiguous resource declaration.
+
+    Fail closed at construction (ADR-061 D2): an ambiguous declaration is
+    never silently resolved by a precedence rule.
+    """
+
+
 @dataclass
 class ActionSpec:
     """Declarative metadata for one capability action (ADR-009).
@@ -38,6 +68,22 @@ class ActionSpec:
       kind ("filesystem:path", future "url", "queue:name", ...) and the params
       key that holds the resource identifier. The policy requires an explicit
       boundary per resource kind (fail closed, ADR-009).
+    - resources: ADR-061 D1 - the ORDERED resource-role declaration for actions
+      targeting more than one resource. This is the single authoritative
+      declaration; the role-preserving and canonical views are DERIVED from it
+      (neither derived view is independently authoritative).
+
+      `resource_kind`/`resource_param` remain supported as compatibility sugar
+      for the one-resource case and are normalized into a one-element
+      `resources` list at construction, so exactly ONE representation exists at
+      runtime (ADR-061 D9, invariant 21). Declaring BOTH spellings is a
+      construction-time error, never a precedence rule: a spec whose declared
+      lock target could differ from its declared approval target is the exact
+      divergence D1 exists to foreclose.
+
+      Reading `spec.resources` is always correct; `resource_kind`/
+      `resource_param` continue to reflect the PRIMARY (first-declared) role so
+      every existing single-resource reader keeps working unchanged.
     - param_schema: declared parameter contract {"name": {"type": "...",
       "required": bool}} used by the PlanValidator to reject missing, wrong-typed
       or arbitrary injected parameters from model-produced plans (ADR-011).
@@ -64,6 +110,74 @@ class ActionSpec:
     param_schema: dict[str, dict[str, Any]] | None = None
     default_verification: dict[str, Any] | None = None
     security_relevant_params: list[str] = field(default_factory=list)
+    resources: list[ResourceRole] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        """Normalize the two spellings into exactly one representation.
+
+        ADR-061 D1/D9 (invariants 1, 21). Fail closed on ambiguity (D2).
+        """
+        singular = self.resource_kind is not None or self.resource_param is not None
+
+        if singular and self.resources:
+            raise ResourceDeclarationError(
+                f"action {self.name!r} declares BOTH resource_kind/resource_param "
+                f"and resources; the two spellings are mutually exclusive "
+                f"(ADR-061 D9). Declare only 'resources'."
+            )
+
+        if singular:
+            # Compatibility sugar -> one-element declaration. Both halves are
+            # required: a half-declared resource is ambiguous, not a default.
+            if self.resource_kind is None or self.resource_param is None:
+                raise ResourceDeclarationError(
+                    f"action {self.name!r} declares an incomplete resource: "
+                    f"resource_kind={self.resource_kind!r}, "
+                    f"resource_param={self.resource_param!r}; both are required."
+                )
+            self.resources = [
+                ResourceRole(role=self.resource_param, kind=self.resource_kind)
+            ]
+
+        if not self.resources:
+            return
+
+        self._validate_resources()
+
+        # Mirror the PRIMARY role into the singular fields so every existing
+        # single-resource reader keeps working unchanged (invariant 16).
+        primary = self.resources[0]
+        self.resource_kind = primary.kind
+        self.resource_param = primary.param
+
+    def _validate_resources(self) -> None:
+        """Reject ambiguous role declarations at construction (ADR-061 D2)."""
+        seen: set[str] = set()
+        for r in self.resources:
+            if not isinstance(r, ResourceRole):
+                raise ResourceDeclarationError(
+                    f"action {self.name!r}: resources entries must be "
+                    f"ResourceRole, got {type(r).__name__}"
+                )
+            if not r.role or not r.kind:
+                raise ResourceDeclarationError(
+                    f"action {self.name!r}: resource role and kind must both "
+                    f"be non-empty (got role={r.role!r}, kind={r.kind!r})"
+                )
+            if r.role in seen:
+                raise ResourceDeclarationError(
+                    f"action {self.name!r}: duplicate resource role {r.role!r}"
+                )
+            seen.add(r.role)
+            # A role naming a param the action does not declare is ambiguous:
+            # it can never be resolved to a value at runtime.
+            if self.param_schema is not None and r.role not in self.param_schema:
+                raise ResourceDeclarationError(
+                    f"action {self.name!r}: resource role {r.role!r} names a "
+                    f"param absent from param_schema "
+                    f"({sorted(self.param_schema)})"
+                )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
@@ -80,6 +194,9 @@ class ActionSpec:
             "param_schema": self.param_schema,
             "default_verification": self.default_verification,
             "security_relevant_params": list(self.security_relevant_params),
+            # Additive (ADR-061 D9): existing readers ignore the new key, and
+            # the singular keys above still carry the primary role.
+            "resources": [r.to_dict() for r in self.resources],
         }
 
 
