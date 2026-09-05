@@ -4664,11 +4664,20 @@ class ArionEngine:
         No filesystem-specific logic here - any capability that declares
         resource_kind + resource_param gets its resource extracted the same
         way. A plan cannot redirect which param is read.
+
+        ADR-061 C2: this is now a THIN WRAPPER over the derived role view, so
+        single- and multi-resource actions share one derivation path. It
+        returns the PRIMARY (first-declared) role, which for a single-resource
+        action is exactly the historical value.
         """
+        from arion.orchestration.resource_set import (
+            primary_resource,
+            resolve_resources,
+        )
+
         if not spec.resource_kind or not spec.resource_param:
             return None
-        p = params.get(spec.resource_param)
-        return p if isinstance(p, str) else None
+        return primary_resource(resolve_resources(spec, params))
 
     # ---------- execution & verification ----------
 
