@@ -43,6 +43,10 @@ from arion.orchestration.authz import (
     ResourcePolicy,
 )
 from arion.orchestration.engine import ArionEngine
+from arion.notifications.config import load_webhook_config
+from arion.notifications.outbox import WebhookOutboxSink
+from arion.notifications.transport import StdlibWebhookTransport
+from arion.notifications.worker import WebhookDeliveryWorker
 from arion.runtime.lifecycle import ResourceLifecycle
 from arion.state.store import SQLiteStorage
 
@@ -177,6 +181,32 @@ def build_engine(
                 progress_evaluator=DeterministicProgressEvaluator(),
                 world_monitor=world_monitor,
             )
+
+        # Durable webhook notifications (ADR-059, M6-B). Disabled by default:
+        # with ARION_WEBHOOK_ENABLED unset this constructs nothing, registers
+        # no sink and starts no thread, so the default runtime is unchanged.
+        #
+        # The outbox sink is added with required=False deliberately (ADR-059
+        # D1/D2): notification is strictly downstream of orchestration and
+        # must never be able to fail a task. Capture is best-effort; once a
+        # row is committed, delivery is at-least-once.
+        #
+        # The worker is started HERE, after storage exists, rather than by
+        # adding a start hook to ResourceLifecycle - ADR-059 D3 keeps
+        # ResourceLifecycle unmodified, so it remains a pure
+        # register/health/shutdown contract.
+        webhook_config = load_webhook_config()
+        if webhook_config.enabled:
+            events.add_sink(
+                WebhookOutboxSink(storage, webhook_config), required=False
+            )
+            webhook_worker = lifecycle.register(
+                "notifications.webhook_worker",
+                WebhookDeliveryWorker(
+                    storage, webhook_config, StdlibWebhookTransport()
+                ),
+            )
+            webhook_worker.start()
 
         return ArionEngine(
             storage=storage,
