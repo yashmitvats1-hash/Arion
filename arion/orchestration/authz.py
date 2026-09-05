@@ -326,8 +326,46 @@ class ResourcePolicy:
         return PolicyDecision(PolicyOutcome.ALLOW, "allowed", **base)
 
     def _resource_allowed(self, request: AuthorizationRequest) -> tuple[bool, str | None]:
-        """Fail-closed resource check, keyed by resource kind (no filesystem I/O)."""
-        kind = request.resource_kind
+        """Fail-closed resource check, keyed by resource kind (no filesystem I/O).
+
+        ADR-061 C4 (D3, invariants 5 and 6): EVERY declared resource is checked
+        against the boundary for ITS OWN kind, not merely the primary one.
+
+        Before C4 only `request.resource` was validated, so a two-resource
+        action's destination was never boundary-checked and an absolute or
+        traversing `dest` was ALLOWED by policy. The capability's own sandbox
+        check would still have refused it, but that inverts ADR-009: the policy
+        must never BLESS an out-of-boundary resource, with the capability as
+        defence-in-depth rather than the primary control.
+
+        Denies on the FIRST failure, naming the failing ROLE so a diagnostic
+        distinguishes "source is outside" from "dest is outside".
+        """
+        # Single-resource path, byte-identical to pre-C4 behaviour. An action
+        # with no declared resource set falls through here unchanged.
+        if not request.resources:
+            return self._one_resource_allowed(
+                request, request.resource_kind, request.resource, role=None,
+            )
+
+        for r in request.resources:
+            ok, reason = self._one_resource_allowed(
+                request, r.kind, r.value, role=r.role,
+            )
+            if not ok:
+                return False, reason
+        return True, None
+
+    def _one_resource_allowed(
+        self,
+        request: AuthorizationRequest,
+        kind: str | None,
+        resource: str | None,
+        role: str | None,
+    ) -> tuple[bool, str | None]:
+        """Boundary-check exactly one resource. Fail closed at every branch."""
+        at = f" for role {role!r}" if role else ""
+
         if kind is None:
             # Action has no resource: nothing to constrain, never denied on resource grounds.
             return True, None
@@ -337,11 +375,15 @@ class ResourcePolicy:
             # Resource-sensitive action with NO configured boundary: fail closed.
             return False, f"no resource boundary configured for resource kind {kind!r} (fail closed)"
 
-        resource = request.resource
+        # An unresolved role (missing/non-string param) must REFUSE, never be
+        # treated as "nothing to check" (ADR-061 C2 hand-off note).
         if not isinstance(resource, str) or not resource:
-            return False, f"resource-sensitive action {request.capability}/{request.action} missing resource"
+            return False, (
+                f"resource-sensitive action {request.capability}/{request.action} "
+                f"missing resource{at}"
+            )
 
         if not boundary.allows(resource):
-            return False, f"resource {resource!r} outside boundary for kind {kind!r}"
+            return False, f"resource {resource!r} outside boundary for kind {kind!r}{at}"
 
         return True, None
