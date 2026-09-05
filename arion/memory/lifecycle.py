@@ -100,9 +100,24 @@ def build_episode_from_task(
                         "resource_redacted": presentation.redacted,
                         "status": s.status.value,
                     })
+    # ADR-060 D9: record WHY a step is believed to have succeeded, not merely
+    # that it did. `unverifiable` names the case the audit found most
+    # dangerous - a capability returned successfully and nothing established
+    # that the intended outcome occurred - so that "executed" can never again
+    # be silently equated with "achieved".
     verification = {
         "passed": [s.index for s in task.steps if s.status == StepStatus.SUCCEEDED],
         "failed": [s.index for s in task.steps if s.status == StepStatus.FAILED],
+        "policies": {
+            str(s.index): (s.verification.policy if s.verification else None)
+            for s in task.steps
+        },
+        "unverifiable": [
+            s.index
+            for s in task.steps
+            if s.status == StepStatus.SUCCEEDED
+            and (s.verification is None or not s.verification.policy)
+        ],
     }
 
     failures: list[dict[str, Any]] = []

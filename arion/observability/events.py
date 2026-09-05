@@ -100,6 +100,10 @@ EVENT_KINDS = (
     "mutation.lock.released",
     "verification.passed",
     "verification.failed",
+    # ADR-060 (M7-A): registry-authoritative verification normalization and
+    # the fail-closed refusal of a mutation with no usable policy.
+    "verification.normalized",
+    "verification.refused",
     "step.retrying",
     "task.recovered",
     "checkpoint.persisted",

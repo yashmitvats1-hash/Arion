@@ -109,6 +109,14 @@ class PlanStep:
     depends_on: list[int] = field(default_factory=list)  # indices of prerequisite steps
     guidance: list[dict[str, Any]] = field(default_factory=list)  # memory-driven transformation provenance (informational)
     skipped_reason: str | None = None  # why this step was deliberately skipped (guidance)
+    # ADR-060 D5: True when this step was rehydrated from a stored plan that
+    # carried NO verification at all, as opposed to one that explicitly asked
+    # for `non_empty`. The two are indistinguishable once the historical
+    # default has been applied, but they must NOT be treated alike for a
+    # MUTATING action: an absent policy fails closed, an explicit known policy
+    # is honoured. Deliberately NOT serialized by `to_dict` - it is a property
+    # of one rehydration, not of the plan, so no schema change is implied.
+    verification_absent: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         d = {
@@ -143,7 +151,13 @@ class PlanStep:
             action=d["action"],
             scope=d.get("scope", ""),
             params=d.get("params", {}) or {},
+            # The historical `non_empty` fallback is retained for READ-ONLY
+            # rehydration (ADR-060 §3 established no Arion-written plan
+            # actually omits verification, so it is defensive). Whether it was
+            # absent is recorded so a MUTATING step can fail closed instead of
+            # silently inheriting shape-only verification.
             verification=VerificationPolicy(policy=v.get("policy", "non_empty"), args=v.get("args", {}) or {}),
+            verification_absent=not isinstance(v.get("policy"), str) or not v.get("policy"),
             status=StepStatus(d.get("status", StepStatus.PENDING.value)),
             attempts=d.get("attempts", 0),
             max_attempts=d.get("max_attempts", 2),

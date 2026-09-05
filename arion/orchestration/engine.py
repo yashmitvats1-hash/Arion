@@ -30,7 +30,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from arion.capabilities.observations import normalize_observation
-from arion.capabilities.registry import CapabilityError, CapabilityRegistry
+from arion.capabilities.registry import (
+    CapabilityError,
+    CapabilityRegistry,
+    VerificationResolutionError,
+    is_mutating,
+    resolve_verification_policy,
+)
 from arion.cognition.goals import GoalPlanLineageError
 from arion.state.approvals import ApprovalError, ApprovalRequest, ApprovalStatus, ApprovalStore
 from arion.state.locks import GOAL_RUN_RESOURCE_KIND
@@ -81,6 +87,7 @@ from arion.state.models import (
     GoalStatus,
     PlanStep,
     StepStatus,
+    VerificationPolicy,
     TASK_TERMINAL_STATUSES,
     Task,
     TaskStateError,
@@ -4321,6 +4328,20 @@ class ArionEngine:
             step.error = f"unknown action {step.action!r} for capability {step.capability!r}"
             self._emit("error", task_id=task.id, step_id=_step_id(step), success=False, detail={"error": step.error})
             return
+
+        # 1b. AUTHORITATIVE verification normalization (ADR-060 D4/D5).
+        #
+        # This is the single point every plan traverses regardless of origin -
+        # DeterministicPlanner (which never touches PlanValidator), the model
+        # planner, and stored-plan rehydration alike. PlanValidator performs
+        # the same normalization earlier for model plans, but is SECONDARY:
+        # correctness must not depend on it.
+        #
+        # Runs BEFORE authorization, execution and _verify, so the verifier
+        # never has to infer which policy was intended.
+        if not self._normalize_step_verification(task, step, spec):
+            return
+
         self._emit(
             "capability.discovered",
             task_id=task.id,
@@ -4924,6 +4945,76 @@ class ArionEngine:
             # an explicit recovery transition. This is a gate, NOT an
             # authorization - every new mutation still needs its own approval.
             self._record_recovery_required(task, step, spec, step.error)
+
+    def _normalize_step_verification(
+        self, task: Task, step: PlanStep, spec
+    ) -> bool:
+        """Apply the registry-authoritative verification policy (ADR-060 D4/D5).
+
+        Returns True to continue execution, False if the step was refused.
+
+        The step's executable `verification` becomes the authoritative
+        normalized value, but what the planner ORIGINALLY requested is never
+        erased: when the applied policy differs from the requested one, a
+        provenance entry is appended to `step.guidance` - the existing,
+        already-persisted mechanism that answers "why does the executed plan
+        differ from the proposed plan?" (no new provenance subsystem).
+        """
+        requested_policy = step.verification.policy if step.verification else None
+        requested_args = dict(step.verification.args or {}) if step.verification else {}
+        # A step rehydrated from a plan that carried NO verification must be
+        # resolved as "missing", not as an explicit request for the historical
+        # default that `from_dict` substituted (ADR-060 D5).
+        requested = None if getattr(step, "verification_absent", False) else step.verification
+        try:
+            policy, args, authority = resolve_verification_policy(spec, requested)
+        except VerificationResolutionError as exc:
+            # A mutating action with no usable verification policy is refused
+            # BEFORE authorization and execution - the mutation never happens.
+            step.status = StepStatus.FAILED
+            step.error = sanitize_error_text(str(exc), max_length=500)
+            self._emit(
+                "verification.refused",
+                task_id=task.id,
+                step_id=_step_id(step),
+                success=False,
+                detail={
+                    "capability": step.capability,
+                    "action": step.action,
+                    "requested_policy": requested_policy,
+                    "reason": "no usable verification policy for a mutating action",
+                },
+            )
+            self._emit(
+                "error",
+                task_id=task.id,
+                step_id=_step_id(step),
+                success=False,
+                detail={"error": step.error},
+            )
+            return False
+
+        if policy == requested_policy and args == requested_args:
+            return True
+
+        step.verification = VerificationPolicy(policy=policy, args=args)
+        provenance = {
+            "kind": "verification_normalized",
+            "capability": step.capability,
+            "action": step.action,
+            "requested": requested_policy,
+            "applied": policy,
+            "authority": authority,
+            "mutating": is_mutating(spec),
+        }
+        step.guidance.append(provenance)
+        self._emit(
+            "verification.normalized",
+            task_id=task.id,
+            step_id=_step_id(step),
+            detail=provenance,
+        )
+        return True
 
     def _verify(self, task: Task, step: PlanStep) -> bool:
         policy = step.verification.policy
