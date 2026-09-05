@@ -206,17 +206,103 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+#: Body is consumed in bounded slices so the remaining attempt budget can be
+#: re-applied before every blocking read. Small enough that a slow-drip
+#: sender cannot buy meaningful extra time per syscall; large enough that a
+#: normal 8 KiB response completes in a couple of reads.
+_READ_CHUNK_BYTES = 4096
+
+
+def _socket_of(response: object) -> socket.socket | None:
+    """Best-effort access to the socket underlying an HTTP response.
+
+    Used only to re-arm the per-operation timeout with the REMAINING attempt
+    budget. CPython exposes this as `response.fp.raw._sock`; the lookup is
+    defensive because it is an implementation detail, and the caller stays
+    correct (deadline still enforced between reads) if it returns None.
+    """
+    fp = getattr(response, "fp", None)
+    raw = getattr(fp, "raw", None)
+    sock = getattr(raw, "_sock", None)
+    if isinstance(sock, socket.socket):
+        return sock
+    sock = getattr(fp, "_sock", None)
+    if isinstance(sock, socket.socket):
+        return sock
+    return None
+
+
+def _read_bounded(response: object, max_bytes: int, remaining) -> bytes:
+    """Read at most `max_bytes` under the caller's whole-attempt deadline.
+
+    ADR-059 D12.2. Two things happen before EVERY blocking read:
+
+      1. `remaining()` is evaluated, which raises once the deadline passes -
+         so the body phase can never silently reset the attempt budget; and
+      2. the socket timeout is re-armed to exactly that remaining budget, so
+         a sender that stops mid-body cannot block past the deadline.
+
+    Without (2) a slow-drip sender defeats the bound: each individual chunk
+    arrives inside the per-operation timeout, so no single read ever times
+    out while the attempt runs arbitrarily long. That was the P1 defect.
+    """
+    limit = max(0, int(max_bytes))
+    if limit == 0:
+        return b""
+
+    sock = _socket_of(response)
+    chunks: list[bytes] = []
+    total = 0
+    while total < limit:
+        budget = remaining()
+        if sock is not None:
+            try:
+                sock.settimeout(budget)
+            except OSError:
+                pass
+        want = min(_READ_CHUNK_BYTES, limit - total)
+        try:
+            # read1() returns as soon as SOME data is available rather than
+            # blocking for a full chunk, which keeps the deadline check
+            # tight; read() would block until `want` bytes or EOF.
+            piece = response.read1(want)  # type: ignore[attr-defined]
+        except AttributeError:
+            piece = response.read(want)  # type: ignore[attr-defined]
+        if not piece:
+            break
+        chunks.append(piece)
+        total += len(piece)
+    return b"".join(chunks)
+
+
 class StdlibWebhookTransport:
     """urllib-based POST transport with a monotonic whole-attempt deadline.
 
     ADR-059 D12.2 [FACT]: the stdlib socket timeout is PER BLOCKING
-    OPERATION, not per request. A whole-attempt bound is therefore
-    approximated by computing a monotonic deadline once and passing the
-    REMAINING budget to each successive blocking phase. The residual overrun
-    is bounded by the return latency of a single in-flight operation, which
-    is why the lease floor adds a fixed margin over the timeout
-    (config.LEASE_TIMEOUT_MARGIN_SECONDS). This is documented rather than
-    overclaimed.
+    OPERATION, not per request. A whole-attempt bound is therefore built by
+    computing a monotonic deadline ONCE and re-deriving the REMAINING budget
+    before every blocking phase of the attempt:
+
+      1. DNS/address validation  - charged against the budget after it runs
+      2. TCP connect             - opener.open(timeout=remaining())
+      3. TLS negotiation         - same socket timeout as connect
+      4. request transmission    - same socket timeout as connect
+      5. response acquisition    - same socket timeout as connect
+      6. response-body reads     - re-armed per slice in `_read_bounded`
+
+    Step 6 is the one that matters most and the one originally missing: a
+    body read that inherits a per-operation timeout lets a slow-drip sender
+    run an attempt arbitrarily long, because every individual chunk arrives
+    inside the per-operation limit. Re-arming the socket with the remaining
+    budget before each bounded slice removes that.
+
+    [FACT] Residual overrun is bounded by the return latency of the single
+    in-flight syscall at the moment the deadline passes - Python cannot
+    interrupt a blocking read already in progress. The bound is therefore
+    "deadline plus at most one syscall's return latency", not a hard
+    real-time guarantee, which is why the lease floor keeps a fixed margin
+    over the timeout (config.LEASE_TIMEOUT_MARGIN_SECONDS). This is
+    documented rather than overclaimed.
     """
 
     def __init__(self, *, screen_addresses: bool = True) -> None:
@@ -242,6 +328,13 @@ class StdlibWebhookTransport:
         if self._screen:
             host = urlsplit(url).hostname or ""
             screen_destination(host)
+            # DNS/address validation (D12.2 step 1) is inside the attempt, so
+            # the time it consumed is charged against the budget before the
+            # connection is opened. [FACT] socket.getaddrinfo() itself takes
+            # no timeout argument and is bounded only by the OS resolver;
+            # charging it here is what keeps a slow resolver from granting a
+            # full fresh timeout to the connect/transmit phases.
+            remaining()
 
         request = urllib.request.Request(url, data=body, method="POST")
         for name, value in headers.items():
@@ -250,15 +343,24 @@ class StdlibWebhookTransport:
         try:
             with self._opener.open(request, timeout=remaining()) as response:
                 status = int(getattr(response, "status", 0) or 0)
-                raw = response.read(max(0, int(max_response_bytes)))
+                # Body consumption is inside the same deadline (D12.2 step 6).
+                raw = _read_bounded(response, max_response_bytes, remaining)
         except urllib.error.HTTPError as exc:
             # A non-2xx status is a real, classifiable outcome, not a
             # transport failure: hand it back so retry classification can
-            # distinguish 4xx from 5xx.
+            # distinguish 4xx from 5xx. The error body is still read under
+            # the deadline - an error response can drip just like a 200.
             try:
-                raw = exc.read(max(0, int(max_response_bytes)))
+                raw = _read_bounded(exc, max_response_bytes, remaining)
+            except WebhookTransportError:
+                raw = b""
             except Exception:
                 raw = b""
+            finally:
+                try:
+                    exc.close()
+                except Exception:
+                    pass
             return WebhookResponse(int(exc.code), _snippet(raw))
         except urllib.error.URLError as exc:
             reason = getattr(exc, "reason", exc)
@@ -267,6 +369,11 @@ class StdlibWebhookTransport:
             ) from exc
         except TimeoutError as exc:
             raise WebhookTransportError("attempt timed out", retryable=True) from exc
+        except WebhookTransportError:
+            # Deadline breach detected inside the body read: already the
+            # right error with the right classification, so propagate it
+            # rather than re-wrapping it as a generic transport error.
+            raise
         except Exception as exc:  # pragma: no cover - defensive
             raise WebhookTransportError(
                 f"transport error: {sanitize_error_text(str(exc))}", retryable=True

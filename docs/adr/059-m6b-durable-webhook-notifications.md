@@ -182,6 +182,9 @@ One `AuthContext`/`Privilege` abstraction, privilege declared per route, a
 single enforcement point, 401 distinct from 403, admin ⊃ approver, dual
 membership is a configuration error, empty admin map fails closed.
 
+**D13.1** — If the admin authorization mapping is absent, administrative
+webhook operations fail closed.
+
 ### D14 — Configuration
 
 Environment-only, disabled by default. Defaults: timeout 10 s, max response
