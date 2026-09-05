@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
 
+from arion.orchestration.resource_set import ResolvedResource
+
 # ---------------------------------------------------------------------------
 # Identity abstraction
 # ---------------------------------------------------------------------------
@@ -109,6 +111,15 @@ class AuthorizationRequest:
     side_effects: str = "read_only"    # none | read_only | mutating | irreversible (from metadata)
     idempotent: bool = True
     retry_safe: bool = True
+    # ADR-061 D1 (C3): the complete ORDERED role-preserving resource view,
+    # derived from ActionSpec.resources. `resource`/`resource_kind` above stay
+    # populated with the PRIMARY (first-declared) role so every existing
+    # single-resource reader keeps working unchanged (invariant 16).
+    #
+    # C3 CARRIES the set; it does not yet enforce it. Boundary checking over
+    # the complete set is C4. Consumers MUST NOT treat an incomplete set as an
+    # empty/safe set - see `unresolved_roles` (ADR-061 invariants 5, 6).
+    resources: list[ResolvedResource] = field(default_factory=list)
 
     @property
     def agent(self) -> str:

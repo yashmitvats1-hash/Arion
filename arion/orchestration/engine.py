@@ -1362,7 +1362,16 @@ class ArionEngine:
     def _build_authz_request(self, task: Task, step: PlanStep, spec) -> "AuthorizationRequest":
         """Build the authorization request from the LIVE ActionSpec (never
         from the plan's claims) - shared by the execution path and the
-        post-wait revalidation."""
+        post-wait revalidation.
+
+        ADR-061 C3: carries the complete ORDERED resource view alongside the
+        singular primary-role fields. Both come from the SAME derivation
+        (resolve_resources), so the set and the singular fields can never
+        disagree (D1).
+        """
+        from arion.orchestration.resource_set import resolve_resources
+
+        resolved = resolve_resources(spec, step.params)
         return AuthorizationRequest(
             actor=self.actor,
             task_id=task.id,
@@ -1377,6 +1386,7 @@ class ArionEngine:
             side_effects=spec.side_effects,
             idempotent=spec.idempotent,
             retry_safe=spec.retry_safe,
+            resources=resolved,
         )
 
     def _release_mutation_lock(self, lock, task: Task, step: PlanStep) -> None:
@@ -4564,6 +4574,25 @@ class ArionEngine:
 
     # ---------- approval records (durable, restart-safe) ----------
 
+    @staticmethod
+    def _resources_metadata(request: "AuthorizationRequest") -> list[dict[str, Any]]:
+        """Bounded, role-preserving durable projection of the resource view.
+
+        ADR-061 C3. Ordered exactly as declared, one entry per role including
+        duplicate values (invariant 4). Every value passes through
+        present_resource (invariant 7) and is the AS-DECLARED string, never
+        the canonical form (invariant 20).
+        """
+        out: list[dict[str, Any]] = []
+        for r in request.resources:
+            presentation = present_resource(r.kind, r.value)
+            out.append({
+                "role": r.role,
+                "resource_kind": r.kind,
+                **presentation.metadata(),
+            })
+        return out
+
     def _append_approval_record(self, task: Task, step: PlanStep, request: AuthorizationRequest,
                                 decision: PolicyDecision, outcome: str, actor: str) -> None:
         """Append a bounded approval record to the task (persisted via the
@@ -4590,6 +4619,12 @@ class ArionEngine:
                 "resource_kind": request.resource_kind,
                 **presentation.metadata(),
                 "params_keys": sorted(request.params.keys()),
+                # ADR-061 C3 (R-A): the durable projection of the complete
+                # ORDERED resource view. Additive - the singular keys above
+                # still carry the primary role. Every value goes through
+                # present_resource (invariant 7); role ORDER and role IDENTITY
+                # must survive rehydration, not merely the entry count.
+                "resources": self._resources_metadata(request),
             },
             "fingerprint": self._authz_fingerprint(request),
         }]
