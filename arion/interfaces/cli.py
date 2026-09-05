@@ -1722,13 +1722,11 @@ def _memory_command(args, engine) -> int:
     return 1
 
 
-if __name__ == "__main__":
-    sys.exit(main())
-
 def _api_command(args, engine) -> int:
     import threading
     from http.server import ThreadingHTTPServer
-    from arion.interfaces.approval_api import ApprovalAPIHandler, load_api_tokens, APIConfigError
+    from arion.interfaces.approval_api import ApprovalAPIHandler, load_api_tokens
+    from arion.interfaces.api_authz import APIConfigError
 
     try:
         tokens = load_api_tokens()
@@ -1759,6 +1757,10 @@ def _api_command(args, engine) -> int:
 
     Handler.engine = engine
     Handler.tokens = tokens
+    # M6-A.1: the approval surface authenticates through the SAME registry as
+    # the webhook surface. `tokens` is retained only for compatibility with
+    # embedders that read it; `registry` takes precedence.
+    Handler.registry = registry
     Handler.webhook_api = WebhookAPI(engine.storage, webhook_config, registry)
     if webhook_config.enabled and not registry.has_admin_credentials:
         print(
@@ -1776,3 +1778,7 @@ def _api_command(args, engine) -> int:
         server.shutdown()
         server.server_close()
     return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
