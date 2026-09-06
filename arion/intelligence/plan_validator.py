@@ -28,10 +28,16 @@ from __future__ import annotations
 
 from typing import Any
 
-from arion.capabilities.registry import ActionSpec, CapabilityRegistry
+from arion.capabilities.registry import (
+    ActionSpec,
+    CapabilityRegistry,
+    VerificationResolutionError,
+    is_mutating,
+    resolve_verification_policy,
+)
 from arion.intelligence.errors import PlanCapabilityValidationError
 from arion.intelligence.plan_schema import PlanSchema, PlanValidationError, StructuredStep
-from arion.state.models import PlanStep
+from arion.state.models import PlanStep, VerificationPolicy
 
 
 def _type_ok(expected: str, value: Any) -> bool:
@@ -119,6 +125,11 @@ class PlanValidator:
                 )
             self._validate_params(i, spec, s.params)
             self._validate_resource(i, spec, s.params)
+            # ADR-060 D4: registry-authoritative verification, applied here as
+            # a SECONDARY early pass for model plans. The engine repeats this
+            # in `_execute_step` and is the authority - DeterministicPlanner
+            # and stored-plan rehydration never reach this code.
+            verification, guidance = self._normalize_verification(i, spec, s.verification)
             steps.append(
                 PlanStep(
                     index=i,
@@ -127,13 +138,51 @@ class PlanValidator:
                     action=s.action,
                     scope=spec.required_scope,  # registry authority, not the model
                     params=dict(s.params),
-                    verification=s.verification,
+                    verification=verification,
                     depends_on=list(s.depends_on),
+                    guidance=guidance,
                 )
             )
         return topo_sort_steps(steps)
 
     # ---------- internals ----------
+
+    def _normalize_verification(
+        self, step_index: int, spec: ActionSpec, requested
+    ) -> tuple[VerificationPolicy, list[dict[str, Any]]]:
+        """Registry-authoritative verification for a model-proposed step.
+
+        ADR-060 D4: a model does not control - and must not be responsible
+        for - the reliability invariant of a mutation, exactly as it does not
+        control `scope`. A weaker proposed policy is deterministically
+        UPGRADED rather than rejected, and the original request is preserved
+        as provenance so "the model asked for X, why did Arion run Y?" stays
+        answerable.
+
+        A mutating action with no usable policy is rejected here (fail
+        closed); the engine independently reaches the same conclusion.
+        """
+        requested_policy = getattr(requested, "policy", None)
+        requested_args = dict(getattr(requested, "args", {}) or {})
+        try:
+            policy, args, authority = resolve_verification_policy(spec, requested)
+        except VerificationResolutionError as exc:
+            raise PlanCapabilityValidationError(f"step {step_index}: {exc}") from None
+
+        if policy == requested_policy and args == requested_args:
+            return VerificationPolicy(policy=policy, args=args), []
+        return (
+            VerificationPolicy(policy=policy, args=args),
+            [{
+                "kind": "verification_normalized",
+                "capability": spec.name,
+                "action": spec.name,
+                "requested": requested_policy,
+                "applied": policy,
+                "authority": authority,
+                "mutating": is_mutating(spec),
+            }],
+        )
 
     def _validate_params(self, step_index: int, spec: ActionSpec, params: dict[str, Any]) -> None:
         """Parameters must match the action's declared param_schema."""
