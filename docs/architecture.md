@@ -65,6 +65,13 @@ Every step is decided by a permission policy over
   resource kind (extensible — future `url`, `queue:name`, ...) and enforced as
   pure string checks; the capability still enforces its own containment
   (sandbox root, symlinks). The two are independent layers.
+- **Multi-resource declaration (M8 / ADR-061):** `ActionSpec` carries an
+  ordered `resources` list (role-preserving view, duplicates retained) together
+  with singular compatibility fields (`resource_kind`/`resource_param`) that
+  mirror the primary role. Two derived views — role view and canonical view — are
+  produced from one authoritative declaration. Boundary checking applies to
+  EVERY declared resource, not only the primary (M8 C4); unresolved roles must
+  refuse, never be treated as empty (ADR-061 invariants 5, 6).
 - **Identity:** requests carry an `Actor` with a delegation chain
   (`user → agent → delegated agent`); policies can match the direct actor or
   any ancestor. Audit events record `actor` + `actor_chain`.

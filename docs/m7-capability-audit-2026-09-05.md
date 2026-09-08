@@ -1,7 +1,14 @@
 # M7 Capability Audit — 2026-09-05
 
 - **Status:** Working document (uncommitted). Not an ADR. No decision taken.
+- **Post-M8 update (2026-09-06):** M8 C4 (`bf4ea05`) closes the security gap
+  identified in this audit (resource boundary only checked primary role).
+  Full-suite baseline at `64a7332`: 1953 passed / 2 skipped / 0 failed.
+  The behavioural-reach findings (7 actions / 78 CLI commands) remain
+  historically accurate; this audit is superseded for authorization/security
+  claims by ADR-061 and the M8 C1–C4 documentation.
 - **Baseline:** `6d8e477` (M6-A.1), one commit ahead of `main` @ `898127b`
+- **Current baseline (post-M8 merge):** `64a7332` (PR #13, 2026-09-06)
 - **Method:** read-only inspection plus *live execution* of the real CLI. Every
   behavioural claim below was produced by running Arion, not by reading it.
 - **Framing:** behavioural reach, not LOC. A subsystem that is beautifully
