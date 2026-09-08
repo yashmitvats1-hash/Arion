@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from arion.capabilities.append import FilesystemAppendCapability
+from arion.capabilities.search import FilesystemSearchCapability
 from arion.capabilities.filesystem import FilesystemReadCapability
 from arion.capabilities.write import FilesystemWriteCapability
 from arion.capabilities.git import GitLogCapability
@@ -77,6 +78,7 @@ def build_engine(
         # operator authorization. Fail closed.
         registry.register(FilesystemWriteCapability(sandbox_root))
         registry.register(FilesystemAppendCapability(sandbox_root))
+        registry.register(FilesystemSearchCapability(sandbox_root))
         registry.register(GitLogCapability(sandbox_root))
         # http.get is DISCOVERABLE by default but DENIED until an operator configures
         # a 'url' resource boundary (fail closed): no allowlist = no network access.
