@@ -87,6 +87,23 @@ Every step is decided by a permission policy over
 - Action metadata: `required_scope`, `risk`, `side_effects`, `reversible`,
   `idempotent`, `retry_safe` — the substrate for safe side-effecting
   capabilities later.
+- **One classification of "changes the world" (M9-B.3 P0).** Whether an action
+  is a mutation is decided by exactly one predicate,
+  `capabilities.registry.is_mutating(spec)` — true for `side_effects` in
+  `{"mutating", "irreversible"}`. Every engine path that gates coordination
+  defers to it: recovery mirroring, same-resource dispatch gating (both the
+  round-building loop and `_step_dispatchable`), and the execution path that
+  acquires the mutation lock. The engine previously compared
+  `side_effects == "mutating"` **literally** at those four sites while
+  `is_mutating()` also counted `irreversible`, so an `irreversible` action could
+  run with **zero mutation locks** — skipping the durable lock (ADR-021),
+  bounded waiting (ADR-022), the FIFO queue (ADR-023), dispatch gating
+  (ADR-024/025) and recovery mirroring (ADR-020) — even though ADR-060 D5 still
+  demanded a verification policy for it. Two authorities, one word, different
+  meanings. A source-level test now fails on *any* literal `side_effects`
+  comparison against a taxonomy value in `engine.py`, so a future
+  `== "irreversible"` special case is caught too. No shipped action declares
+  `irreversible` yet; `filesystem.move` (M9-B.3) is expected to.
 
 ## Vertical slice (implemented)
 

@@ -382,11 +382,29 @@ the point at which this should be revisited.
 Recorded here because the M9-B.2 investigation measured them; none is in scope
 for this ADR. See `docs/m9b.2-architecture-proposal.md` §3–§4 for the evidence.
 
-- **P0 — two definitions of "mutating".** `registry.is_mutating()` counts
-  `irreversible`; `engine.py` compares `== "mutating"` literally at lines 365,
-  3039, 3422 and 4725. An `irreversible` action therefore ran end-to-end with
-  **zero mutation locks** (measured). Must be collapsed onto `is_mutating()`
-  before any capability declares `irreversible`.
+- **P0 — two definitions of "mutating". ✅ LANDED (M9-B.3 P0, this branch).**
+  `registry.is_mutating()` counts `irreversible`; `engine.py` compared
+  `== "mutating"` literally at lines 365, 3039, 3422 and 4725. An `irreversible`
+  action therefore ran end-to-end with **zero mutation locks** (measured),
+  skipping the durable lock (ADR-021), bounded waiting (ADR-022), the FIFO waiter
+  queue (ADR-023), same-resource dispatch gating (ADR-024/025), post-wait
+  re-authorization and recovery mirroring (ADR-020) — while ADR-060 D5 *still*
+  refused to let it run without a verification policy.
+
+  All four sites now defer to `registry.is_mutating()`, so exactly one predicate
+  classifies "changes the world". Behaviour is unchanged for the entire current
+  vocabulary (every shipped action declares `read_only` or `mutating`, where the
+  two definitions already agreed); the change is reachable only by an action
+  declaring `irreversible`, which is what `filesystem.move` will do.
+
+  Pinned by `tests/test_irreversible_mutation_locking.py` (13 tests), verified to
+  fail 8/13 with the fix reverted — including a contention case showing the
+  baseline let an `irreversible` mutation **run while another owner held the lock
+  on that exact resource**, and a source-level gate that fails on *any* literal
+  `side_effects` comparison against a taxonomy value (so a future
+  `== "irreversible"` special case is caught too). Negative controls confirm the
+  fix does not widen: `none`/`read_only` still take no lock and create no
+  recovery record.
 - **ADR-061 invariant 13 is unenforced.** `canonical_identities()` and
   `unresolved_roles()` have **no production consumers**; the lock layer M8
   deferred as "C7" does not exist. `_lock_canonical` locks the primary role

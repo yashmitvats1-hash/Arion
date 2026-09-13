@@ -114,11 +114,16 @@ All 8 pre-existing `tests/test_search.py` tests pass **unmodified**.
 Recorded in ADR-062's follow-ups with measured evidence in
 `docs/m9b.2-architecture-proposal.md` §3–§4:
 
-- **P0 — two definitions of "mutating".** `registry.is_mutating()` counts
-  `irreversible`; `engine.py` compares `== "mutating"` literally at lines 365,
-  3039, 3422, 4725. An `irreversible` action ran end-to-end with **zero mutation
-  locks** (measured). Must land before any capability declares `irreversible` —
-  and `filesystem.move` will.
+- **P0 — two definitions of "mutating". ✅ LANDED after B.2 review, on this
+  branch (M9-B.3 P0).** `registry.is_mutating()` counts `irreversible`;
+  `engine.py` compared `== "mutating"` literally at lines 365, 3039, 3422, 4725.
+  An `irreversible` action ran end-to-end with **zero mutation locks**
+  (measured). All four sites now defer to `registry.is_mutating()`, so one
+  predicate classifies mutation. Unchanged for the current vocabulary (no
+  shipped action declares `irreversible`); pinned by
+  `tests/test_irreversible_mutation_locking.py` (13 tests, 8 of which fail with
+  the fix reverted). See ADR-062's follow-ups for detail. The remaining bullets
+  below are **not** implemented.
 - **ADR-061 invariant 13 is unenforced.** `canonical_identities()` and
   `unresolved_roles()` have **no production consumers**; the lock layer M8
   deferred as "C7" was never built. `_lock_canonical` locks the primary role
