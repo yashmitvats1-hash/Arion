@@ -22,6 +22,20 @@ class CapabilityError(Exception):
     """Raised when a capability fails to execute its action."""
 
 
+class CapabilityDeclarationError(ValueError):
+    """Raised when a capability violates the declaration contract (ADR-062 D1).
+
+    The REGISTRATION-TIME analogue of ``ResourceDeclarationError`` (ADR-061 D2):
+    a capability whose contract the boundary cannot READ is refused at
+    ``register()``, never discovered later as an ``AttributeError`` deep inside
+    planning, authorization or the CLI.
+
+    ``ValueError`` subclass, matching ``ResourceDeclarationError``: both are
+    "the declaration is malformed" faults raised at construction, and both are
+    caller bugs rather than runtime capability failures (``CapabilityError``).
+    """
+
+
 @dataclass(frozen=True)
 class ResourceRole:
     """One named resource slot of an action (ADR-061 D1).
@@ -212,6 +226,107 @@ class Capability(Protocol):
         ...
 
 
+def validate_capability_declaration(capability: Any) -> None:
+    """Fail closed on a capability the boundary could not govern (ADR-062 D1).
+
+    ``CapabilityRegistry.register`` is the single point where a capability joins
+    the authority boundary, so it is the single point where the declaration
+    contract can be enforced BEFORE anything downstream has to read it. Three
+    consumers read ``capability.actions`` expecting ``ActionSpec`` objects:
+
+      ``CapabilityRegistry.action_spec``    -> ``a.name``      (authorization,
+                                              plan validation, audit projection)
+      ``CapabilityRegistry.capabilities_summary`` -> ``a.to_dict()`` (the model
+                                              planning catalog, the CLI surface)
+      ``resolve_verification_policy``       -> ``spec.*``      (ADR-060 D4/D5)
+
+    A capability that declares its actions as raw mappings satisfies the
+    ``Capability`` protocol structurally at type-check time and then raises
+    ``AttributeError`` in all three readers at runtime. Because ``build_engine``
+    registers every capability unconditionally, ONE such capability takes the
+    whole catalog down with it - the model planner cannot plan ANY goal and
+    ``arion capabilities`` cannot list ANY capability (ADR-062 context).
+
+    An ``ActionSpec`` also carries guarantees a raw mapping silently forfeits:
+    ADR-061 D2 resource-role validation in ``__post_init__`` (which is what
+    normalizes the singular/plural spellings into one representation), and the
+    ADR-060 D4/D5 verification-authority metadata. Accepting a mapping would
+    therefore admit a capability that is simultaneously unauthorizable and
+    unverifiable.
+
+    Every check here is a construction-time refusal, never a runtime default
+    (ADR-061 D2 discipline: ambiguity is never silently resolved).
+    """
+    if capability is None:
+        raise CapabilityDeclarationError("cannot register None as a capability")
+
+    label = type(capability).__name__
+
+    name = getattr(capability, "name", None)
+    if not isinstance(name, str) or not name.strip():
+        raise CapabilityDeclarationError(
+            f"capability {label} must declare a non-empty string 'name' "
+            f"(got {name!r})"
+        )
+
+    description = getattr(capability, "description", None)
+    if not isinstance(description, str) or not description.strip():
+        raise CapabilityDeclarationError(
+            f"capability {name!r} must declare a non-empty string "
+            f"'description' - it is surfaced to planners in capability "
+            f"discovery (got {description!r})"
+        )
+
+    if not callable(getattr(capability, "execute", None)):
+        raise CapabilityDeclarationError(
+            f"capability {name!r} must implement execute(action, params): a "
+            f"capability that cannot be executed can never be governed"
+        )
+
+    actions = getattr(capability, "actions", None)
+    if not isinstance(actions, (list, tuple)):
+        raise CapabilityDeclarationError(
+            f"capability {name!r} must declare 'actions' as a list of "
+            f"ActionSpec (got {type(actions).__name__})"
+        )
+    if not actions:
+        raise CapabilityDeclarationError(
+            f"capability {name!r} declares an empty 'actions' list: no step "
+            f"could ever target it, so it is discoverable noise rather than a "
+            f"capability"
+        )
+
+    seen: set[str] = set()
+    for index, action in enumerate(actions):
+        if not isinstance(action, ActionSpec):
+            raise CapabilityDeclarationError(
+                f"capability {name!r} action #{index} must be an ActionSpec, "
+                f"got {type(action).__name__}. A raw mapping forfeits ADR-061 "
+                f"D2 resource-role validation and ADR-060 D4/D5 verification "
+                f"authority, and makes the registry unreadable to "
+                f"authorization, planning and the CLI (ADR-062 D1)."
+            )
+        if not isinstance(action.name, str) or not action.name.strip():
+            raise CapabilityDeclarationError(
+                f"capability {name!r} action #{index} must declare a "
+                f"non-empty string 'name' (got {action.name!r})"
+            )
+        if action.name in seen:
+            raise CapabilityDeclarationError(
+                f"capability {name!r} declares action {action.name!r} twice: "
+                f"action_spec() could only ever resolve the first, so the "
+                f"second would be silently unauthorizable"
+            )
+        seen.add(action.name)
+        if not isinstance(action.required_scope, str) or not action.required_scope.strip():
+            raise CapabilityDeclarationError(
+                f"capability {name!r} action {action.name!r} must declare a "
+                f"non-empty 'required_scope': the scope is the authorization "
+                f"source of truth and an action without one cannot be decided "
+                f"(fail closed)"
+            )
+
+
 class CapabilityRegistry:
     """Discovers capabilities by name and provides introspection for planning."""
 
@@ -219,6 +334,14 @@ class CapabilityRegistry:
         self._caps: dict[str, Capability] = {}
 
     def register(self, capability: Capability) -> None:
+        """Add a capability to the boundary, refusing an ungovernable one.
+
+        ADR-062 D1: validated BEFORE insertion, so a refused capability never
+        becomes visible to ``get``/``has``/``list``/``action_spec``/
+        ``capabilities_summary`` - the registry is never left half-populated by
+        a failed registration.
+        """
+        validate_capability_declaration(capability)
         self._caps[capability.name] = capability
 
     def get(self, name: str) -> Capability | None:

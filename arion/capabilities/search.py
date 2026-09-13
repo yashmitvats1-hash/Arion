@@ -1,30 +1,48 @@
-"""M9-B.1: Structured filesystem search — bounded, read-only path/filename."""
+"""M9-B.1: Structured filesystem search — bounded, read-only path/filename.
+
+M9-B.2 (ADR-062): the action is declared as an ``ActionSpec``, not a raw
+mapping. The declaration is otherwise unchanged from M9-B.1 — same scope, same
+resource kind/role, same bounds, same default verification — so runtime
+behaviour of ``execute`` is byte-identical; what changes is that the authority
+boundary can now READ the action, which is what makes it authorizable,
+plannable and verifiable at all.
+
+Note the deliberate interaction between two declarations: ``directory`` is
+``required: False`` in ``param_schema`` (so ``execute`` may be called directly
+without it and defaults to the sandbox root), yet it IS the declared resource
+role — so ``PlanValidator._validate_resource`` and the ADR-009 boundary check
+make it effectively MANDATORY for any planned step. That is fail-closed by
+design: an implicit "the whole sandbox" resource is exactly what resource-aware
+authorization exists to prevent. A plan must name the directory it searches.
+"""
 from __future__ import annotations
 from pathlib import Path
+
+from arion.capabilities.registry import ActionSpec
 
 
 class FilesystemSearchCapability:
     name = "filesystem.search"
     description = "Bounded structured filesystem search within authorized directory (path/filename only, read-only)."
     actions = [
-        {
-            "name": "search",
-            "description": "Search for files/directories by path/filename pattern within directory.",
-            "required_scope": "filesystem:read",
-            "risk": "low",
-            "side_effects": "read_only",
-            "reversible": True,
-            "idempotent": True,
-            "retry_safe": True,
-            "resource_kind": "filesystem:path",
-            "resource_param": "directory",
-            "param_schema": {
+        ActionSpec(
+            name="search",
+            description="Search for files/directories by path/filename pattern within directory.",
+            required_scope="filesystem:read",
+            risk="low",
+            side_effects="read_only",
+            reversible=True,
+            idempotent=True,
+            retry_safe=True,
+            resource_kind="filesystem:path",
+            resource_param="directory",
+            param_schema={
                 "pattern": {"type": "string", "required": True},
                 "directory": {"type": "string", "required": False},
                 "max_results": {"type": "integer", "required": False, "max": 100},
             },
-            "default_verification": {"policy": "schema_keys", "args": {"keys": ["results", "count"]}},
-        }
+            default_verification={"policy": "schema_keys", "args": {"keys": ["results", "count"]}},
+        )
     ]
 
     def __init__(self, sandbox_root: str | Path) -> None:
