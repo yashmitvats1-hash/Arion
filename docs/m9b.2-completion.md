@@ -116,7 +116,7 @@ Recorded in ADR-062's follow-ups with measured evidence in
 
 - **P0 — two definitions of "mutating".** `registry.is_mutating()` counts
   `irreversible`; `engine.py` compares `== "mutating"` literally at lines 365,
-  3039, 3423, 4725. An `irreversible` action ran end-to-end with **zero mutation
+  3039, 3422, 4725. An `irreversible` action ran end-to-end with **zero mutation
   locks** (measured). Must land before any capability declares `irreversible` —
   and `filesystem.move` will.
 - **ADR-061 invariant 13 is unenforced.** `canonical_identities()` and

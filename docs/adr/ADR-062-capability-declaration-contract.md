@@ -190,14 +190,87 @@ let M9-B.1 land:
 
 | # | Statement | Source |
 |---|---|---|
-| 22 | A capability the registry cannot read is never admitted | `registry.register` → `validate_capability_declaration` |
+| 22 | A capability whose declaration cannot be read is never admitted **at registration** | `registry.register` → `validate_capability_declaration` |
 | 23 | A refused registration never half-populates the registry (`has`/`get`/`list`/`action_spec`/`capabilities_summary` all unchanged) | `register` validates before insert |
-| 24 | Every admitted action is an `ActionSpec`, so ADR-061 D2 and ADR-060 D4/D5 guarantees hold for every registered action | D1 |
-| 25 | Every action has a non-empty `required_scope`: no action is admitted that authorization cannot decide | D1 |
+| 24 | Every action admitted at registration is an `ActionSpec`, so the ADR-061 D2 and ADR-060 D4/D5 guarantees that `ActionSpec` construction establishes hold for every admitted action | D1 |
+| 25 | Every admitted action declares a non-empty `required_scope`, providing the authorization layer with a scope it can evaluate | D1 |
 | 26 | No capability is admitted with duplicate action names (`action_spec` could only resolve the first) | D1 |
 | 27 | Registered ⇒ transitable: every registered action reaches a durable terminal status through the engine, never an exception out of `run_goal()` | D2 |
 | 28 | The default bootstrap yields a catalog that is complete and JSON-serializable | D3 |
 | 29 | Declaration faults are construction-time `ValueError`s, distinct from runtime `CapabilityError`s | D1 |
+
+**Temporal scope of invariants 22, 24 and 25.** These are **registration-time**
+invariants, not immutability invariants. `Capability.actions` is a mutable
+attribute, and the registry validates it once, at admission; nothing re-checks it
+before each read. Mutating an admitted capability's `actions` in place — e.g.
+`registry.get(name).actions.append({...})` — reintroduces exactly the fault class
+this ADR closes, and `capabilities_summary()` fails again with the same
+`AttributeError`. Measured, and deliberately accepted: see *Limitation* below.
+
+---
+
+## Ownership boundary: registry validity vs. policy permission
+
+Invariant 25 puts the registry's opinion on a field authorization owns, so the
+division is stated explicitly:
+
+| Layer | Question it asks | Question it must NOT ask |
+|---|---|---|
+| `CapabilityRegistry.register` | *Did the action declare an authorization scope at all?* | Is that scope permitted? |
+| `PermissionPolicy.decide` | *Is this scope permitted for this actor, action and resource?* | Did the capability declare itself well? |
+
+The contract checks **presence and shape only**. It never reads `boundaries`,
+`allowed_scopes`, `denied_scopes`, `risk`, `side_effects`, `resource_kind`,
+approval configuration or actor identity — verified by inspection: with
+docstrings and comments stripped, the only capability/action attributes
+`validate_capability_declaration` dereferences are `name` and `required_scope`
+(`description`, `execute` and `actions` are read via `getattr`).
+
+It is also **read-only**: `register()` either admits the object unchanged or
+raises. Measured — `ActionSpec.to_dict()` is identical before and after
+registration and the registry stores the same object identity — so the contract
+cannot rewrite `scope`/`risk`/`side_effects` and therefore **cannot widen what
+policy later decides**. (The only mutation anywhere in the declaration path
+remains ADR-061 D9's `ActionSpec.__post_init__`, which mirrors the primary
+resource role into the singular fields.)
+
+Where the two layers meet, the outcomes agree rather than compete: an action
+declaring `required_scope=""` is refused at registration, and `policy.decide()`
+independently returns `DENY — "scope '' not permitted by policy"`. The contract
+moves an identical fail-closed outcome to an earlier layer with a better
+diagnostic; it does not substitute its judgement for policy's.
+
+---
+
+## Declaration refusal is not an authorization denial
+
+A `CapabilityDeclarationError` means the capability **was not admitted** because
+its declaration was invalid. It must not be translated into, or used to
+simulate, a policy denial. Runtime attempts to use an admitted capability remain
+subject to the normal authorization path and produce authorization outcomes
+independently of declaration validity.
+
+The two are different events with different evidence, and conflating them is a
+live hazard once plugin-shaped registration exists:
+
+| | Declaration refusal | Authorization denial |
+|---|---|---|
+| When | at `register()`, before admission | at `policy.decide()`, per step |
+| Object | the capability's *contract* | one *step's* request |
+| Audit | none — no engine, no task, no step exists | `permission.denied` on a durable task |
+| Operator read | "this capability is malformed" | "this action is not permitted" |
+
+The failure mode to prevent is a loader that does
+`invalid capability → silently skip → step fails "capability not found"`, which
+*presents* as an authorization outcome while no authorization decision was ever
+made. A caller that catches `CapabilityDeclarationError` must surface it as a
+declaration fault, not absorb it into the deny path.
+
+Note that the engine already fails closed on an unresolvable spec independently
+of this ADR (`engine.py:4330–4340`): durable `StepStatus.FAILED` with
+`"capability not found"` / `"unknown action … for capability …"`, no crash. So an
+unadmitted capability is inert either way — the distinction above is about
+*honest diagnostics*, not about safety.
 
 ---
 
@@ -205,10 +278,11 @@ let M9-B.1 land:
 
 **Positive**
 
-- The fault class is closed at the boundary rather than three layers downstream.
-  A future capability that misdeclares itself fails at import/registration with a
-  diagnostic naming the capability, the action index, the type found and the
-  `ActionSpec` requirement — not as an `AttributeError` inside planning.
+- The fault class is closed **at the registration boundary** rather than three
+  layers downstream. A future capability that misdeclares itself fails at
+  import/registration with a diagnostic naming the capability, the action index,
+  the type found and the `ActionSpec` requirement — not as an `AttributeError`
+  inside planning.
 - The suite is green again: **2042 collected, 2040 passed, 2 skipped, 0 failed,
   exit 0** at M9-B.2 HEAD. The 16 baseline failures were resolved by a two-file
   declaration fix (`registry.py` contract + `search.py` redeclaration); 63 new
@@ -232,10 +306,45 @@ make it mandatory for any *planned* step. That asymmetry is fail-closed and is
 now documented in `capabilities/search.py`: an implicit "the whole sandbox"
 resource is exactly what resource-aware authorization exists to prevent.
 
+**Limitation — registration-scoped, not an immutability guarantee**
+
+Invariant 22 holds **at admission**, not forever. `Capability.actions` is a
+mutable attribute and the registry validates it once; no reader re-checks it.
+Measured bypass:
+
+```python
+reg.register(FilesystemSearchCapability(root))      # admitted, contract satisfied
+reg.get("filesystem.search").actions.append({"name": "smuggled", ...})
+reg.capabilities_summary()   # AttributeError: 'dict' object has no attribute 'to_dict'
+```
+
+Re-running `validate_capability_declaration` on the same object catches it, but
+nothing calls it again. Two strengthenings were considered and **rejected**:
+
+- *Freeze `actions` into a tuple at registration.* Rejected: it would make
+  `register()` **mutate** the capability, forfeiting the read-only property that
+  guarantees the contract cannot alter what authorization later sees.
+- *Re-validate defensively inside `action_spec()` / `capabilities_summary()`.*
+  Rejected: it puts an O(actions) check on the hot planning path to defend
+  against a post-registration mutation that **no code in Arion performs**.
+
+The residual risk is accepted and bounded: the D2 transit gate and the D3
+bootstrap invariant both exercise the real registry at test time, so a mutation
+introduced anywhere in Arion's own composition is caught by the suite. A future
+plugin loader that hands the registry third-party objects *after* bootstrap is
+the point at which this should be revisited.
+
 **Cost**
 
 - `register()` is no longer a bare insert. The validation is O(actions) and runs
   once per capability at bootstrap; no measurable runtime cost.
+- **Registration is now a throwing operation, so `build_engine()` can raise where
+  it previously did not.** Verified transactional: `bootstrap.py:231` is
+  `except BaseException: lifecycle.shutdown(); raise`, so a refusal during
+  composition closes the already-opened `SQLiteStorage` and no process resource
+  leaks. Any future caller registering capabilities in a loop must handle
+  `CapabilityDeclarationError` explicitly — and per *Declaration refusal is not an
+  authorization denial* above, must not absorb it into the deny path.
 - Third-party/test capabilities must now be honest declarations. Surveyed at
   baseline: every capability-shaped stub in `tests/` already declares `name`,
   `description`, `execute` and `ActionSpec` actions — **zero** existing stubs
@@ -275,7 +384,7 @@ for this ADR. See `docs/m9b.2-architecture-proposal.md` §3–§4 for the eviden
 
 - **P0 — two definitions of "mutating".** `registry.is_mutating()` counts
   `irreversible`; `engine.py` compares `== "mutating"` literally at lines 365,
-  3039, 3423 and 4725. An `irreversible` action therefore ran end-to-end with
+  3039, 3422 and 4725. An `irreversible` action therefore ran end-to-end with
   **zero mutation locks** (measured). Must be collapsed onto `is_mutating()`
   before any capability declares `irreversible`.
 - **ADR-061 invariant 13 is unenforced.** `canonical_identities()` and
