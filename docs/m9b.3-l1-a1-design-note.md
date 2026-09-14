@@ -7,6 +7,12 @@ Nothing here is implemented.
 separate B.3 concerns, explicitly not to be fixed opportunistically inside L1/A1.
 No question remains open. Next artifact by ruling: **ADR-063 first, then the
 concrete L1/A1 data-flow**, both reviewed before any L1 implementation.
+**Superseded where they differ by
+`docs/adr/ADR-063-approval-and-lock-identity-projections.md`**, which is now the
+normative artifact. Its contract pass corrected three things below: the D6
+ordering claim in §9, the milestone order (**R1 must precede L1**), and bold
+inserted into verbatim ADR-061 quotations. The measurements in §1–§4 and the
+reproduction in §12 are unchanged and still verified.
 **Branch:** `arena/01a09aaa-arion` @ `2036fc3` (M9-B.2 + P0 landed).
 **Scope:** the two decisions that constrain everything else in M9-B.3, because
 `filesystem.move` cannot be built until they are fixed — L1 determines what a
@@ -478,8 +484,11 @@ implementation that "fixes" `a→a` by changing either view has broken invariant
 ### Resolving the apparent contradiction with ADR-061 D1, line 28
 
 > Both are derived from the same `ActionSpec.resources`; a caller can never
-> **approve one view and lock another** (the "approve A, lock B" divergence class
+> approve one view and lock another (the "approve A, lock B" divergence class
 > D1 exists to foreclose).
+
+(Quoted byte-exactly; the operative phrase is `can never approve one view and lock
+another`.)
 
 Read literally, §9's table violates this: `b→a` approves the role view and locks
 the canonical view. The sentence is right in intent but wrong in letter, and the
@@ -546,17 +555,40 @@ role (value `None`) while the canonical view *omits* it. So a step with a missin
 locking half of what the approval names. That is precisely the "approve A+B, lock
 A" divergence ADR-061 D1 exists to foreclose, and it is why:
 
-- **L1** must refuse to acquire when `unresolved_roles()` is non-empty (invariant
-  5/6 — "unresolved must REFUSE, never be treated as nothing to check");
-- **V1** (`PlanValidator` iterating `spec.resources`) should reject it earlier, at
-  plan time, so a model gets a typed retryable error instead of a DENY;
-- **A1** never sees it, because authorization already refused (ADR-061 C4's
-  `_one_resource_allowed` fails closed on a missing resource, naming the role).
+1. **V1** (`PlanValidator` iterating `spec.resources`) rejects at plan time, so a
+   model gets a typed retryable error instead of a DENY;
+2. **authorization — which is where A1's fingerprint is computed — denies**:
+   ADR-061 C4's `_one_resource_allowed` fails closed on a missing resource and names
+   the role, so the decision is DENY rather than "approval required" and **no
+   `ApprovalRequest` is ever queued**;
+3. **L1 is never reached**, because the lock is acquired only after authorization
+   succeeds (`engine.py:4739`). Its `unresolved_roles()` check is defence-in-depth
+   (invariant 5/6 — "unresolved must REFUSE, never be treated as nothing to
+   check"), not the primary gate.
+
+**Corrected by the ADR-063 contract pass.** This note originally listed L1 first and
+said "**A1** never sees it, because authorization already refused" — muddled, since
+A1 *is* part of authorization and authorization runs **before** locking (measured at
+`engine.py:4739`). A1 does see the unresolved role; it denies it. What never sees it
+is the **durable approval queue** and the **lock layer**. One residue is now a
+decision rather than an accident: `_append_approval_record` fingerprints DENIED
+outcomes too, and since the role view retains the unresolved entry while
+`present_resource(kind, None)` returns nulls without raising, a denied record's
+`resources` may contain a null-valued entry — forensic only, never an authority.
 
 Ordering across the milestone therefore matters: **V1 before L1** gives the model
 path a plan-time signal; **L1 before C1** means the capability can never execute
 unlocked; **A1 before C1** means it can never execute under an approval that
 doesn't bind its destination.
+
+**Corrected by the ADR-063 contract pass: R1 must also precede L1.** L1's fencing
+path (renewal failure after execution) calls `_record_recovery_required`, which
+writes a **scalar** `MutationRecovery.resource` taken from the primary role only. A
+fenced `move a→b` would therefore record recovery naming `a.txt` and never mention
+that `archive/b.txt` may exist. The order this note originally implied
+(`L1 → R1`) leaves that window open; ADR-063 invariant 43 closes it
+structurally instead of relying on C1 shipping last. Final order:
+**V1 → A1 → R1 → L1 → V2 → C1 → T1**.
 
 ---
 
@@ -579,7 +611,11 @@ ruling, not an approval of the fix.
 | **Q6** | `a→a` (source == dest): lock one resource and approve two roles, or refuse the step outright? | **Refuse at the capability.** A move onto itself is either a no-op or a destruction, and neither is worth an approval prompt. **Crucially this does not weaken ADR-061 invariant 4:** `resolve_resources` still returns **two** entries for `a→a` and `canonical_identities` still dedups to **one** identity — the refusal is a capability-level policy *above* the view layer, not a change to either projection. The general multi-role lock/approval semantics stay fully defined (§9) for the non-degenerate case. |
 | **Q7** | Does `_mirror_from_request` get the `resources` projection (fixing the pre-existing asymmetry with `_append_approval_record`)? | **Reclassified → deferred** (was "yes, independently of move"). Ruled: keep the finding in the note, **do not fix opportunistically in L1/A1**; whether it is B.3 scope is decided after the core approval model is locked. The same ruling covers the CLI / `ApprovalRequest` primary-only display (§7). |
 
-No question remains open.
+No question remains open. The rulings above are carried into
+`docs/adr/ADR-063-approval-and-lock-identity-projections.md` as decisions D1–D8
+and invariants 30–44; where that ADR's contract pass corrected this note
+(§9's D6 ordering, the milestone sequence, verbatim-quotation fidelity), **the
+ADR governs**.
 
 ---
 

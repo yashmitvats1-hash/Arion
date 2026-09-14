@@ -39,10 +39,15 @@ A second, compounding hazard: `present_resource`'s hash is `sha256(f"{kind}\0{ex
 
 ### What ADR-061 D1 says, verbatim
 
-> - **Role view** (`resolve_resources` in `resource_set.py`): ordered as declared, duplicates retained (invariant 4), values exactly as declared (invariant 20). Used for **approval display**, capability execution, recovery metadata.
-> - **Canonical view** (`canonical_identities`): sorted set of `(kind, canonical_resource(kind, value))` pairs, deduplicated (invariant 3), identity is the pair never a bare string (invariant 2, rejected alternative R6). Used for **fingerprinting**, lock acquisition ordering (invariant 13).
+> - **Role view** (`resolve_resources` in `resource_set.py`): ordered as declared, duplicates retained (invariant 4), values exactly as declared (invariant 20). Used for approval display, capability execution, recovery metadata.
+> - **Canonical view** (`canonical_identities`): sorted set of `(kind, canonical_resource(kind, value))` pairs, deduplicated (invariant 3), identity is the pair never a bare string (invariant 2, rejected alternative R6). Used for fingerprinting, lock acquisition ordering (invariant 13).
 >
-> Both are derived from the same `ActionSpec.resources`; a caller can never **approve one view and lock another** (the "approve A, lock B" divergence class D1 exists to foreclose).
+> Both are derived from the same `ActionSpec.resources`; a caller can never approve one view and lock another (the "approve A, lock B" divergence class D1 exists to foreclose).
+
+Quoted byte-exactly from ADR-061 so this correction can be diffed against it. The
+three operative phrases are `Used for approval display` (role view bullet), `Used
+for fingerprinting` (canonical view bullet), and `can never approve one view and
+lock another` (closing sentence).
 
 Two problems:
 
@@ -79,6 +84,21 @@ This is strictly stronger than ADR-061's "never approve one view and lock anothe
 - Role view — "Used for approval display, capability execution, recovery metadata" becomes "Used for **approval identity and display**, capability execution, recovery metadata."
 - Canonical view — "Used for fingerprinting, lock acquisition ordering" becomes "Used for **lock identity and acquisition ordering only**."
 - The closing sentence is replaced by the covering invariant above.
+
+**The correction scope is wider than ADR-061.** The same two claims are duplicated
+in source docstrings, and leaving them would make the code contradict this ADR the
+moment A1/L1 land. Both are quoted verbatim from
+`arion/orchestration/resource_set.py` and must be corrected in the same change:
+
+- the module docstring — `canonical view ... -> fingerprinting, lock acquisition
+  ordering`, and `so a caller can never approve one resource while locking another
+  (the "approve A, lock B" divergence class D1 exists to foreclose)`;
+- the `ResolvedResource` docstring — `` `canonical` is the lock/fingerprint
+  identity derived from it ``, which assigns fingerprinting to the canonical form
+  at the level of the individual resolved slot.
+
+That is four locations, not two: ADR-061's role-view bullet, its canonical-view
+bullet, its closing sentence, and the two source docstrings that restate them.
 
 ### D2 — The approval fingerprint is the ordered per-role presentation
 
@@ -146,6 +166,100 @@ Under D3, changing a declaration from one role to two changes the fingerprint sh
 
 Locks remain coordination and never permission (ADR-021): acquiring a lock set grants nothing.
 
+#### D4.1 Where the lock set sits relative to authorization (measured)
+
+`_execute_with_retries` documents the existing ordering at `engine.py:4739`:
+*"authorization (live policy + approval) has already succeeded in `_execute_step`
+BEFORE we reach this point. The advisory mutation lock is acquired NOW,
+immediately before the actual mutation."* L1 must preserve that ordering, which
+gives a property worth stating because it is easy to lose:
+
+> **No lock set is ever held across an `AWAITING_APPROVAL` pause.** A step that
+> needs a human decision has not yet acquired anything, so a slow operator cannot
+> pin N resources.
+
+The one path that can pause *after* acquiring is post-wait re-authorization
+(`_revalidate_before_mutation`, `:1286`, called at `:4779`): if it queues a fresh
+approval or denies, the lock is released (`:4782`) and the capability does not run.
+For a set, that release must be the **whole set in reverse order** — it is one of
+the "every terminal path" cases in invariant 38, and it is the case most likely to
+be missed because it is a *pause*, not a failure.
+
+#### D4.2 Renewal fencing (the D4 claim, grounded)
+
+Two renewal mechanisms exist today:
+
+1. **Heartbeat thread** — `_start_lock_heartbeat` (`:830`) starts one daemon
+   thread per lock, named `arion-lock-heartbeat-{lock_id}`, renewing at
+   `max(0.01, min(5.0, lease/3))`. On exception it records `state["error"]` and
+   **stops renewing**.
+2. **Synchronous final renewal** — immediately after `capability.execute` returns
+   (`:4868`), before verification/success. Its `MutationLockError` handler
+   (`:4869`) sets the step FAILED, emits `mutation.failed` **and**
+   `mutation.requires_recovery`, calls `_record_recovery_required`, and returns
+   without retrying. This is ADR-039 §2 and invariants 3–4, and it is the
+   mechanism that actually fences.
+
+**The execution path discards the heartbeat's error state.** At `:4797`
+`_stop_lock_heartbeat(heartbeat)` is called without assignment, unlike the
+goal-run lease path at `:757`, which assigns it and emits ownership-lost when
+`state["error"]` is set. So fencing on the mutation path rests entirely on the
+synchronous final renewal, not on the heartbeat. For a lock set that must remain
+true, and it constrains the design:
+
+- **One heartbeat thread renews the whole set**, in sorted canonical order — not
+  N threads. A single thread means one failure stops renewal for every lock, which
+  is exactly the semantics invariant 42 needs ("ownership of the whole step is
+  lost"). N threads would permit the pathological state where one lock keeps being
+  renewed after another's ownership is gone.
+- **The final synchronous renewal renews every lock in the set**, in sorted
+  canonical order, and failure on **any** one fences the **whole step**. Partial
+  renewal never yields partial success: a step whose second lock's ownership was
+  lost is fenced even though its first lock renewed cleanly, because the side
+  effect may have happened and the ownership token that authorized it is no longer
+  valid (ADR-039 invariant 3).
+- Locks still held after a fencing failure are released in reverse order on the way
+  out, per invariant 38.
+
+#### D4.3 Waiter adoption is the real reason the queue gates on the lead identity
+
+`enqueue_waiter(resource_kind, resource, task_id, goal_id, step_index, deadline,
+now)` (`store.py:1806`) keys a waiter row on **one** `(resource_kind, resource)`
+pair, and ADR-039 §3 makes it a transactional create-or-**adopt**: *"Existing
+QUEUED membership for the same resource/task/step is adopted unchanged
+(position/deadline preserved across a row-before-checkpoint crash)."*
+
+With a lead-identity row, adoption across a restart works because the lead is a
+**pure function of `(spec, params)`** — sorted canonical order, first element —
+so a restarted engine recomputes the identical lead and matches the existing row.
+Per-identity rows would require N adoptions and would admit partial-adoption
+states (some rows adopted, some re-allocated at new positions), which is a fairness
+bug class ADR-023 does not have today. This strengthens R5: lead-only is not
+merely cheaper, it is the only option that keeps adoption deterministic.
+
+**Requirement:** the contention blocker (`_set_lock_contention_blocker`, `:1422`)
+must name the **same** lead identity the waiter row was keyed on, or a restarted
+engine will look up a blocker it cannot match to its waiter row.
+
+#### D4.4 L1 is coupled to R1 and must not land before it
+
+`_record_recovery_required` (`:413`) populates `MutationRecovery.resource` — a
+**scalar** field (`recovery.py:57`) — from `step.params.get(spec.resource_param)`,
+the primary role only. So the fencing path in D4.2 writes a recovery record naming
+**one** resource.
+
+For a fenced `move a→b` whose side effect may have partially happened, that record
+would name `a.txt` and never mention that `archive/b.txt` may now exist. The
+operator's recovery authority would under-describe the world — which is the same
+class of defect ADR-061 C4 closed for boundary checking, one layer down.
+
+L1 is what makes that path reachable with more than one lock. Therefore **R1
+(multi-role recovery) must land no later than L1**, and invariant 43 states the
+property directly so the ordering does not depend on C1 happening to ship last.
+This reorders the follow-ups below: the pre-pass sequence was
+`V1 → A1 → L1 → R1`, which leaves a window where a multi-resource fence is
+recorded with a single-resource recovery record.
+
 ### D5 — Approval is finer than locking, and that is the safe direction
 
 `canonical_resource` normalizes spelling (`os.path.normpath` for `filesystem:path`): `./a.txt` → `a.txt`, `archive//b.txt` → `archive/b.txt`. Approval hashes the **as-declared** string while locking uses the **canonical** one, so the two views can disagree about a value in exactly two ways, and both are safe:
@@ -165,11 +279,43 @@ Stated as an invariant (37), because "conservative" is only a property if it is 
 
 The role view **retains** an unresolved role (value `None`) while the canonical view **omits** it. A step with a missing `dest` would therefore present to approval as `[source=a, dest=None]` but hand the lock layer only `{a}` — locking half of what the approval names. That is the "approve A+B, lock A" divergence D1 exists to foreclose, and it is the one case where the covering invariant can actually be violated.
 
-Layered refusal:
+**Corrected ordering.** The pre-pass draft said "A1 never sees it: authorization
+already refused", which is muddled — A1 *is* part of authorization, and per D4.1
+authorization runs **before** lock acquisition. The actual layering, in execution
+order:
 
-- **V1** (`PlanValidator` iterating `spec.resources`) rejects at plan time, so a model gets a typed retryable error;
-- **L1** refuses to acquire when `unresolved_roles()` is non-empty (ADR-061 invariants 5, 6 — "unresolved must REFUSE, never be treated as nothing to check"). This is `unresolved_roles()`' first production consumer;
-- **A1** never sees it: authorization already refused, because `_one_resource_allowed` fails closed on a missing resource and names the role (ADR-061 C4).
+1. **V1** (`PlanValidator` iterating `spec.resources`) rejects at plan time, so a
+   model gets a typed retryable error rather than a denial.
+2. **Authorization — which is where A1's fingerprint is computed — denies.**
+   `_one_resource_allowed` fails closed on a missing resource and names the role
+   (ADR-061 C4/D3), so the decision is DENY, not "approval required". **No
+   `ApprovalRequest` is ever queued** for an unresolved role: the durable queue
+   never receives it, and no operator is ever asked to approve a half-specified
+   transformation.
+3. **L1 is never reached**, because the lock is acquired only after authorization
+   succeeds (`engine.py:4739`). The `unresolved_roles()` check there is
+   defence-in-depth (ADR-061 invariants 5, 6 — "unresolved must REFUSE, never be
+   treated as nothing to check"), not the primary gate. It is still
+   `unresolved_roles()`' first production consumer.
+
+**Consequence for the denied record, stated so it is a decision and not an
+accident.** `_append_approval_record` computes a fingerprint for DENIED outcomes
+too. Since `resolve_resources` **retains** the unresolved role with `value=None`,
+and `present_resource(kind, None)` returns
+`{resource: None, resource_fingerprint: None, resource_redacted: False}` (verified:
+it does not raise), a denied record's `resources` list **may contain a
+null-valued entry**. That is forensic only and never an authority — authorization
+already refused — but no reader may mistake it for a resource that was approved.
+Invariant 40 covers the refusal; this note covers the residue.
+
+**Why the D3 predicate is stable.** `resolve_resources` appends one entry per
+declared role unconditionally, so `len(resolved) == len(spec.resources)` **always**
+— including when a role is unresolved. The predicate `len(resolved) > 1` is
+therefore equivalent to a declaration-based one, which means the fingerprint's
+*shape* depends only on the `ActionSpec` declaration and never on whether a
+particular step's params happened to resolve. Shape stability is what invariant 34
+requires; had `resolve_resources` filtered unresolved roles, the shape would have
+varied with runtime data.
 
 ### D7 — The degenerate self-move is refused at the capability
 
@@ -192,17 +338,20 @@ Numbering continues from ADR-062 (which ends at 29).
 | # | Statement | Source (planned) |
 |---|---|---|
 | 30 | Approval identity is the **ordered role view**; lock identity is the **sorted canonical view**; both derive from one `resolve_resources` call and neither is independently authoritative | D1 |
-| 31 | The resource set covered by approval is a **superset of / equivalent to** the set execution locks. Different projections of the same resolved resources are legitimate; different *coverage* is not | D1 |
+| 31 | **Covering invariant, stated operationally so it is testable:** the lock set equals the canonicalization of the role view's *resolved* values — `set(canonical_identities(resolved)) == {(r.kind, r.canonical) for r in resolved if r.resolved}`. Given invariant 40 refuses the unresolved case, approval therefore covers exactly what execution locks. Different *projections* of one resolved set are legitimate; different *coverage* is not | D1 |
 | 32 | The canonical view is **never** an approval identity — it is sorted and deduplicated, so it cannot express direction | D1, D2 |
-| 33 | An **unordered set** of `resource_fingerprint` values is never an approval identity — `present_resource`'s hash is role-blind, so such a set collides across direction | D2 |
-| 34 | For a resolved role view of length ≤ 1, `_authz_fingerprint` is **byte-identical** to the pre-M9-B.3 fingerprint: no `resources` key, no reordering, no changed value | D3 |
+| 33 | Approval-identity material **must carry role identity and declaration order**. Any fingerprint whose compared material is an unordered collection of resource hashes is non-conforming however it is spelled, because `present_resource`'s hash is `sha256(kind\0exact)` and is therefore role-blind | D2 |
+| 34 | A resolved role view of length ≤ 1 produces a fingerprint containing **no `resources` key** and no change to any existing key or value — stated structurally, not historically, so it stays true long after the migration. Asserted for a given registry state: `security_relevant_params` is read live from the registry inside a `try/except` that yields `{}` on any failure (`_authz_fingerprint_base`), a pre-existing sensitivity this ADR neither introduces nor removes | D3 |
 | 35 | For length ≥ 2, `resources` is present in **declaration order**, and the singular primary-role keys still mirror `resources[0]` (invariant 16 preserved, not replaced) | D3 |
 | 36 | `_fingerprint_matches` never accepts a multi-role shape for a single-role request, nor a single-role shape for a multi-role request | D3 |
 | 37 | Approval identity **may distinguish** two spellings that lock identity treats as equivalent; it **must never collapse** two identities that locking treats as distinct | D5 |
-| 38 | The lock set is acquired in sorted canonical order, **all-or-nothing**, and released in reverse order on every terminal path; a partial lock set never survives a failed attempt | D4 |
+| 38 | The lock set is acquired in sorted canonical order, **all-or-nothing**, and released in reverse order on every terminal path — **including a post-wait re-authorization pause**, which is a terminal path for the held set even though the step merely waits. A partial lock set never survives a failed attempt or a pause | D4, D4.1 |
 | 39 | `a→a` takes exactly **one** lock while the role view retains **two** entries — invariant 4 and invariant 3 both hold, and the self-move is refused above the view layer | D4, D7 |
 | 40 | An unresolved role **refuses** before any lock is acquired and before any approval is queued; it is never treated as "nothing to check" | D6 |
 | 41 | A resource role may not also be named in `security_relevant_params`; the declaration is refused at construction | D8 |
+| 42 | **One** heartbeat renews the whole lock set in sorted canonical order, and the synchronous post-execution renewal renews **every** lock in it. Failure on any one fences the **whole step**: partial renewal never yields partial success, because the side effect may have happened and the ownership token that authorized it is no longer valid (ADR-039 invariants 3–4) | D4.2 |
+| 43 | A fenced step's recovery record names **every** resource in the lock set it held, never only the primary role. Consequently L1 must not be reachable with more than one lock before R1 lands | D4.4 |
+| 44 | The waiter row and the contention blocker are both keyed on the **lead** canonical identity, which is a pure function of `(spec, params)`; a restarted engine therefore recomputes the identical key and ADR-039 §3 create-or-adopt still matches, with no partial-adoption state | D4.3 |
 
 ---
 
@@ -246,13 +395,120 @@ Sequencing matters, and follows from D1/D6/D7:
 
 1. **V1** — `PlanValidator` iterates `spec.resources`; plan-time typed refusal (D6). Gives the model path a signal before locking.
 2. **A1** — fingerprint per D2/D3, plus the D8 construction refusal (D8 is construction-time and lands here).
-3. **L1** — lock set per D4/D6. Must follow A1 so the capability can never execute under an approval that does not bind its destination.
-4. **R1** — `MutationRecovery` names every role.
+3. **R1** — `MutationRecovery` names every role. **Moved ahead of L1** by
+   invariant 43: L1 is what makes a multi-resource fence reachable, and the fencing
+   path writes a recovery record that is scalar today (`recovery.py:57`, populated
+   from `spec.resource_param`). The pre-pass order was `L1 → R1`, which leaves a
+   window where a fenced `move a→b` records recovery naming only `a.txt`. Closing
+   that window structurally is preferable to relying on C1 shipping last — the same
+   discipline the Q2 ruling applied to D3.
+4. **L1** — lock set per D4/D6. Must follow A1 (so the capability can never
+   execute under an approval that does not bind its destination) and R1 (invariant
+   43).
 5. **V2** — `move_verified` two-resource verification policy.
-6. **C1** — `filesystem.move`, inheriting D7's self-move refusal; declares `irreversible` when it can overwrite, which P0 made safe to declare.
-7. **T1** — concurrency proof: `a→b` vs `b→a` contend and neither deadlocks; `a→c` is not authorized by an `a→b` approval.
+6. **C1** — `filesystem.move`, inheriting D7's self-move refusal; declares
+   `irreversible` when it can overwrite, which P0 made safe to declare.
+7. **T1** — concurrency proof: `a→b` vs `b→a` contend and neither deadlocks;
+   `a→c` is not authorized by an `a→b` approval.
 
 The concrete L1/A1 data-flow is the next required artifact, by ruling, after this ADR is reviewed.
+
+## Contract pass (2026-09-14)
+
+A final invariant/contract pass over the four areas flagged for review. **No
+finding invalidates the direction**; all are refinements, plus one sequencing
+change. Every claim below was re-checked against source, not against the draft's
+own assertions.
+
+### D4 renewal fencing — three issues found
+
+1. **The fencing mechanism is not the heartbeat.** ADR-039 §2's fence is the
+   *synchronous post-execution renewal* (`:4868`, handler at `:4869`: FAILED,
+   `mutation.failed`, `mutation.requires_recovery`, `_record_recovery_required`,
+   no retry). The execution path **discards** the heartbeat's error state at
+   `:4797` — contrast the goal-run lease path at `:757`, which assigns it and
+   emits ownership-lost. The pre-pass text said "failure on any one must fence the
+   step" without naming the mechanism, the renewal order, or partial-renewal
+   semantics. Added **D4.2** (one heartbeat for the whole set; renew in sorted
+   canonical order; partial renewal never yields partial success) and
+   **invariant 42**.
+2. **The fencing path writes a scalar recovery record.** `_record_recovery_required`
+   (`:413`) populates `MutationRecovery.resource` — scalar (`recovery.py:57`) —
+   from `spec.resource_param`, the primary role only. So a fenced `move a→b` would
+   record recovery naming `a.txt` and never mention that `archive/b.txt` may exist.
+   L1 makes that reachable with >1 lock. Added **D4.4**, **invariant 43**, and
+   **reordered R1 ahead of L1** — closing the window structurally rather than
+   relying on C1 shipping last, the same discipline the Q2 ruling applied to D3.
+3. **The lead-only waiter ruling was under-justified.** `enqueue_waiter`
+   (`store.py:1806`) is a transactional create-or-**adopt** keyed on
+   `(resource, task, step)` (ADR-039 §3), so the lead must be recomputable
+   identically after a restart. It is — a pure function of `(spec, params)` — but
+   that is the actual reason lead-only is safe, and per-identity rows would admit
+   partial-adoption states. Added **D4.3**, **invariant 44**, and the requirement
+   that `_set_lock_contention_blocker` (`:1422`) name the *same* lead the waiter row
+   used.
+
+### D6 ordering — one issue found
+
+The pre-pass text said "**A1** never sees it: authorization already refused". That
+is wrong: A1 *is* part of authorization, and authorization runs **before** lock
+acquisition (`:4739`). Corrected to the real three-layer ordering — V1 at plan
+time, authorization **denies and names the role** so **no `ApprovalRequest` is ever
+queued**, L1 never reached. Two consequences added: the DENIED task record may carry
+a null-valued role entry (`present_resource(kind, None)` verified to return
+`{resource: None, resource_fingerprint: None, resource_redacted: False}` without
+raising) and is forensic only; and `len(resolved) == len(spec.resources)` **always**,
+since `resolve_resources` appends one entry per declared role unconditionally — so
+D3's predicate makes the fingerprint *shape* depend on the declaration, never on
+whether a step's params resolved.
+
+### D3 byte-compatibility — verified, one scoping refinement
+
+`_authz_fingerprint` is `_authz_fingerprint_base(...)` plus
+`present_resource(kind, resource).metadata()`, compared by exact dict equality in
+`_fingerprint_matches`. A conditionally-added key leaves the ≤ 1-role shape
+untouched, so the claim holds. Refinement: `security_relevant_params` is read
+**live from the registry** inside a `try/except` that yields `{}` on any exception,
+so byte-identity holds only *for a given registry state* — a pre-existing
+sensitivity this ADR neither introduces nor removes, now stated rather than implied.
+Invariant 34 was also restated **structurally** ("contains no `resources` key")
+instead of **historically** ("identical to pre-M9-B.3"), so it remains a live
+property after the migration is forgotten.
+
+### ADR-061 correction wording — two issues found
+
+1. **Quote fidelity.** Three passages were presented as verbatim ADR-061 text but
+   carried `**emphasis**` that the original does not contain. In a *correction* ADR
+   the quotes must be diffable, so they are now byte-exact and the operative phrases
+   are identified outside the quotation.
+2. **Correction scope was incomplete.** The same two claims are restated in source:
+   `resource_set.py`'s module docstring (`canonical view ... -> fingerprinting, lock
+   acquisition ordering`; `so a caller can never approve one resource while locking
+   another`) and `ResolvedResource`'s docstring (`` `canonical` is the lock/fingerprint
+   identity derived from it ``). Left uncorrected, the code would contradict this ADR
+   the moment A1/L1 land. Scope widened from **two statements to four locations**.
+
+### Invariants 30–41 — durability review
+
+Each was tested against "durable architectural property vs. accidental
+implementation detail":
+
+- **31** was a vague "superset of / equivalent to" relation → restated as a **set
+  equality** that is directly assertable.
+- **33** was phrased as an *observation* about a hash → restated as a **normative
+  requirement** on approval-identity material, so it still binds if the hash
+  construction changes.
+- **34** was anchored to a historical baseline → restated **structurally**, and
+  scoped to registry state.
+- **38** did not name the post-wait *pause* as a terminal path for the held set →
+  now does; that path is the one most likely to be missed because the step does not
+  fail, it waits.
+- **30, 32, 35, 36, 37, 39, 40, 41** are durable as written: each states a relation
+  between the declaration, the two projections and the consumers, and none names a
+  data structure, a field count or a call site as the property itself.
+- **42, 43, 44** added by this pass.
+
+---
 
 ## Tests
 
@@ -262,7 +518,31 @@ None written — this ADR is design only. The tests it mandates:
 - **Invariant 37:** the `./a.txt` vs `a.txt` regression — different fingerprints, same canonical lock, respelling forces re-approval.
 - **Invariants 32/33:** `a→b`, `a→c`, `b→a`, `a→a` produce four distinct approval identities; an unordered hash multiset does not (documenting *why* D2 is ordered).
 - **Invariant 39:** `a→a` yields two role-view entries, one canonical identity, one lock.
-- **Invariant 40:** an unresolved `dest` refuses at plan time (V1), refuses to acquire (L1), and never reaches A1.
-- **Invariant 41:** `ActionSpec` construction raises `ResourceDeclarationError` when a role is also a `security_relevant_param`.
-- **D4:** all-or-nothing acquisition releases held locks in reverse on mid-set failure; dispatch gating blocks on any colliding identity; renewal failure on any lock fences the step.
-- **Post-wait property:** a role-declaration change while waiting stales the approval.
+- **Invariant 40 (corrected by the pass):** an unresolved `dest` is rejected at
+  plan time (V1); authorization **denies and names the role**, so **no
+  `ApprovalRequest` is queued**; and L1 is never reached. Assert the denial and the
+  absence of a queued request — not "A1 never sees it", which the measured
+  ordering contradicts. Also assert the denied task record's `resources` may carry a
+  null-valued entry and that nothing treats it as an approved resource.
+- **Invariant 31:** the set-equality form — `set(canonical_identities(resolved))`
+  equals the canonicalization of the resolved role values, for `a→b`, `b→a` and
+  `a→a`.
+- **Invariant 41:** `ActionSpec` construction raises `ResourceDeclarationError`
+  when a role is also a `security_relevant_param`.
+- **Invariant 42:** exactly **one** heartbeat thread exists for a 3-lock set;
+  renewal failure on the **second** lock fences the whole step (FAILED,
+  `mutation.failed`, `mutation.requires_recovery`, recovery recorded, no retry) even
+  though the first lock renewed cleanly.
+- **Invariant 43:** a fenced multi-resource step records recovery naming **every**
+  role, not only the primary.
+- **Invariant 44:** after a simulated restart, the recomputed lead identity matches
+  the persisted waiter row and `enqueue_waiter` **adopts** it (position and deadline
+  preserved) rather than allocating a new one; the contention blocker names the same
+  lead.
+- **D4:** all-or-nothing acquisition releases held locks in reverse on mid-set
+  failure; dispatch gating blocks on **any** colliding identity.
+- **D4.1:** no lock is held across an `AWAITING_APPROVAL` pause; and a post-wait
+  re-authorization that queues a fresh approval releases the **whole set** in
+  reverse order.
+- **Post-wait property:** a role-declaration change while waiting stales the
+  approval.
