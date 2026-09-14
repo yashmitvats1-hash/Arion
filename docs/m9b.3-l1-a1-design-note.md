@@ -2,10 +2,11 @@
 
 **Status:** DESIGN ONLY. No source, test or schema change accompanies this note.
 Nothing here is implemented.
-**Ruled 2026-09-14:** **Q1, Q2, Q3, Q4, Q8 are LOCKED** (§10 records each ruling
-verbatim). **Q5 and Q6 remain OPEN** — they were not ruled and must not be assumed.
-§7's scalar-approval and CLI findings are **reclassified as separate B.3 concerns**,
-explicitly not to be fixed opportunistically inside L1/A1.
+**Ruled 2026-09-14:** **Q1–Q6 and Q8 are LOCKED** (§10 records each ruling).
+**Q7 is reclassified → deferred:** §7's scalar-approval and CLI findings are
+separate B.3 concerns, explicitly not to be fixed opportunistically inside L1/A1.
+No question remains open. Next artifact by ruling: **ADR-063 first, then the
+concrete L1/A1 data-flow**, both reviewed before any L1 implementation.
 **Branch:** `arena/01a09aaa-arion` @ `2036fc3` (M9-B.2 + P0 landed).
 **Scope:** the two decisions that constrain everything else in M9-B.3, because
 `filesystem.move` cannot be built until they are fixed — L1 determines what a
@@ -364,18 +365,18 @@ Two consequences of deferring, stated so they are chosen rather than inherited:
    task-level approval record at different fidelity. Deferring it does not make it
    worse, and A1 touches neither path's display projection.
 
-**OPEN — Q5 (param exclusivity), NOT ruled:** an `ActionSpec` must not name a
-resource role in `security_relevant_params`. Today nothing forbids it, and doing
-so would encode the same value through two channels with different privacy
-semantics — hashed and bounded as a resource, **raw** as a security-relevant
-param (which is how `overwrite` is stored). That is a direct ADR-037 violation for
-any non-boolean role, and it is the same mutually-exclusive-spellings hazard
-ADR-061 D9 refuses for `resource_kind`/`resources`. Proposed enforcement:
-`ActionSpec._validate_resources` (`registry.py:167`) raises
-`ResourceDeclarationError`. **Awaiting a ruling** — it is a construction-time
-check, not part of the L1/A1 data-flow, so it can be decided separately without
-blocking either. (Renamed from "A1-C1" in the pre-ruling draft to avoid colliding
-with the §6 compatibility invariants INV-C1…C3.)
+**LOCKED (Q5) — param exclusivity, refused at construction.** An `ActionSpec`
+must not name a resource role in `security_relevant_params`. Today nothing forbids
+it, and doing so encodes the same value through two channels with different
+privacy semantics — hashed and bounded as a resource, **raw** as a
+security-relevant param (which is how `overwrite` is stored). That is a direct
+ADR-037 violation for any non-boolean role, and the same
+mutually-exclusive-spellings hazard ADR-061 D9 refuses for
+`resource_kind`/`resources`. Enforcement: `ActionSpec._validate_resources`
+(`registry.py:167`) raises `ResourceDeclarationError`, alongside the existing D2
+construction checks. A construction-time rule, so it lands with A1 rather than
+depending on the data-flow. (Renamed from "A1-C1" in the pre-ruling draft to avoid
+colliding with the §6 compatibility invariants INV-C1…C3.)
 
 ---
 
@@ -466,6 +467,14 @@ roles, L1 takes one lock, and the underlying resource set is identical. Counting
 resource once for exclusion while naming it twice for approval is correct, not
 inconsistent.
 
+**LOCKED (Q6): the capability refuses it.** A move onto itself is either a no-op
+or a destruction. The refusal sits **above** the view layer and changes neither
+projection: `resolve_resources` still returns two entries (ADR-061 invariant 4 is
+explicitly illustrated by `move a -> a` and must keep holding) and
+`canonical_identities` still dedups to one identity. So the `a→a` row above stays
+as specified — it is the *execution* that is refused, not the derivation. Any
+implementation that "fixes" `a→a` by changing either view has broken invariant 4.
+
 ### Resolving the apparent contradiction with ADR-061 D1, line 28
 
 > Both are derived from the same `ActionSpec.resources`; a caller can never
@@ -551,9 +560,12 @@ doesn't bind its destination.
 
 ---
 
-## 10. Decisions — ruled and still open
+## 10. Decisions — all ruled
 
-### LOCKED (ruled 2026-09-14)
+### Rulings (2026-09-14)
+
+Q1–Q6 and Q8 are locked as recommended or as reworded below; Q7 is a **deferral**
+ruling, not an approval of the fix.
 
 | # | Question | Ruling |
 |---|---|---|
@@ -563,13 +575,11 @@ doesn't bind its destination.
 | **Q4** | Amend ADR-061 D1? Line 26 assigns the canonical view to "fingerprinting" (cannot express direction); line 28 says a caller "can never approve one view and lock another" (but `b→a` **requires** exactly that). | **Finding accepted.** Record as a targeted **ADR-063 correction/clarification** — ADR-061 is **not** altered retroactively. The distinction becomes explicit architecture: **approval/fingerprint view** ordered and role-sensitive (`a→b` ≠ `b→a`); **lock view** canonical and order-independent (both must lock the same set); **safety invariant** — approval must cover a superset of / equivalent of what execution locks, and the two **may legitimately hold different projections of the same resolved resources**. Stronger than pretending one canonical representation serves both. |
 | **Q8** | Should the A1 fingerprint hash the **as-declared** value or the **canonical** one? | **As-declared**, documented and regression-tested. **INV-A8** (§9): approval identity *may distinguish* two spellings the lock identity treats as equivalent; it *must never collapse* two identities locking treats as distinct. Acceptable **because it is conservative**. Mandated regression example: `./a.txt` vs `a.txt` — different fingerprints, same canonical lock, respelling forces re-approval. |
 
-### STILL OPEN — must not be assumed
+| **Q5** | May a resource role also be named in `security_relevant_params`? (§7) | **No — refuse at construction.** `ActionSpec._validate_resources` raises `ResourceDeclarationError`. Otherwise the same value is persisted hashed-and-bounded as a resource *and* raw as a param, violating ADR-037 for any non-boolean role; it is the same mutually-exclusive-spellings hazard ADR-061 D9 already refuses for `resource_kind`/`resources`. Lands with A1 as a construction-time check. |
+| **Q6** | `a→a` (source == dest): lock one resource and approve two roles, or refuse the step outright? | **Refuse at the capability.** A move onto itself is either a no-op or a destruction, and neither is worth an approval prompt. **Crucially this does not weaken ADR-061 invariant 4:** `resolve_resources` still returns **two** entries for `a→a` and `canonical_identities` still dedups to **one** identity — the refusal is a capability-level policy *above* the view layer, not a change to either projection. The general multi-role lock/approval semantics stay fully defined (§9) for the non-degenerate case. |
+| **Q7** | Does `_mirror_from_request` get the `resources` projection (fixing the pre-existing asymmetry with `_append_approval_record`)? | **Reclassified → deferred** (was "yes, independently of move"). Ruled: keep the finding in the note, **do not fix opportunistically in L1/A1**; whether it is B.3 scope is decided after the core approval model is locked. The same ruling covers the CLI / `ApprovalRequest` primary-only display (§7). |
 
-| # | Question | Recommendation | Status |
-|---|---|---|---|
-| **Q5** | May a resource role also be named in `security_relevant_params`? (§7) | **No** — refuse at construction. Otherwise the same value is persisted hashed-and-bounded as a resource *and* raw as a param, violating ADR-037 for any non-boolean role. | **Not ruled.** Construction-time check, separable from the L1/A1 data-flow; can be decided without blocking either. |
-| **Q6** | `a→a` (source == dest): lock one resource and approve two roles, or refuse the step outright? | **Refuse at the capability**, while keeping the general lock/approval semantics defined (§9: two roles bound, one lock taken — correct, not divergent). A move onto itself is either a no-op or a destruction. | **Not ruled.** Interacts with C1's capability design and with V2/R1, which are not yet designed. |
-| **Q7** | Does `_mirror_from_request` get the `resources` projection (fixing the pre-existing asymmetry with `_append_approval_record`)? | Was "yes, independently of move". | **Reclassified → deferred.** Ruled: keep the finding in the note, **do not fix opportunistically in L1/A1**; whether it is B.3 scope is decided after the core approval model is locked. Same ruling covers the CLI/`ApprovalRequest` primary-only display (§7). |
+No question remains open.
 
 ---
 
@@ -577,8 +587,8 @@ doesn't bind its destination.
 
 - **V2** (`move_verified` two-resource verification policy), **R1**
   (`MutationRecovery` naming every role) and **C1** (the `filesystem.move`
-  capability itself) depend on **Q5 and Q6, which are still open**, and are
-  designed after them.
+  capability itself) are designed next, now that Q1–Q6 and Q8 are ruled. C1 in
+  particular inherits Q5 (construction refusal) and Q6 (self-move refusal).
 - The §7 human-surface work (`ApprovalRequest.resources`, the queue summary,
   `arion approvals show`, `_mirror_from_request`) is **deferred by ruling**, not
   omitted by oversight. It must not be pulled into an L1/A1 change.
