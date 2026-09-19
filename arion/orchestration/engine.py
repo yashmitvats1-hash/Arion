@@ -362,7 +362,7 @@ class ArionEngine:
             if _RECOVERY_PERSISTENCE_MARKER not in text or step is None:
                 continue
             spec = self.registry.action_spec(step.capability, step.action)
-            if spec is None or getattr(spec, "side_effects", "") != "mutating":
+            if spec is None or not is_mutating(spec):
                 continue
             self._record_recovery_required(task, step, spec, step.error or task.error or text)
 
@@ -3036,7 +3036,7 @@ class ArionEngine:
                 if spec is None:
                     dispatch.append(i)  # will fail fast inside _execute_step
                     continue
-                if getattr(spec, "side_effects", "read_only") == "mutating":
+                if is_mutating(spec):
                     k, r = self._lock_canonical(spec, step)
                     if k and r:
                         key = (k, r)
@@ -3419,7 +3419,7 @@ class ArionEngine:
         spec = self.registry.action_spec(step.capability, step.action)
         if spec is None:
             return True, ""  # will fail fast inside _execute_step
-        if getattr(spec, "side_effects", "read_only") == "mutating":
+        if is_mutating(spec):
             k, r = self._lock_canonical(spec, step)
             if k and r:
                 key = (k, r)
@@ -4722,7 +4722,14 @@ class ArionEngine:
     ) -> None:
         verify_failed = False
         exec_error: str | None = None
-        mutating = getattr(spec, "side_effects", "read_only") == "mutating"
+        # ADR-006 taxonomy via the SINGLE classification (ADR-062 P0):
+        # `is_mutating()` covers BOTH "mutating" and "irreversible". A literal
+        # `== "mutating"` comparison here let an `irreversible` action skip the
+        # mutation lock, the FIFO waiter queue, contention blocking and
+        # post-wait re-authorization entirely - while ADR-060 D5 still demanded
+        # a verification policy for it. Two authorities, one word, different
+        # meanings; the registry predicate is now the only one.
+        mutating = is_mutating(spec)
         lock: Any = None
         waited = False
         if not self._goal_run_allows_task(

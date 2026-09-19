@@ -87,6 +87,23 @@ Every step is decided by a permission policy over
 - Action metadata: `required_scope`, `risk`, `side_effects`, `reversible`,
   `idempotent`, `retry_safe` — the substrate for safe side-effecting
   capabilities later.
+- **One classification of "changes the world" (M9-B.3 P0).** Whether an action
+  is a mutation is decided by exactly one predicate,
+  `capabilities.registry.is_mutating(spec)` — true for `side_effects` in
+  `{"mutating", "irreversible"}`. Every engine path that gates coordination
+  defers to it: recovery mirroring, same-resource dispatch gating (both the
+  round-building loop and `_step_dispatchable`), and the execution path that
+  acquires the mutation lock. The engine previously compared
+  `side_effects == "mutating"` **literally** at those four sites while
+  `is_mutating()` also counted `irreversible`, so an `irreversible` action could
+  run with **zero mutation locks** — skipping the durable lock (ADR-021),
+  bounded waiting (ADR-022), the FIFO queue (ADR-023), dispatch gating
+  (ADR-024/025) and recovery mirroring (ADR-020) — even though ADR-060 D5 still
+  demanded a verification policy for it. Two authorities, one word, different
+  meanings. A source-level test now fails on *any* literal `side_effects`
+  comparison against a taxonomy value in `engine.py`, so a future
+  `== "irreversible"` special case is caught too. No shipped action declares
+  `irreversible` yet; `filesystem.move` (M9-B.3) is expected to.
 
 ## Vertical slice (implemented)
 
@@ -1622,6 +1639,72 @@ The concrete ownership map and consolidation deferrals are recorded in
 distributed health checks, and a broad event-payload migration are deferred
 until real service boundaries require them.
 
+## Structured filesystem search (M9-B.1)
+
+- **`filesystem.search`** (`arion/capabilities/search.py`) — bounded, read-only
+  path/filename search inside an authorized directory. Single `search` action:
+  reuses the existing `filesystem:read` scope (no new authorization path),
+  `directory` is the declared resource role under the same
+  `filesystem:path` boundary as read/write/append, `risk=low`,
+  `side_effects=read_only`.
+- **Bounds:** `max_results` hard-capped at 100, `pattern` bounded at 200 chars
+  (PlanSchema), every result path `resolve()`d and re-checked against the
+  sandbox root so symlink escapes are excluded fail-closed. Results are sorted
+  by relative path (deterministic) and deduplicated by resolution.
+- **Verification:** `schema_keys` on `["results", "count"]` — structure, not
+  presence. Zero matches (`count == 0`) is legitimate success, deliberately not
+  `non_empty`.
+- **Results are DATA, never authorization.** A path returned by `search` grants
+  nothing: any subsequent read/write/append receives independent authorization
+  against its own `directory`/`path` resource.
+
+## Capability declaration contract (ADR-062, M9-B.2)
+
+`Capability` is a `Protocol`, so it is a *type-checking* contract only — and
+`CapabilityRegistry.register()` used to be a bare dictionary insert. M9-B.1
+shipped `filesystem.search` with `actions` declared as a raw dict instead of an
+`ActionSpec`; the registry admitted it, and the fault surfaced three layers away
+as an `AttributeError`. Because `build_engine()` registers every capability
+unconditionally, one unreadable declaration took the whole catalog down:
+`capabilities_summary()` is both the model planner's catalog
+(`model_planner.py`) and the `arion capabilities` surface, so **the entire M9-A
+model path was dead in every default-built engine**, and `filesystem.search`
+itself could never transit the boundary (a planned step crashed in
+`_plan_steps_for_audit`, the exception escaping `run_goal()` unhandled on the
+deterministic path). 16 tests failed at `main`.
+
+- **Fail closed at registration (D1):** `register()` now validates the
+  declaration and raises typed `CapabilityDeclarationError(ValueError)` —
+  the registration-time analogue of ADR-061 D2's `ResourceDeclarationError`.
+  Refused: `None`; absent/blank/non-string `name` or `description`; absent or
+  non-callable `execute`; `actions` absent, not a list/tuple, or **empty**; any
+  action that is not an `ActionSpec`; a blank action `name`; duplicate action
+  names; a blank `required_scope`. Validation runs **before** insertion, so a
+  refused registration never half-populates the registry.
+- **Refuse, never coerce (rejected R1):** converting a mapping into an
+  `ActionSpec` would silently invent `risk`, `side_effects`, `reversible`,
+  `retry_safe` and `default_verification` from dataclass defaults — an
+  authorization-relevant decision made on the capability author's behalf.
+- **Registered ⇒ transitable (D2):** `tests/test_capability_boundary_transit.py`
+  drives every registered action through the real engine
+  (`plan → validate → authorize → execute → verify`) and requires a **durable
+  terminal status**, never an exception out of `run_goal()`. Allowed actions must
+  complete (including the mutation-lock window); fail-closed actions must be
+  denied durably (`http.get` with no `url` boundary, `filesystem.write` under the
+  default policy, a traversal `directory`); the approval seam is part of transit.
+- **Bootstrap self-consistency (D3):** `tests/test_bootstrap_registry_invariant.py`
+  pins that the default catalog is complete, `ActionSpec`-backed,
+  **JSON-serializable** (it crosses a wire to a provider), reaches
+  `RealModelPlanner`, and that `arion capabilities` exits 0.
+- **Planner reachability (measured, not assumed):** `DeterministicPlanner` can
+  emit only 5 of the 8 registered actions — `filesystem.read` (read, list),
+  `git.log` (log, branches), `http.get` (get). `filesystem.write`, `append` and
+  `search` are reachable only via an explicit/model-produced plan, which is why
+  the transit tests inject one-step plans.
+- **Suite:** 2042 collected, 2040 passed, 2 skipped, 0 failed, exit 0. The 16
+  baseline failures were resolved by a two-file fix; **no pre-existing test was
+  modified**, and all 8 original `test_search.py` tests pass unchanged.
+
 ## Security boundary (first slice)
 
 No shell, no subprocess, no dynamic code execution anywhere in the core.
@@ -1629,8 +1712,12 @@ Every action passes the permission gate (ADR-006/009); the default policy is
 fail-closed:
 
 - **Filesystem access is confined to the sandbox root** (`filesystem.read`,
-  `filesystem.write`, `filesystem.append` all enforce `_resolve_inside`
+  `filesystem.write`, `filesystem.append` and `filesystem.search` all enforce
   containment — traversal, absolute-path and symlink escapes fail closed).
+- **Every registered capability is readable by the boundary** (ADR-062): a
+  capability that misdeclares its contract is refused at `register()`, so the
+  registry can never admit an action that authorization, planning and
+  verification cannot govern.
 - **Mutating capabilities are registered but DENIED by the default policy**
   (`allowed_scopes` has no `filesystem:write`): no write/append mutation
   without explicit operator authorization, and mutations additionally require
