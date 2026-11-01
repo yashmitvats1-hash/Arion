@@ -8,6 +8,7 @@ must XPASS (which strict xfail reports as a failure) and then be converted
 to an ordinary passing regression test in the fix PR.
 
 The executable counterexamples live in ``scripts/audit_issue18_repro.py``
+and hostile-input negative controls in ``scripts/audit_issue18_controls.py``
 so the coordinator can reproduce them without pytest. See
 ``docs/agent_reports/ARENA_ISSUE_18_AUDIT.md`` for severity, reachability and
 source locations. No production capability or policy is changed here.
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import pytest
 
+from scripts import audit_issue18_controls as controls
 from scripts import audit_issue18_repro as repro
 
 
@@ -37,6 +39,7 @@ DEFECT_GATES = [
     pytest.param(repro.provider_unbounded_read, "F09", "provider response size must be bounded during read", id="F09-provider-read-bound"),
     pytest.param(repro.crash_append_duplicate, "F10", "hard-crash resume must not duplicate a non-retry-safe append", id="F10-crash-append"),
     pytest.param(repro.declaration_taxonomy_fail_open, "F11", "unknown risk/side-effects declarations must fail closed at registration", id="F11-declaration-taxonomy"),
+    pytest.param(repro.observation_non_finite, "F12", "observation contract must reject non-finite floats", id="F12-observation-non-finite"),
 ]
 
 
@@ -67,3 +70,9 @@ def test_audit_control_default_policy_still_denies_writes(tmp_path):
         assert not (root / "sandbox" / "denied.txt").exists()
     finally:
         engine.close()
+
+
+@pytest.mark.parametrize("name", sorted(controls.CONTROLS))
+def test_hostile_boundary_negative_control(name):
+    """Required-work-5 negative controls: hostile plan/output must be rejected."""
+    assert controls.CONTROLS[name](), name

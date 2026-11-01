@@ -2,15 +2,15 @@
 
 - **Auditor:** Arena (independent engineering audit / red team)
 - **Assignment:** https://github.com/yashmitvats1-hash/Arion/issues/18
-- **Date:** 2026-10-31
+- **Date:** 2026-10-31 (continued 2026-11-01)
 - **Baseline `main`:** `8e490eff8faf3c84ca8730174a8a3c7f5a9e91a7`
 - **Working branch:** `arena/82c68d7f-arion`
 - **Scope:** audit, executable counterexamples, and regression gates only. **No production capability, policy, authorization, verification, or recovery code was changed.**
-- **Status:** audit complete; **11 confirmed defects remain unfixed**.
+- **Status:** audit complete; **12 confirmed defects remain unfixed**.
 
 ## 1. Verdict
 
-The current test suite is green, but it is **not evidence that Arion satisfies its charter**. The audit reproduced false success, two sandbox-escape paths, a hard-crash duplicate mutation, an approval that does not bind the write payload, and fail-open handling of unknown capability risk/side-effect declarations.
+The current test suite is green, but it is **not evidence that Arion satisfies its charter**. The audit reproduced false success, two sandbox-escape paths, a hard-crash duplicate mutation, an approval that does not bind the write payload, fail-open handling of unknown capability risk/side-effect declarations, and a non-finite tool-output contract violation. Executable hostile-input negative controls are included for malformed model plans and tool outputs (§7).
 
 Release-blocking conclusions:
 
@@ -28,6 +28,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[dev]'
 .venv/bin/python -m pytest -ra
 .venv/bin/python scripts/audit_issue18_repro.py
+.venv/bin/python scripts/audit_issue18_controls.py
 .venv/bin/python -m pytest -q tests/test_issue18_audit_regressions.py -rxX
 ```
 
@@ -45,9 +46,10 @@ Test results:
 |---|---:|---:|---:|---:|---:|---:|
 | Baseline before audit files | 2055 | 2053 | 2 | 0 | 0 | 0 |
 | Focused existing safety suites | 339 | 339 | 0 | 0 | 0 | 0 |
-| Final full suite with audit gates | 2067 | 2054 | 2 | 11 | 0 | 0 |
+| Hostile-input negative controls (standalone) | 9 | 9 | 0 | 0 | 0 | 0 |
+| Final full suite with audit gates | 2077 | 2063 | 2 | 12 | 0 | 0 |
 
-The two baseline skips are the live-provider smoke test (no credentials) and one platform symlink test. The 11 final xfails are **strict expected failures for confirmed defects**, not product passes. A fix PR must convert the corresponding gate to an ordinary passing test.
+The two baseline skips are the live-provider smoke test (no credentials) and one platform symlink test. The 12 final xfails are **strict expected failures for confirmed defects**, not product passes. A fix PR must convert the corresponding gate to an ordinary passing test. The final full-suite run completed in 226.41s with exit 0; the standalone repro harness reproduced all 12 defects (exit 0) and the standalone hostile-input controls all rejected their attacks (exit 0).
 
 One intermediate full-suite run exposed a timing flake in `tests/test_cross_goal_concurrency.py::test_two_goals_execute_concurrently`: the overlap assertion passed, but wall-clock `elapsed 0.528s` exceeded the hard-coded `<0.45s` threshold under load. The isolated test and the final full-suite rerun passed. Recommend replacing the wall-clock bound with the existing barrier/overlap evidence; this is a test-reliability issue, not a demonstrated product safety bypass.
 
@@ -72,6 +74,7 @@ One intermediate full-suite run exposed a timing flake in `tests/test_cross_goal
 | F09 | Medium | Model provider transport | Model opt-in + hostile/compromised provider | Response size is checked only after an unbounded `resp.read()`. |
 | F10 | High | Crash recovery / non-retry-safe mutation | Write opt-in + hard crash window | Append applied before crash is applied again on resume; no recovery record. |
 | F11 | Medium | Capability declaration contract | Third-party/buggy extension | Unknown `risk` / `side_effects` strings are accepted and fail open (no approval / no mutation lock). |
+| F12 | Medium | Observation contract / verification | Buggy/hostile read tool extension | NaN/Infinity tool output is accepted as finite JSON, completes `non_empty`, and persists non-finite values. |
 
 ## 5. Detailed findings
 
@@ -172,6 +175,15 @@ One intermediate full-suite run exposed a timing flake in `tests/test_cross_goal
 - **Preconditions:** third-party or buggy capability extension. The model cannot register capabilities.
 - **Proposed remediation:** validate `risk`, `side_effects`, and boolean semantics at `ActionSpec`/registration; fail closed on unknown taxonomy. Keep `is_mutating` as the single predicate, but make its input domain closed.
 
+### F12 — Non-finite tool output is accepted as finite JSON
+
+- **Expected:** the observation contract rejects NaN/Infinity so persisted results and verification remain finite JSON.
+- **Observed:** a test-only read capability returns `{"content": NaN, "inf": Infinity}`; `normalize_observation` accepts it; default `non_empty` verification passes; goal/task complete; SQLite reload preserves NaN and Infinity.
+- **Reproduce:** `--case observation_non_finite`
+- **Source:** `arion/capabilities/observations.py:64` `json.dumps(dict(value))` omits `allow_nan=False` despite the finite-JSON contract; `engine._verify` trusts the normalized result.
+- **Preconditions:** a buggy or hostile registered read tool; the model cannot register capabilities. This is a contract/integrity defect, not a direct sandbox escape.
+- **Proposed remediation:** serialize with `allow_nan=False` (and reject non-finite floats before persistence); add a hostile tool-output regression that asserts `ObservationContractError` for NaN/Infinity.
+
 ## 6. M9-B.3 P0 and multi-resource gate verification
 
 **P0 confirmed:** production mutation-classification decisions use `registry.is_mutating()`; no remaining literal `side_effects == "mutating"` decision path was found in `arion/`. Engine sites: `365`, `3039`, `3422`, `4732`, `5059`; validator provenance: `plan_validator.py:183`. Focused `tests/test_irreversible_mutation_locking.py` passes. **However, F11 shows the predicate's input vocabulary is not closed.**
@@ -199,6 +211,28 @@ A test-only two-resource probe (not registered in production) confirmed the outs
 This matches ADR-063 and the M9-B.3 design note: **P0 landed; the rest remains unimplemented.** Do not implement `filesystem.move` before V1/A1/R1/L1/V2.
 
 ## 7. Negative findings and controls (method-bounded)
+
+Required-work-5 hostile-input attacks are executable, not merely narrative:
+
+```bash
+.venv/bin/python scripts/audit_issue18_controls.py
+```
+
+All 9 standalone controls returned `rejected: true` (exit 0), and the same checks run as ordinary passing tests inside `tests/test_issue18_audit_regressions.py`:
+
+| Control | Attack | Result |
+|---|---|---|
+| `model_forbidden_authority_field` | model step sets `scope` | rejected by plan schema |
+| `model_extra_param` | read step adds `shell` param | rejected by plan validator |
+| `model_omitted_resource` | read step omits `path` | rejected by plan validator |
+| `model_oversized_param` | 2001-char path param | rejected by plan schema |
+| `model_deep_nesting` | nested JSON beyond depth bound | rejected by plan schema |
+| `tool_output_non_mapping` | tool returns a list | rejected by observation contract |
+| `tool_output_non_string_key` | tool returns integer key | rejected by observation contract |
+| `tool_output_cyclic` | tool returns cyclic dict | rejected by observation contract |
+| `tool_output_oversize` | tool output exceeds byte cap | rejected by observation contract |
+
+Prompt-injection-as-authorization and partial-failure non-retry behavior remain covered by the focused existing poisoning/memory-security and recovery suites cited below; stale approvals are covered by approval fingerprint tests (with F07 as the content-binding exception). Non-finite output is **not** a negative control: it is confirmed defect F12.
 
 The following were **not bypassed** in the focused existing suites and full suite. These are negative findings under the stated tests, not formal proofs:
 
@@ -231,7 +265,7 @@ No evidence was found to support consciousness, AGI-level performance, or unrest
 1. **Containment first:** F05 Git metadata path resolution; F06 secure no-follow temp creation.
 2. **Crash integrity:** F10 durable mutation-intent journal and in-doubt recovery fence.
 3. **Approval identity:** F07 payload digest binding and operator-visible exact action; F11 closed taxonomy validation.
-4. **Semantic goal contract:** F01/F02 unsupported-intent refusal and goal-level postconditions; F03 required-step skip semantics; F04 HTTP status verification.
+4. **Semantic goal/output contract:** F01/F02 unsupported-intent refusal and goal-level postconditions; F03 required-step skip semantics; F04 HTTP status verification; F12 finite-JSON observation enforcement.
 5. **Network/provider bounds:** F08 redirect/policy intersection; F09 streaming response cap.
 6. **Then M9-B.3:** V1→A1→R1→L1→V2→C1→T1, with the above fixes as prerequisites for a trustworthy move demo.
 7. Replace the wall-clock concurrency assertion with overlap/barrier evidence to remove the observed flake.
@@ -240,9 +274,11 @@ Do not add new mutation classes, unattended scheduling, or broader model autonom
 
 ## 10. Evidence artifacts
 
-- `scripts/audit_issue18_repro.py` — 11 offline, disposable-sandbox counterexamples; prints JSON; exit 0 means the undesirable baseline behavior was reproduced.
-- `tests/test_issue18_audit_regressions.py` — 11 strict-xfail desired-invariant gates plus one default-deny positive control.
-- Probe output (all 11 reproduced at baseline):
+- `scripts/audit_issue18_repro.py` — 12 offline, disposable-sandbox counterexamples; prints JSON; exit 0 means the undesirable baseline behavior was reproduced.
+- `scripts/audit_issue18_controls.py` — 9 hostile model-plan/tool-output negative controls; exit 0 means every attack was rejected.
+- `tests/test_issue18_audit_regressions.py` — 12 strict-xfail desired-invariant gates, one default-deny positive control, and 9 ordinary passing hostile-boundary controls.
+- `docs/agent_reports/evidence/issue18-probes.json`, `issue18-controls.json`, `issue18-final-summary.txt` — captured probe/control output and final suite summary.
+- Probe output (all 12 reproduced at baseline):
 
 ```text
 deterministic_rename: completed read, target absent, reflection high
@@ -256,6 +292,7 @@ redirect_allowlist_mismatch: completed, requests=[A/start, B/data], direct_b_all
 provider_unbounded_read: read_arguments=[null], oversize_rejected_after_read=true
 crash_append_duplicate: after_crash=BASEA, after_restart=BASEAA, attempts=2, recovery_records=0
 declaration_taxonomy_fail_open: unknown risk completed without approval; unknown side effect completed without mutation lock
+observation_non_finite: completed, persisted_nan=true, persisted_inf=true
 ```
 
 **Bottom line:** the engineering substrate is substantial, but the prototype must not be presented as verified or release-ready until the above defects are fixed and the strict-xfail gates become ordinary passing regressions.

@@ -1,0 +1,6 @@
+command: .venv/bin/python -m pytest -ra --junitxml=/tmp/arion-issue18-final2.xml
+baseline_main: 8e490eff8faf3c84ca8730174a8a3c7f5a9e91a7
+python: 3.11.2
+pytest: 9.2.0
+2063 passed, 2 skipped, 12 xfailed in 226.41s (0:03:46)
+exit_code: 0

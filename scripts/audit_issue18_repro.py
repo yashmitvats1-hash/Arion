@@ -447,6 +447,45 @@ def declaration_taxonomy_fail_open(root):
     }
 
 
+def observation_non_finite(root: Path | None = None) -> dict:
+    """F12: a hostile read tool returns NaN/Infinity; finite-JSON contract accepts it."""
+    import math
+
+    class NanCap:
+        name = "probe.nan"
+        description = "audit probe"
+        actions = [ActionSpec(name="read", description="audit", required_scope="filesystem:read",
+                              risk="low", side_effects="read_only",
+                              default_verification={"policy": "non_empty"})]
+        def execute(self, action, params):
+            return {"content": float("nan"), "inf": float("inf")}
+    class P:
+        last_source = "deterministic"
+        last_transformation = None
+        def plan(self, *a, **k):
+            return [PlanStep(index=0, intent="nan", capability="probe.nan", action="read",
+                             scope="filesystem:read", verification=VerificationPolicy("non_empty"))]
+        def required_capabilities(self, g): return {"probe.nan"}
+    with tempfile.TemporaryDirectory(prefix="arion-audit-") as td:
+        (Path(td) / "sandbox").mkdir()
+        engine = _build(Path(td), planner=P())
+        try:
+            engine.registry.register(NanCap())
+            goal = engine.submit_goal("non-finite observation probe")
+            final = engine.run_goal(goal.id)
+            task = engine.goal_manager.task_history(goal.id)[-1]
+            loaded = engine.storage.load_task(task.id)
+            return {
+                "finding": "F12", "reproduced": final.status.value == "completed",
+                "goal_status": final.status.value, "task_status": task.status.value,
+                "persisted_nan": math.isnan(loaded.steps[0].result["content"]),
+                "persisted_inf": math.isinf(loaded.steps[0].result["inf"]),
+                "contract": "normalize_observation promises finite JSON but json.dumps allows NaN/Infinity",
+            }
+        finally:
+            engine.close()
+
+
 CASES = {
     "deterministic_rename": deterministic_rename,
     "model_rename": model_rename,
@@ -459,6 +498,7 @@ CASES = {
     "provider_unbounded_read": provider_unbounded_read,
     "crash_append_duplicate": crash_append_duplicate,
     "declaration_taxonomy_fail_open": declaration_taxonomy_fail_open,
+    "observation_non_finite": observation_non_finite,
 }
 
 
