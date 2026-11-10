@@ -9,6 +9,11 @@ filesystem.write is the ONLY write path in Arion:
 - NO shell, NO subprocess, NO os.system - pure Path I/O;
 - strict containment: the resolved path must stay inside the sandbox root
   (symlink escapes and ``../`` traversal are resolved away and rejected);
+- secure temporary-file handling (F06): the staging file is created
+  EXCLUSIVELY with no-follow semantics (``O_CREAT|O_EXCL|O_NOFOLLOW``), so a
+  planted ``.<name>.arion-write-tmp`` symlink - or any pre-existing entry at
+  that name - can never redirect the write; occupied temp paths fail closed
+  and are left untouched;
 - deterministic verification contract: returns the exact byte size so the
   engine can confirm the postcondition without another mutation.
 
@@ -19,6 +24,7 @@ orchestration authorization layer (scope/boundary/risk/approval), never here.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -107,17 +113,50 @@ class FilesystemWriteCapability:
         # Atomic-ish bounded write: parents created on demand, file replaced
         # only after the write succeeds (never a partial overwrite of a
         # pre-existing file via truncate-then-fail paths).
+        #
+        # F06: the staging file is created EXCLUSIVELY and with no-follow
+        # semantics.  ``O_CREAT|O_EXCL`` refuses an existing entry of ANY
+        # kind - including a planted ``.<name>.arion-write-tmp`` symlink -
+        # so a predictable temp name can never redirect the bytes outside
+        # the sandbox; ``O_NOFOLLOW`` is kept as defense in depth.  An
+        # occupied temp path fails closed and is left exactly as found.
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_name(f".{target.name}.arion-write-tmp")
+        flags = (
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        fd: int | None = None
+        created = False
         try:
-            tmp.write_bytes(data)
-            tmp.replace(target)
-        finally:
             try:
-                if tmp.exists():
-                    tmp.unlink()
-            except OSError:
-                pass
+                fd = os.open(tmp, flags, 0o600)
+            except FileExistsError as exc:
+                raise CapabilityError(
+                    f"temporary write path is occupied (refusing to follow "
+                    f"or reuse it): {tmp.name!r}"
+                ) from exc
+            created = True
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.close(fd)
+            fd = None
+            os.replace(tmp, target)
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            # Only OUR staging file is ever cleaned up; a planted entry at
+            # the temp name is left untouched (created stays False).
+            if created:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         return {
             "written": True,
             "path": str(rel),

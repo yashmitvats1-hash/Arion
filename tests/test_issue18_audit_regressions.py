@@ -38,6 +38,7 @@ def _root(tmp_path):
 # baseline behaviour is no longer reachable.
 FIXED_GATES = [
     pytest.param(repro.git_dotgit_symlink, "F05", "Git metadata reads must stay inside the sandbox", id="F05-git-dotgit-symlink"),
+    pytest.param(repro.write_temp_symlink, "F06", "approved writes must not follow a planted temp symlink outside the sandbox", id="F06-write-temp-symlink"),
 ]
 
 # UNFIXED_GATES: strict expected failures for confirmed defects that are
@@ -48,7 +49,6 @@ UNFIXED_GATES = [
     pytest.param(repro.model_rename, "F02", "model-proposed read must not satisfy a rename goal", id="F02-model-rename"),
     pytest.param(repro.memory_skip, "F03", "skipping a required read must not complete the goal", id="F03-memory-skip"),
     pytest.param(repro.http_500, "F04", "HTTP 500 must not verify as a successful fetch", id="F04-http-500"),
-    pytest.param(repro.write_temp_symlink, "F06", "approved writes must not follow a planted temp symlink outside the sandbox", id="F06-write-temp-symlink"),
     pytest.param(repro.approval_payload_swap, "F07", "an approval must bind the write payload", id="F07-approval-payload"),
     pytest.param(repro.redirect_allowlist_mismatch, "F08", "redirects must satisfy the policy URL boundary", id="F08-redirect-boundary"),
     pytest.param(repro.provider_unbounded_read, "F09", "provider response size must be bounded during read", id="F09-provider-read-bound"),
