@@ -150,6 +150,21 @@ CREATE TABLE IF NOT EXISTS mutation_recoveries (
 );
 CREATE INDEX IF NOT EXISTS idx_recoveries_goal ON mutation_recoveries(goal_id, status);
 CREATE INDEX IF NOT EXISTS idx_recoveries_task ON mutation_recoveries(task_id, step_index);
+CREATE TABLE IF NOT EXISTS mutation_intents (
+    intent_id   TEXT PRIMARY KEY,
+    task_id     TEXT NOT NULL,
+    step_index  INTEGER NOT NULL,
+    attempt     INTEGER NOT NULL,
+    capability  TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    resource    TEXT,
+    status      TEXT NOT NULL,
+    outcome     TEXT,
+    created_at  TEXT NOT NULL,
+    settled_at  TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_intents_task_step ON mutation_intents(task_id, step_index);
+CREATE INDEX IF NOT EXISTS idx_intents_status ON mutation_intents(status);
 CREATE TABLE IF NOT EXISTS mutation_locks (
     lock_id      TEXT PRIMARY KEY,
     resource_kind TEXT NOT NULL,
@@ -1505,6 +1520,94 @@ class SQLiteStorage:
         except Exception:
             self._conn.rollback()
             raise
+
+    # ---- durable mutation-intent journal (issue #23 / F10) ----
+
+    _INTENT_COLS = (
+        "intent_id", "task_id", "step_index", "attempt", "capability",
+        "action", "resource", "status", "outcome", "created_at", "settled_at",
+    )
+
+    @_threadsafe
+    def record_mutation_intent(self, intent: "MutationIntent") -> "MutationIntent":
+        """Durably journal one replay-unsafe mutation BEFORE dispatch.
+
+        One row per (task_id, step_index) for the lifetime of the step: a
+        duplicate is refused (fail closed) because replay-unsafe work may
+        dispatch at most once - a second journal entry would mean an
+        unsettled dispatch is being replayed blindly.
+        """
+        from arion.state.intents import MutationIntentError
+
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                "SELECT intent_id, status FROM mutation_intents "
+                "WHERE task_id=? AND step_index=?",
+                (intent.task_id, intent.step_index),
+            ).fetchone()
+            if row is not None:
+                self._conn.commit()
+                raise MutationIntentError(
+                    f"mutation intent already journaled for task {intent.task_id} "
+                    f"step {intent.step_index} (refusing duplicate dispatch)"
+                )
+            self._conn.execute(
+                "INSERT INTO mutation_intents "
+                f"({', '.join(self._INTENT_COLS)}) "
+                f"VALUES ({', '.join('?' * len(self._INTENT_COLS))})",
+                (
+                    intent.intent_id, intent.task_id, intent.step_index,
+                    intent.attempt, intent.capability, intent.action,
+                    intent.resource, intent.status, intent.outcome,
+                    intent.created_at, intent.settled_at,
+                ),
+            )
+            self._conn.commit()
+            return intent
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_threadsafe
+    def settle_mutation_intent(
+        self, task_id: str, step_index: int, outcome: str,
+        now: str | None = None,
+    ) -> int:
+        """Close open intent rows for one (task, step) with a durable
+        outcome.  Idempotent: already-settled rows are left untouched.
+        The durable task snapshot stays authoritative; this row state is
+        bookkeeping for open-intent queries."""
+        cursor = self._conn.execute(
+            "UPDATE mutation_intents SET status='settled', outcome=?, "
+            "settled_at=? WHERE task_id=? AND step_index=? "
+            "AND status='in_flight'",
+            (outcome, now or utcnow(), task_id, step_index),
+        )
+        self._conn.commit()
+        return cursor.rowcount
+
+    @_threadsafe
+    def list_mutation_intents(
+        self, task_id: str | None = None, open_only: bool = False,
+    ) -> list["MutationIntent"]:
+        from arion.state.intents import MutationIntent
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if open_only:
+            clauses.append("status = 'in_flight'")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT {', '.join(self._INTENT_COLS)} FROM mutation_intents {where} "
+            "ORDER BY created_at DESC, rowid DESC",
+            params,
+        ).fetchall()
+        return [MutationIntent.from_dict(dict(zip(self._INTENT_COLS, row)))
+                for row in rows]
 
     # ---- advisory mutation locks (ADR-021) ----
 

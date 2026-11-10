@@ -40,6 +40,13 @@ from arion.capabilities.registry import (
 from arion.cognition.goals import GoalPlanLineageError
 from arion.state.approvals import ApprovalError, ApprovalRequest, ApprovalStatus, ApprovalStore
 from arion.state.locks import GOAL_RUN_RESOURCE_KIND
+from arion.state.intents import (
+    MutationIntent,
+    MutationIntentError,
+    OUTCOME_FAILED,
+    OUTCOME_RECOVERY,
+    OUTCOME_SUCCEEDED,
+)
 from arion.state.recovery import MutationRecovery, RecoveryError, RecoveryStatus
 from arion.state.scheduler_work import SchedulerStateError, SchedulerWorkStatus
 from arion.intelligence.plan_schema import PlanValidationError
@@ -512,6 +519,9 @@ class ArionEngine:
                 if canonical is not None:
                     task.__dict__.update(canonical.__dict__)
 
+        # Issue #23 / F10: a durable recovery record IS the settlement of an
+        # uncertain mutation - close the intent row (bookkeeping).
+        self._settle_mutation_intents(task.id, step, OUTCOME_RECOVERY)
         if created:
             self._emit("recovery.required", task_id=task.id, step_id=_step_id(step),
                        success=False, detail={
@@ -606,6 +616,126 @@ class ArionEngine:
             except Exception:
                 pass
         return self.recovery_store.get_recovery(recovery_id)
+
+    # ---------- durable mutation intents / crash integrity (issue #23 / F10) ----------
+
+    def _persist_mutation_intent(self, task: Task, step: PlanStep, spec) -> None:
+        """Durably journal a replay-unsafe mutation BEFORE dispatch.
+
+        Called immediately before the capability is invoked for a mutating,
+        non-retry-safe action.  Any failure here fails CLOSED: the capability
+        never executes, so no side effect exists and no recovery record is
+        required (same contract as a refused mutation lock)."""
+        recorder = getattr(self.storage, "record_mutation_intent", None)
+        if not callable(recorder):
+            raise MutationIntentError(
+                "storage has no durable mutation-intent journal"
+            )
+        resource = (
+            step.params.get(spec.resource_param)
+            if getattr(spec, "resource_param", None) else None
+        )
+        recorder(MutationIntent(
+            intent_id=new_id("intent"),
+            task_id=task.id,
+            step_index=step.index,
+            attempt=step.attempts,
+            capability=step.capability,
+            action=step.action,
+            resource=resource if isinstance(resource, str) else None,
+        ))
+
+    def _settle_mutation_intents(
+        self, task_id: str, step: PlanStep, outcome: str,
+    ) -> None:
+        """Best-effort bookkeeping: close the intent row once the outcome is
+        durable.  The in-doubt fence treats a durable terminal step (or a
+        recovery record) as authoritative settlement regardless of row
+        state, so a failure here is never unsafe."""
+        settler = getattr(self.storage, "settle_mutation_intent", None)
+        if not callable(settler):
+            return
+        try:
+            settler(task_id=task_id, step_index=step.index, outcome=outcome)
+        except Exception:
+            pass
+
+    def _in_doubt_steps(self, task: Task, step: PlanStep | None = None) -> list[PlanStep]:
+        """Return replay-unsafe steps whose mutation intent is unsettled.
+
+        An open (in_flight) intent with no durable terminal step outcome
+        means the process died in the side-effect/persistence window: the
+        mutation MAY already have applied.  Retry-safe actions are excluded
+        (replay is their declared contract).  An unreadable journal fails
+        closed - uncertainty about dispatch state fences, never replays."""
+        if self.recovery_store is None:
+            return []
+        lister = getattr(self.storage, "list_mutation_intents", None)
+        if not callable(lister):
+            return []  # stores without a journal never dispatched one
+        candidates = [step] if step is not None else list(task.steps)
+        terminal = (
+            StepStatus.SUCCEEDED, StepStatus.FAILED, StepStatus.SKIPPED
+        )
+        try:
+            open_rows = lister(task_id=task.id, open_only=True)
+        except Exception:
+            # Fail closed: classify every replay-unsafe non-terminal step as
+            # in doubt when dispatch state cannot be verified.
+            open_rows = None
+        open_steps = (
+            {row.step_index for row in open_rows}
+            if open_rows is not None else None
+        )
+        in_doubt: list[PlanStep] = []
+        for candidate in candidates:
+            if candidate.status in terminal:
+                continue
+            if open_steps is not None and candidate.index not in open_steps:
+                continue
+            spec = self.registry.action_spec(
+                candidate.capability, candidate.action
+            )
+            if spec is None:
+                # Unsettled dispatch of an unclassifiable action: replay
+                # safety cannot be proven -> fence.
+                in_doubt.append(candidate)
+                continue
+            if getattr(spec, "retry_safe", False):
+                continue  # replay after a crash is the declared contract
+            if not is_mutating(spec):
+                continue
+            in_doubt.append(candidate)
+        return in_doubt
+
+    def _fence_task_on_in_doubt_mutation(
+        self, task: Task, step: PlanStep | None = None,
+    ) -> bool:
+        """Fence in-doubt replay-unsafe mutations into recovery (issue #23).
+
+        A hard crash between side effect and outcome persistence leaves the
+        mutation uncertain.  Blind replay could duplicate a non-retry-safe
+        append; instead each in-doubt step gets a durable REQUIRED recovery
+        record and the task fails closed until an operator acknowledges it
+        (ADR-020 semantics).  Returns True when at least one step fenced."""
+        if task.status in TASK_TERMINAL_STATUSES or self.recovery_store is None:
+            return False
+        fenced = False
+        for candidate in self._in_doubt_steps(task, step=step):
+            spec = self.registry.action_spec(
+                candidate.capability, candidate.action
+            )
+            reason = (
+                "in-doubt non-retry-safe mutation after interruption "
+                "(intent journaled, outcome unknown); recovery required "
+                "instead of blind replay"
+            )
+            self._record_recovery_required(task, candidate, spec, reason)
+            self._settle_mutation_intents(
+                task.id, candidate, OUTCOME_RECOVERY
+            )
+            fenced = True
+        return fenced
 
     # ---------- per-goal run ownership (ADR-045/052) ----------
 
@@ -2925,6 +3055,13 @@ class ArionEngine:
         if self._fence_task_on_open_recovery(task):
             return task
 
+        # Issue #23 / F10: a journaled mutation intent without a durable
+        # outcome means the side effect may already exist (hard crash in the
+        # side-effect/persistence window).  Fence into recovery - never
+        # blindly replay a non-retry-safe mutation.
+        if self._fence_task_on_in_doubt_mutation(task):
+            return task
+
         if not task.steps:
             task = self._plan(task, goal_run_claim=goal_run_claim)
             if self._goal_is_paused(task):
@@ -2989,6 +3126,8 @@ class ArionEngine:
                     task, phase="execution dispatch"):
                 return task
             if self._fence_task_on_open_recovery(task):
+                return task
+            if self._fence_task_on_in_doubt_mutation(task):
                 return task
 
             pending = [i for i, st in enumerate(task.steps) if st.status == StepStatus.PENDING]
@@ -3235,6 +3374,9 @@ class ArionEngine:
                     results[tid] = task
                     continue
                 if self._fence_task_on_open_recovery(task):
+                    results[tid] = task
+                    continue
+                if self._fence_task_on_in_doubt_mutation(task):
                     results[tid] = task
                     continue
                 if not task.steps:
@@ -4280,6 +4422,15 @@ class ArionEngine:
                         task.__dict__.update(durable.__dict__)
                 except BaseException as exc:
                     persistence_error = exc
+            # Issue #23 / F10: terminal outcome persisted (or adopted) above,
+            # so the mutation-intent journal row can be closed (bookkeeping).
+            if step.status in (
+                    StepStatus.SUCCEEDED, StepStatus.FAILED, StepStatus.SKIPPED):
+                self._settle_mutation_intents(
+                    task.id, step,
+                    OUTCOME_SUCCEEDED if step.status == StepStatus.SUCCEEDED
+                    else OUTCOME_FAILED,
+                )
 
             if work_id is not None and self.scheduler_registry is not None:
                 terminal = (
@@ -4317,6 +4468,12 @@ class ArionEngine:
     ) -> None:
         if not self._goal_run_allows_task(
                 task, goal_run_claim, "capability pipeline"):
+            return
+        # Issue #23 / F10 choke point: NEVER re-dispatch a replay-unsafe
+        # mutation whose journaled intent is unsettled.  A crash between the
+        # side effect and outcome persistence leaves the step in doubt; it
+        # fences into recovery here instead of being replayed blindly.
+        if self._fence_task_on_in_doubt_mutation(task, step=step):
             return
         self._emit(
             "step.started",
@@ -4824,6 +4981,16 @@ class ArionEngine:
                 self._release_mutation_lock(lock, task, step)
                 if persistence_error is not None:
                     raise persistence_error
+            # Issue #23 / F10: once the terminal step outcome is durable,
+            # close the mutation-intent journal row (bookkeeping; the fence
+            # treats the durable snapshot as authoritative regardless).
+            if step.status in (
+                    StepStatus.SUCCEEDED, StepStatus.FAILED, StepStatus.SKIPPED):
+                self._settle_mutation_intents(
+                    task.id, step,
+                    OUTCOME_SUCCEEDED if step.status == StepStatus.SUCCEEDED
+                    else OUTCOME_FAILED,
+                )
 
     def _execute_attempts(
         self,
@@ -4847,6 +5014,27 @@ class ArionEngine:
                 return
             step.attempts += 1
             step.status = StepStatus.RUNNING
+            if mutating and not spec.retry_safe:
+                # Issue #23 / F10: durably journal the mutation intent BEFORE
+                # dispatch.  A hard crash after the side effect but before the
+                # outcome is persisted leaves this row open, and the resume
+                # path fences it into recovery instead of replaying blindly.
+                # If the journal cannot be written, the capability NEVER
+                # executes (fail closed) and no side effect exists.
+                try:
+                    self._persist_mutation_intent(task, step, spec)
+                except Exception as exc:
+                    step.status = StepStatus.FAILED
+                    step.result = None
+                    step.error = sanitize_error_text(
+                        f"mutation intent persistence failed closed: {exc}",
+                        max_length=500,
+                    )
+                    self._emit(
+                        "error", task_id=task.id, step_id=_step_id(step),
+                        success=False, detail={"error": step.error},
+                    )
+                    return
             if mutating:
                 self._emit("mutation.attempted", task_id=task.id, step_id=_step_id(step), detail={
                     "capability": getattr(capability, "name", step.capability),
