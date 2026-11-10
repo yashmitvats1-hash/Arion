@@ -10,6 +10,11 @@ Security:
   filesystem operations applies at the policy layer;
 - the repo path is resolved against the sandbox root and must stay inside it
   (symlink-safe), enforced by the capability itself;
+- EVERY git metadata path (.git, HEAD, logs, refs, packed-refs, individual
+  ref files) is validated before reading: symlinked metadata components are
+  refused and the final resolved path must stay inside the sandbox root
+  (F05: a planted ``.git``/``HEAD``/``logs``/``refs`` symlink must never
+  expose bytes from outside the sandbox);
 - read-only by construction (no writes, no subprocess).
 
 Actions:
@@ -85,12 +90,72 @@ class GitLogCapability:
             raise CapabilityError(f"path escapes sandbox: {rel_repo!r}") from exc
         return candidate
 
+    def _contain_final(self, candidate: Path, label: str) -> Path:
+        """Resolve the FINAL metadata path and require it to stay inside the
+        sandbox root.  This closes the F05 escape: appending ``.git`` (or
+        ``HEAD``/``logs``/``refs``/...) after resolving only ``repo`` left the
+        appended components free to be symlinks pointing outside."""
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(self.sandbox_root)
+        except ValueError as exc:
+            raise CapabilityError(
+                f"git metadata path escapes sandbox: {label!r}"
+            ) from exc
+        return resolved
+
+    def _metadata_path(self, git: Path, *parts: str) -> Path:
+        """Build one git metadata path component by component.
+
+        Every existing component must be a REAL file or directory - a
+        symlink anywhere in the chain is refused outright (``.git``, ``HEAD``,
+        ``logs``, ``refs`` and friends are git-owned metadata, never links in
+        a healthy repository).  The final resolved path is also contained
+        inside the sandbox root (defense in depth)."""
+        candidate = git
+        for part in parts:
+            candidate = candidate / part
+            if candidate.is_symlink():
+                raise CapabilityError(
+                    f"git metadata path is a symlink (refused): "
+                    f"{'/'.join(parts)!r}"
+                )
+        return self._contain_final(candidate, "/".join(parts) or ".")
+
     def _git_dir(self, rel_repo: str) -> Path:
         repo = self._resolve_inside(rel_repo)
         git = repo / ".git"
+        if git.is_symlink():
+            raise CapabilityError(
+                f"git metadata directory is a symlink (refused): {rel_repo!r}"
+            )
         if not git.is_dir():
             raise CapabilityError(f"not a git repository: {rel_repo!r}")
-        return git
+        return self._contain_final(git, ".git")
+
+    def _iter_ref_files(self, heads: Path):
+        """Yield real (non-symlink) ref files below ``refs/heads``.
+
+        The walk never follows symlinks: a symlinked directory or ref file is
+        refused instead of traversed, so enumeration cannot leave the
+        contained metadata tree."""
+        stack = [heads]
+        while stack:
+            directory = stack.pop()
+            try:
+                entries = sorted(directory.iterdir())
+            except OSError as exc:
+                raise CapabilityError(f"git refs unreadable: {exc}") from exc
+            for entry in entries:
+                if entry.is_symlink():
+                    raise CapabilityError(
+                        f"git metadata path is a symlink (refused): "
+                        f"{entry.name!r}"
+                    )
+                if entry.is_dir():
+                    stack.append(entry)
+                elif entry.is_file():
+                    yield entry
 
     # ------------------------------------------------------------------ #
     # actions
@@ -112,7 +177,7 @@ class GitLogCapability:
             raise CapabilityError("'limit' must be a positive integer")
         git = self._git_dir(rel)
         current_branch = self._current_branch(git)
-        reflog = git / "logs" / "HEAD"
+        reflog = self._metadata_path(git, "logs", "HEAD")
         commits: list[dict[str, Any]] = []
         if reflog.is_file():
             lines = reflog.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -150,14 +215,13 @@ class GitLogCapability:
             raise CapabilityError("branches requires string param 'repo'")
         git = self._git_dir(rel)
         branches: list[dict[str, str]] = []
-        heads = git / "refs" / "heads"
+        heads = self._metadata_path(git, "refs", "heads")
         if heads.is_dir():
-            for ref in sorted(heads.rglob("*")):
-                if ref.is_file():
-                    sha = ref.read_text(encoding="utf-8", errors="replace").strip()
-                    if sha:
-                        branches.append({"name": str(ref.relative_to(heads)), "sha": sha})
-        packed = git / "packed-refs"
+            for ref in self._iter_ref_files(heads):
+                sha = ref.read_text(encoding="utf-8", errors="replace").strip()
+                if sha:
+                    branches.append({"name": str(ref.relative_to(heads)), "sha": sha})
+        packed = self._metadata_path(git, "packed-refs")
         if packed.is_file():
             for line in packed.read_text(encoding="utf-8", errors="replace").splitlines():
                 line = line.strip()
@@ -179,7 +243,7 @@ class GitLogCapability:
         }
 
     def _current_branch(self, git: Path) -> str | None:
-        head = git / "HEAD"
+        head = self._metadata_path(git, "HEAD")
         if not head.is_file():
             return None
         content = head.read_text(encoding="utf-8", errors="replace").strip()
