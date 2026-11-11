@@ -14,6 +14,14 @@ filesystem.write is the ONLY write path in Arion:
   planted ``.<name>.arion-write-tmp`` symlink - or any pre-existing entry at
   that name - can never redirect the write; occupied temp paths fail closed
   and are left untouched;
+- directory-relative containment (F05/F06 second pass): every filesystem
+  operation runs through held directory descriptors (``dirfs``) -
+  parent components are opened ``O_NOFOLLOW|O_DIRECTORY`` from the root, so
+  a component swapped for a symlink after validation is refused, never
+  followed; publish is atomic (``os.link`` - never replaces - for
+  ``overwrite=false``; ``os.rename`` - atomic name replace that never
+  follows symlinks - for ``overwrite=true``), and staging cleanup is
+  identity-gated;
 - deterministic verification contract: returns the exact byte size so the
   engine can confirm the postcondition without another mutation.
 
@@ -28,6 +36,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from arion.capabilities import dirfs
 from arion.capabilities.registry import ActionSpec, CapabilityError
 
 _MAX_WRITE_BYTES = 1_000_000  # 1 MB content cap (hard default, configurable)
@@ -105,58 +114,75 @@ class FilesystemWriteCapability:
             )
         overwrite = bool(params.get("overwrite", False))
 
+        # Symlink-safe containment check (unchanged messages are part of the
+        # capability contract: "path escapes sandbox").  `.resolve()` follows
+        # links, so an outside-pointing link fails closed here exactly as it
+        # always has.  The I/O below never re-enters the path namespace by
+        # name - it runs through held directory descriptors (``dirfs``).
         target = self._resolve_inside(rel)
-        if target.exists() and not overwrite:
-            raise CapabilityError(
-                f"target already exists and overwrite was not requested: {rel!r}"
-            )
-        # Atomic-ish bounded write: parents created on demand, file replaced
-        # only after the write succeeds (never a partial overwrite of a
-        # pre-existing file via truncate-then-fail paths).
-        #
-        # F06: the staging file is created EXCLUSIVELY and with no-follow
-        # semantics.  ``O_CREAT|O_EXCL`` refuses an existing entry of ANY
-        # kind - including a planted ``.<name>.arion-write-tmp`` symlink -
-        # so a predictable temp name can never redirect the bytes outside
-        # the sandbox; ``O_NOFOLLOW`` is kept as defense in depth.  An
-        # occupied temp path fails closed and is left exactly as found.
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_name(f".{target.name}.arion-write-tmp")
-        flags = (
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            | getattr(os, "O_NOFOLLOW", 0)
+        rel_parts = dirfs.normalize_rel_parts(rel)
+        dirfs.require_secure_primitives()
+
+        parent_fd, leaf = dirfs.open_contained_parent(
+            self.sandbox_root, rel_parts, create=True,
         )
-        fd: int | None = None
-        created = False
         try:
-            try:
-                fd = os.open(tmp, flags, 0o600)
-            except FileExistsError as exc:
+            # Fast path preserving the long-standing error contract.  The
+            # atomic no-replace publish below additionally closes the race
+            # where a concurrent creator wins BETWEEN this check and the
+            # publish (overwrite=false can never clobber it).
+            if not overwrite and dirfs.name_identity(parent_fd, leaf) is not None:
                 raise CapabilityError(
-                    f"temporary write path is occupied (refusing to follow "
-                    f"or reuse it): {tmp.name!r}"
-                ) from exc
-            created = True
-            view = memoryview(data)
-            while view:
-                written = os.write(fd, view)
-                view = view[written:]
-            os.close(fd)
-            fd = None
-            os.replace(tmp, target)
-        finally:
-            if fd is not None:
+                    f"target already exists and overwrite was not requested: "
+                    f"{rel!r}"
+                )
+            staging = f".{leaf}.arion-write-tmp"
+            # F06: EXCLUSIVE no-follow creation - any pre-existing entry at
+            # the staging name (planted symlink or plain file) fails closed
+            # and is left exactly as found.  Cleanup is identity-gated: only
+            # the exact file created here is ever unlinked.
+            fd = dirfs.open_staging(parent_fd, staging)
+            # The staging descriptor is held until AFTER the identity-gated
+            # cleanup: an open descriptor pins the inode, so a name swapped
+            # for an innocent file can never alias it (see
+            # dirfs.file_identity).  Only the exact file created here is
+            # ever unlinked.
+            identity = dirfs.file_identity(fd)
+            try:
+                dirfs.write_all(fd, data)
+                try:
+                    if overwrite:
+                        # Atomic replace of the NAME; a leaf swapped for a
+                        # symlink has the symlink itself replaced - its
+                        # target is never opened or written.
+                        dirfs.publish_replace(parent_fd, staging, leaf)
+                    else:
+                        # Atomic no-replace publish (hard link): a
+                        # concurrent creator of `leaf` wins and is never
+                        # clobbered.
+                        try:
+                            dirfs.publish_no_overwrite(parent_fd, staging, leaf)
+                        except FileExistsError as exc:
+                            raise CapabilityError(
+                                f"target already exists and overwrite was not "
+                                f"requested: {rel!r}"
+                            ) from exc
+                finally:
+                    dirfs.cleanup_staging(parent_fd, staging, identity)
+            finally:
                 try:
                     os.close(fd)
                 except OSError:
                     pass
-            # Only OUR staging file is ever cleaned up; a planted entry at
-            # the temp name is left untouched (created stays False).
-            if created:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+        except CapabilityError:
+            raise
+        except OSError as exc:
+            raise CapabilityError(f"write failed: {exc}") from exc
+        finally:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
         return {
             "written": True,
             "path": str(rel),

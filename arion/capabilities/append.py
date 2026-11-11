@@ -9,6 +9,11 @@ Appends plain text to a sandboxed, repo-relative file:
 - NO shell, NO subprocess, NO os.system - pure Path I/O;
 - strict containment: the resolved path must stay inside the sandbox root
   (symlink escapes and ``../`` traversal are resolved away and rejected);
+- directory-relative containment (F05/F06 second pass): the append runs
+  through held directory descriptors (``dirfs``) - parent components are
+  opened ``O_NOFOLLOW|O_DIRECTORY`` from the root, and the target itself is
+  opened ``O_NOFOLLOW`` through the parent descriptor - so a component or
+  leaf swapped for a symlink after validation is refused, never followed;
 - deterministic verification contract: reports prior_size / appended_bytes /
   size so the engine can confirm the postcondition without another mutation.
 
@@ -19,9 +24,11 @@ orchestration authorization layer (scope/boundary/risk/approval), never here.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
+from arion.capabilities import dirfs
 from arion.capabilities.registry import ActionSpec, CapabilityError
 
 _MAX_APPEND_BYTES = 1_000_000  # 1 MB content cap (hard default, configurable)
@@ -100,6 +107,11 @@ class FilesystemAppendCapability:
             )
         create = bool(params.get("create", False))
 
+        # Symlink-safe containment check (unchanged messages are part of the
+        # capability contract: "path escapes sandbox").  Actual I/O below
+        # never re-enters the path namespace by name - it runs through held
+        # directory descriptors (``dirfs``), so a path component or leaf
+        # swapped for a symlink after this check is refused, never followed.
         target = self._resolve_inside(rel)
         if target.is_dir():
             raise CapabilityError(f"not a file: {rel!r}")
@@ -108,14 +120,45 @@ class FilesystemAppendCapability:
                 raise CapabilityError(
                     f"target does not exist and create was not requested: {rel!r}"
                 )
-            target.parent.mkdir(parents=True, exist_ok=True)
-        prior_size = target.stat().st_size if target.exists() else 0
+        rel_parts = dirfs.normalize_rel_parts(rel)
+        dirfs.require_secure_primitives()
+        parent_fd, leaf = dirfs.open_contained_parent(
+            self.sandbox_root, rel_parts, create=create,
+        )
         try:
-            with target.open("ab") as fh:
-                fh.write(data)
-                fh.flush()
-        except OSError as exc:
-            raise CapabilityError(f"append failed: {exc}") from exc
+            flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW
+            if create:
+                flags |= os.O_CREAT
+            try:
+                # O_APPEND positions every write atomically at the end
+                # (same semantics as open("ab")); O_NOFOLLOW refuses a
+                # leaf swapped for a symlink instead of appending through
+                # it.  0o666 matches the historical open("ab") creation
+                # mode (umask applies).
+                fd = os.open(leaf, flags, 0o666, dir_fd=parent_fd)
+            except FileNotFoundError as exc:
+                raise CapabilityError(
+                    f"target does not exist and create was not requested: {rel!r}"
+                ) from exc
+            except OSError as exc:
+                raise CapabilityError(f"append failed: {exc}") from exc
+            try:
+                # Size BEFORE the append, taken from the held descriptor
+                # (immune to name swaps between stat and open).
+                prior_size = os.fstat(fd).st_size
+                dirfs.write_all(fd, data)
+            except OSError as exc:
+                raise CapabilityError(f"append failed: {exc}") from exc
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        finally:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
         return {
             "appended": True,
             "path": str(rel),
