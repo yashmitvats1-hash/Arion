@@ -1,5 +1,7 @@
 # ADR-020 — filesystem.append + Mutation Recovery Fencing
 
+- **Amended by ADR-064 (issue #23 F10):** "each task attempts its mutation at most once" is enforced by the in-doubt mutation fence (mutation-intent journal); `append_verified` is size arithmetic, not a duplicate-execution detector.
+
 - **Status:** Approved & implemented (2026-08-09)
 - **Deciders:** ChatGPT (architect/manager), Arena AI (engineering agent)
 
