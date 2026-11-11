@@ -15,6 +15,12 @@ Security:
   refused and the final resolved path must stay inside the sandbox root
   (F05: a planted ``.git``/``HEAD``/``logs``/``refs`` symlink must never
   expose bytes from outside the sandbox);
+- worktree indirection is UNSUPPORTED and fails closed: a worktree-style
+  ``.git`` regular FILE containing a ``gitdir:`` pointer is not a metadata
+  directory, so any request touching it is refused ("not a git repository")
+  and the pointer is NEVER dereferenced - whether it points outside the
+  sandbox or inside it.  True linked worktrees (``.git/worktrees/<name>``
+  metadata directories) remain supported as real directories only;
 - read-only by construction (no writes, no subprocess).
 
 Actions:
@@ -123,6 +129,15 @@ class GitLogCapability:
         return self._contain_final(candidate, "/".join(parts) or ".")
 
     def _git_dir(self, rel_repo: str) -> Path:
+        """Locate the repository's real ``.git`` metadata directory.
+
+        Only a real directory named ``.git`` qualifies.  A worktree-style
+        ``.git`` regular FILE (``gitdir:`` pointer indirection) is
+        UNSUPPORTED: it is not a metadata directory, the request fails
+        closed with "not a git repository", and the pointer is never
+        dereferenced - inside-pointing and outside-pointing pointers alike
+        (regression-tested in ``tests/test_git_worktree_indirection.py``).
+        """
         repo = self._resolve_inside(rel_repo)
         git = repo / ".git"
         if git.is_symlink():
