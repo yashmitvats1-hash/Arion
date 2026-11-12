@@ -180,32 +180,48 @@ def normalize_rel_parts(rel: str) -> tuple[str, ...]:
     return parts
 
 
-def open_staging(parent_fd: int, staging: str) -> int:
-    """Create ``staging`` EXCLUSIVELY and no-follow inside ``parent_fd``.
+def open_staging(parent_fd: int, leaf: str, attempts: int = 3) -> Tuple[int, str]:
+    """Create an EXCLUSIVE, no-follow staging file beside ``leaf`` under an
+    UNPREDICTABLE name.
 
-    ``O_EXCL`` refuses an existing entry of ANY kind - including a planted
-    symlink at the predictable staging name - so the name can never redirect
-    the bytes; ``O_NOFOLLOW`` is defense in depth.  An occupied staging name
-    fails closed and is left exactly as found.  Mode 0o600 keeps content
-    private between creation and the atomic publish.
+    The random name closes two vulnerabilities of the fixed
+    ``.<leaf>.arion-write-tmp`` name (issue #23 third-pass reviews):
+
+    - *crash-orphan*: a fixed name meant one crash mid-write left an orphan
+      that made every later write to that target fail closed forever (DoS
+      plus stale-payload debris).  Random names never collide with an old
+      orphan, so a later write is never blocked by it; orphans themselves
+      are left untouched (never cleaned - see the cleanup identity gate).
+    - *staging inode substitution*: the name is unknown until the file
+      exists, ``O_EXCL`` refuses any pre-existing entry, and every later
+      publish/cleanup re-verifies the entry's identity against the held
+      descriptor (see ``identity_matches``).  A pre-existing entry at ANY
+      name is never reused, followed or touched - the generator simply
+      draws another name and fails closed after ``attempts`` collisions.
     """
     require_secure_primitives()
-    try:
-        return os.open(
-            staging,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=parent_fd,
-        )
-    except FileExistsError as exc:
-        raise CapabilityError(
-            f"temporary write path is occupied (refusing to follow "
-            f"or reuse it): {staging!r}"
-        ) from exc
-    except OSError as exc:
-        raise CapabilityError(
-            f"cannot create staging file {staging!r}: {exc}"
-        ) from exc
+    last_exc: Optional[Exception] = None
+    for _ in range(max(1, attempts)):
+        staging = f".{leaf}.{os.urandom(8).hex()}.arion-write-tmp"
+        try:
+            fd = os.open(
+                staging,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            return fd, staging
+        except FileExistsError as exc:
+            last_exc = exc  # never reuse an existing entry; draw another name
+            continue
+        except OSError as exc:
+            raise CapabilityError(
+                f"cannot create staging file for {leaf!r}: {exc}"
+            ) from exc
+    raise CapabilityError(
+        f"temporary write path is occupied after {attempts} attempts "
+        f"(refusing to follow or reuse any entry): {last_exc}"
+    ) from last_exc
 
 
 def file_identity(fd: int) -> Tuple[int, int]:
@@ -232,6 +248,18 @@ def name_identity(parent_fd: int, name: str) -> Optional[Tuple[int, int]]:
     return (st.st_dev, st.st_ino)
 
 
+def identity_matches(
+    parent_fd: int, name: str, identity: Tuple[int, int],
+) -> bool:
+    """True while ``name`` still is the exact file that produced ``identity``.
+
+    ``identity`` must come from a descriptor that is STILL OPEN (see
+    ``file_identity``) - only then can the recorded inode not have been
+    freed and reused by an innocent file in the meantime.
+    """
+    return name_identity(parent_fd, name) == identity
+
+
 def unlink_if_identity(
     parent_fd: int, name: str, identity: Tuple[int, int],
 ) -> bool:
@@ -246,7 +274,7 @@ def unlink_if_identity(
     hard guarantee is containment and no-overwrite publish.  Returns True
     when the staging file was removed.
     """
-    if name_identity(parent_fd, name) != identity:
+    if not identity_matches(parent_fd, name, identity):
         return False
     try:
         os.unlink(name, dir_fd=parent_fd)
@@ -266,16 +294,24 @@ def write_all(fd: int, data: bytes) -> None:
 
 
 def publish_no_overwrite(
-    parent_fd: int, staging: str, leaf: str,
+    parent_fd: int, staging: str, leaf: str, identity: Tuple[int, int],
 ) -> None:
     """Atomically publish ``staging`` as ``leaf`` WITHOUT replacing anything.
 
     ``os.link`` never replaces an existing name: a concurrent creator of
     ``leaf`` wins and this raises ``FileExistsError``.  Both names are used
     through the held parent descriptor, so neither can be redirected by a
-    path-component substitution.
+    path-component substitution.  The staging entry's identity is
+    re-verified against the caller's held descriptor first: a staging name
+    substituted for an innocent file after creation is refused, never
+    published (issue #23 third-pass review - staging inode substitution).
     """
     require_secure_primitives()
+    if not identity_matches(parent_fd, staging, identity):
+        raise CapabilityError(
+            f"staging file {staging!r} was substituted after creation "
+            f"(refusing to publish it)"
+        )
     os.link(
         staging,
         leaf,
@@ -285,15 +321,24 @@ def publish_no_overwrite(
     )
 
 
-def publish_replace(parent_fd: int, staging: str, leaf: str) -> None:
+def publish_replace(
+    parent_fd: int, staging: str, leaf: str, identity: Tuple[int, int],
+) -> None:
     """Atomically publish ``staging`` as ``leaf``, replacing the name.
 
     ``os.rename`` (same semantics as ``os.replace`` on POSIX) atomically
     replaces the destination NAME and never follows symlinks: a leaf that
     was swapped for a symlink has the symlink itself replaced - its target
-    is never opened or written.
+    is never opened or written.  The staging entry's identity is
+    re-verified against the caller's held descriptor first (see
+    ``publish_no_overwrite``).
     """
     require_secure_primitives()
+    if not identity_matches(parent_fd, staging, identity):
+        raise CapabilityError(
+            f"staging file {staging!r} was substituted after creation "
+            f"(refusing to publish it)"
+        )
     os.rename(staging, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
 
 

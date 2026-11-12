@@ -136,12 +136,14 @@ class FilesystemWriteCapability:
                     f"target already exists and overwrite was not requested: "
                     f"{rel!r}"
                 )
-            staging = f".{leaf}.arion-write-tmp"
-            # F06: EXCLUSIVE no-follow creation - any pre-existing entry at
-            # the staging name (planted symlink or plain file) fails closed
-            # and is left exactly as found.  Cleanup is identity-gated: only
-            # the exact file created here is ever unlinked.
-            fd = dirfs.open_staging(parent_fd, staging)
+            # F06 (hardened): EXCLUSIVE no-follow creation under an
+            # UNPREDICTABLE name - a crash-orphaned staging file can never
+            # block a later write, and no pre-existing entry is ever reused,
+            # followed or touched (entries at any name are left as found).
+            # Cleanup is identity-gated and publish re-verifies the staging
+            # identity against the held descriptor: only the exact file
+            # created here is ever published or unlinked.
+            fd, staging = dirfs.open_staging(parent_fd, leaf)
             # The staging descriptor is held until AFTER the identity-gated
             # cleanup: an open descriptor pins the inode, so a name swapped
             # for an innocent file can never alias it (see
@@ -155,13 +157,15 @@ class FilesystemWriteCapability:
                         # Atomic replace of the NAME; a leaf swapped for a
                         # symlink has the symlink itself replaced - its
                         # target is never opened or written.
-                        dirfs.publish_replace(parent_fd, staging, leaf)
+                        dirfs.publish_replace(parent_fd, staging, leaf, identity)
                     else:
                         # Atomic no-replace publish (hard link): a
                         # concurrent creator of `leaf` wins and is never
                         # clobbered.
                         try:
-                            dirfs.publish_no_overwrite(parent_fd, staging, leaf)
+                            dirfs.publish_no_overwrite(
+                                parent_fd, staging, leaf, identity,
+                            )
                         except FileExistsError as exc:
                             raise CapabilityError(
                                 f"target already exists and overwrite was not "

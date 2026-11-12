@@ -186,7 +186,7 @@ def test_concurrent_creator_wins_against_overwrite_false(
     cap = FilesystemWriteCapability(sb)
     real_publish = dirfs.publish_no_overwrite
 
-    def racing_publish(parent_fd, staging, leaf):
+    def racing_publish(parent_fd, staging, leaf, identity):
         # Simulate the concurrent creator winning at the last instant.
         fd = os.open(
             leaf,
@@ -196,7 +196,7 @@ def test_concurrent_creator_wins_against_overwrite_false(
         )
         os.write(fd, b"CONCURRENT")
         os.close(fd)
-        return real_publish(parent_fd, staging, leaf)
+        return real_publish(parent_fd, staging, leaf, identity)
 
     monkeypatch.setattr(dirfs, "publish_no_overwrite", racing_publish)
     with pytest.raises(CapabilityError, match="exists"):
@@ -247,11 +247,12 @@ def test_swapped_staging_name_never_cleaned_up(tmp_path, monkeypatch):
     created by this write is ever unlinked."""
     sb = _sandbox(tmp_path)
     cap = FilesystemWriteCapability(sb)
-    real_replace = dirfs.publish_replace
+    seen: list[str] = []
 
-    def swapping_failing_replace(parent_fd, staging, leaf):
+    def swapping_failing_replace(parent_fd, staging, leaf, identity):
         # Attacker swaps the staging name for a victim file, then the
         # publish fails (e.g. I/O error).
+        seen.append(staging)
         ident = dirfs.name_identity(parent_fd, staging)
         assert ident is not None
         os.unlink(staging, dir_fd=parent_fd)
@@ -269,7 +270,7 @@ def test_swapped_staging_name_never_cleaned_up(tmp_path, monkeypatch):
             "path": "report.txt", "content": "PAYLOAD", "overwrite": True,
         })
     monkeypatch.undo()
-    staging_path = sb / ".report.txt.arion-write-tmp"
+    staging_path = sb / seen[0]
     assert staging_path.read_text(encoding="utf-8") == "VICTIM_CONTENT"
     assert not (sb / "report.txt").exists()
 
@@ -278,7 +279,7 @@ def test_failed_publish_leaves_no_staging_residue(tmp_path, monkeypatch):
     sb = _sandbox(tmp_path)
     cap = FilesystemWriteCapability(sb)
 
-    def failing_replace(parent_fd, staging, leaf):
+    def failing_replace(parent_fd, staging, leaf, identity):
         raise OSError("disk full")
 
     monkeypatch.setattr(dirfs, "publish_replace", failing_replace)
@@ -289,6 +290,40 @@ def test_failed_publish_leaves_no_staging_residue(tmp_path, monkeypatch):
     monkeypatch.undo()
     leftovers = [p for p in sb.iterdir() if p.name.endswith(".arion-write-tmp")]
     assert leftovers == []
+    assert not (sb / "report.txt").exists()
+
+
+def test_staging_inode_substitution_refused_at_publish(tmp_path, monkeypatch):
+    """Named vulnerability (third-pass review): a victim file substituted
+    onto the staging name after creation must NEVER be published as our
+    write and NEVER destroyed - the identity re-verification inside the
+    publish refuses it, and the cleanup identity gate leaves it alone."""
+    sb = _sandbox(tmp_path)
+    cap = FilesystemWriteCapability(sb)
+    real_replace = dirfs.publish_replace
+
+    def substituting_replace(parent_fd, staging, leaf, identity):
+        # Attacker swaps an innocent victim file ONTO the staging name.
+        os.unlink(staging, dir_fd=parent_fd)
+        victim_fd = os.open(
+            staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644,
+            dir_fd=parent_fd,
+        )
+        os.write(victim_fd, b"VICTIM_CONTENT")
+        os.close(victim_fd)
+        return real_replace(parent_fd, staging, leaf, identity)
+
+    monkeypatch.setattr(dirfs, "publish_replace", substituting_replace)
+    with pytest.raises(CapabilityError, match="substituted"):
+        cap.execute("write", {
+            "path": "report.txt", "content": "PAYLOAD", "overwrite": True,
+        })
+    monkeypatch.undo()
+    # The victim survives at the staging name (never cleaned), was never
+    # published as the write result, and the target does not exist.
+    leftovers = [p for p in sb.iterdir() if p.name.endswith(".arion-write-tmp")]
+    assert len(leftovers) == 1
+    assert leftovers[0].read_text(encoding="utf-8") == "VICTIM_CONTENT"
     assert not (sb / "report.txt").exists()
 
 
