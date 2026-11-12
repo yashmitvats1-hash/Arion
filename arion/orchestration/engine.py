@@ -585,6 +585,14 @@ class ArionEngine:
         and the goal may plan again' - it cannot execute a capability, cannot
         grant authorization, cannot reuse or resurrect approvals, and cannot
         erase the mutation-failure history (the record + audit trail persist).
+
+        Fresh-authorization invariant (issue #23): acknowledgement is NOT
+        authorization for the next attempt.  The re-execution is a NEW task
+        that passes through the full live authorization pipeline - a FRESH
+        approval decision is solicited per execution attempt, and a denial
+        is honored (the mutation does not run).  The ack itself solicits no
+        approval and touches no file (regression-tested in
+        ``tests/test_recovery_ack_fresh_authorization.py``).
         """
         if self.recovery_store is None:
             raise RecoveryError("recovery registry is not available on this engine")

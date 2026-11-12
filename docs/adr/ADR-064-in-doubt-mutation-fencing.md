@@ -82,6 +82,17 @@ when the mechanism is missing, so a crash can never leave a side effect
 with no way to fence it.  A registry whose API is merely unreadable at
 resume time keeps the historical fail-closed verify behaviour.
 
+### Recovery acknowledgement is not authorization
+
+`acknowledge_recovery` records "the previous failed mutation has been
+handled" and unblocks the goal - nothing more.  It cannot execute a
+capability, cannot grant authorization, and cannot reuse or resurrect an
+approval.  The post-ack re-execution is a NEW task: a **fresh approval
+decision is solicited per execution attempt** through the live
+authorization pipeline, and a denial is honored (the mutation does not
+run).  The acknowledgement itself solicits no approval and touches no
+file.  Pinned in `tests/test_recovery_ack_fresh_authorization.py`.
+
 ### What is NOT claimed
 
 - **`append_verified` is a size-arithmetic postcondition only**
