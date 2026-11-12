@@ -50,10 +50,31 @@ from __future__ import annotations
 
 import os
 import posixpath
+import stat as stat_mod
 from pathlib import PurePosixPath
 from typing import Optional, Sequence, Tuple
 
 from arion.capabilities.registry import CapabilityError
+
+
+class ComponentSymlinkError(CapabilityError):
+    """A path component or leaf is a symlink; the boundary never follows.
+
+    Distinct from generic walk failures so callers can keep their own
+    symlink-refusal message contracts.  Note the kernel reports a symlinked
+    component under ``O_DIRECTORY|O_NOFOLLOW`` as ``ENOTDIR``/``ELOOP``
+    depending on the link's target, so the boundary distinguishes by
+    ``lstat`` at the failure site, not by errno alone.
+    """
+
+
+def is_symlink_at(parent_fd: int, name: str) -> bool:
+    try:
+        st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return stat_mod.S_ISLNK(st.st_mode)
+
 
 # The boundary never follows symlinks.  This module-wide constant documents
 # the choice; every operation below passes ``follow_symlinks=False`` or uses
@@ -150,11 +171,19 @@ def open_contained_parent(
                 try:
                     next_fd = os.open(name, _DIR_OPEN_FLAGS, dir_fd=fd)
                 except OSError as exc:
+                    if is_symlink_at(fd, name):
+                        raise ComponentSymlinkError(
+                            f"path component {name!r} is a symlink (refused)"
+                        ) from exc
                     raise CapabilityError(
                         f"path component {name} under {root} is not a "
                         f"secure directory: {exc}"
                     ) from exc
             except OSError as exc:
+                if is_symlink_at(fd, name):
+                    raise ComponentSymlinkError(
+                        f"path component {name!r} is a symlink (refused)"
+                    ) from exc
                 raise CapabilityError(
                     f"path component {name} under {root} is not a "
                     f"secure directory: {exc}"

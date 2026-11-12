@@ -14,7 +14,11 @@ Security:
   ref files) is validated before reading: symlinked metadata components are
   refused and the final resolved path must stay inside the sandbox root
   (F05: a planted ``.git``/``HEAD``/``logs``/``refs`` symlink must never
-  expose bytes from outside the sandbox);
+  expose bytes from outside the sandbox).  Reads are DESCRIPTOR-RELATIVE:
+  every metadata component is opened ``O_NOFOLLOW|O_DIRECTORY`` through
+  held directory descriptors and every file ``O_RDONLY|O_NOFOLLOW`` (the
+  ``dirfs`` boundary), so a component or leaf swapped for a symlink after
+  validation is refused, never followed;
 - worktree indirection is UNSUPPORTED and fails closed: a worktree-style
   ``.git`` regular FILE containing a ``gitdir:`` pointer is not a metadata
   directory, so any request touching it is refused ("not a git repository")
@@ -30,9 +34,13 @@ Actions:
 
 from __future__ import annotations
 
+import errno
+import os
+import stat as stat_mod
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, Optional, Tuple
 
+from arion.capabilities import dirfs
 from arion.capabilities.registry import ActionSpec, CapabilityError
 
 _MAX_REF_LINES = 500
@@ -110,23 +118,158 @@ class GitLogCapability:
             ) from exc
         return resolved
 
-    def _metadata_path(self, git: Path, *parts: str) -> Path:
-        """Build one git metadata path component by component.
+    # ------------------------------------------------------------------ #
+    # descriptor-relative metadata access (F05, second/third pass)
+    # ------------------------------------------------------------------ #
+    #
+    # Metadata READS never re-enter the path namespace by name: every
+    # component is opened O_NOFOLLOW|O_DIRECTORY from the sandbox root
+    # descriptor and every file O_RDONLY|O_NOFOLLOW through its parent
+    # descriptor (``dirfs``).  A component - or the leaf - swapped for a
+    # symlink after validation is REFUSED, never followed (issue #23
+    # reviews).  Missing files/components read as absent (the historical
+    # ``is_file()``/``is_dir()`` False semantics); symlinked ones raise the
+    # long-standing "git metadata path is a symlink (refused)" error.
 
-        Every existing component must be a REAL file or directory - a
-        symlink anywhere in the chain is refused outright (``.git``, ``HEAD``,
-        ``logs``, ``refs`` and friends are git-owned metadata, never links in
-        a healthy repository).  The final resolved path is also contained
-        inside the sandbox root (defense in depth)."""
-        candidate = git
-        for part in parts:
-            candidate = candidate / part
-            if candidate.is_symlink():
+    def _validated_repo_parts(self, rel_repo: str) -> tuple[str, ...]:
+        """Run the static checks (message contract) and return walk parts."""
+        self._git_dir(rel_repo)
+        return dirfs.normalize_rel_parts(rel_repo)
+
+    @staticmethod
+    def _map_walk_error(exc: CapabilityError, label: str) -> Optional[Any]:
+        """Map a dirfs walk failure: absent -> None, symlink -> refused."""
+        if isinstance(exc, dirfs.ComponentSymlinkError):
+            raise CapabilityError(
+                f"git metadata path is a symlink (refused): {label!r}"
+            ) from exc
+        cause = exc.__cause__ or exc.__context__
+        if isinstance(cause, FileNotFoundError):
+            return None
+        if isinstance(cause, OSError) and cause.errno == errno.ENOTDIR:
+            return None  # file-substituted component: nothing to read
+        if isinstance(cause, OSError) and cause.errno == errno.ELOOP:
+            raise CapabilityError(
+                f"git metadata path is a symlink (refused): {label!r}"
+            ) from exc
+        raise exc
+
+    def _open_meta_parent(
+        self, repo_parts: tuple[str, ...], parts: tuple[str, ...],
+    ) -> Optional[Tuple[int, str]]:
+        """Open the parent of one metadata path (no-follow chain).
+
+        Returns ``(parent_fd, leaf_name)`` (caller closes) or None when
+        absent.  ``parts`` must be non-empty.
+        """
+        label = "/".join(parts)
+        full = tuple(repo_parts) + (".git",) + tuple(parts)
+        try:
+            return dirfs.open_contained_parent(
+                self.sandbox_root, full, create=False,
+            )
+        except CapabilityError as exc:
+            return self._map_walk_error(exc, label)
+
+    def _read_meta(
+        self, repo_parts: tuple[str, ...], *parts: str,
+    ) -> Optional[str]:
+        """Read one metadata file descriptor-relatively; None when absent."""
+        label = "/".join(parts)
+        got = self._open_meta_parent(repo_parts, tuple(parts))
+        if got is None:
+            return None
+        parent_fd, leaf = got
+        try:
+            try:
+                fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                if dirfs.is_symlink_at(parent_fd, leaf) or exc.errno == errno.ELOOP:
+                    raise CapabilityError(
+                        f"git metadata path is a symlink (refused): {label!r}"
+                    ) from exc
                 raise CapabilityError(
-                    f"git metadata path is a symlink (refused): "
-                    f"{'/'.join(parts)!r}"
+                    f"git metadata unreadable: {label!r}: {exc}"
+                ) from exc
+            try:
+                if not stat_mod.S_ISREG(os.fstat(fd).st_mode):
+                    return None  # directory-substituted leaf: not a ref file
+                data = os.read(fd, 262_144)
+            finally:
+                os.close(fd)
+            return data.decode("utf-8", errors="replace")
+        finally:
+            os.close(parent_fd)
+
+    def _open_meta_dir(
+        self, repo_parts: tuple[str, ...], *parts: str,
+    ) -> Optional[int]:
+        """Open one metadata DIRECTORY descriptor-relatively; None when
+        absent.  Caller closes the descriptor."""
+        label = "/".join(parts)
+        got = self._open_meta_parent(repo_parts, tuple(parts))
+        if got is None:
+            return None
+        parent_fd, leaf = got
+        try:
+            try:
+                return os.open(
+                    leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
                 )
-        return self._contain_final(candidate, "/".join(parts) or ".")
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                if dirfs.is_symlink_at(parent_fd, leaf) or exc.errno == errno.ELOOP:
+                    raise CapabilityError(
+                        f"git metadata path is a symlink (refused): {label!r}"
+                    ) from exc
+                if exc.errno == errno.ENOTDIR:
+                    return None  # file-substituted leaf: not a directory
+                raise CapabilityError(
+                    f"git metadata unreadable: {label!r}: {exc}"
+                ) from exc
+        finally:
+            os.close(parent_fd)
+
+    def _iter_ref_files_fd(
+        self, dir_fd: int, prefix: str = "",
+    ) -> Iterator[Tuple[str, str]]:
+        """Yield ``(rel_name, text)`` for real ref files below ``dir_fd``.
+
+        The walk never follows symlinks: a symlinked directory or ref file
+        is refused instead of traversed, so enumeration cannot leave the
+        contained metadata tree.  Every entry is examined through the held
+        directory descriptor (no name-based re-entry).
+        """
+        try:
+            names = sorted(os.listdir(dir_fd))
+        except OSError as exc:
+            raise CapabilityError(f"git refs unreadable: {exc}") from exc
+        for name in names:
+            st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            if stat_mod.S_ISLNK(st.st_mode):
+                raise CapabilityError(
+                    f"git metadata path is a symlink (refused): {name!r}"
+                )
+            if stat_mod.S_ISDIR(st.st_mode):
+                sub = os.open(
+                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=dir_fd,
+                )
+                try:
+                    yield from self._iter_ref_files_fd(sub, f"{prefix}{name}/")
+                finally:
+                    os.close(sub)
+            elif stat_mod.S_ISREG(st.st_mode):
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+                try:
+                    data = os.read(fd, 262_144)
+                finally:
+                    os.close(fd)
+                yield f"{prefix}{name}", data.decode("utf-8", errors="replace")
 
     def _git_dir(self, rel_repo: str) -> Path:
         """Locate the repository's real ``.git`` metadata directory.
@@ -148,30 +291,6 @@ class GitLogCapability:
             raise CapabilityError(f"not a git repository: {rel_repo!r}")
         return self._contain_final(git, ".git")
 
-    def _iter_ref_files(self, heads: Path):
-        """Yield real (non-symlink) ref files below ``refs/heads``.
-
-        The walk never follows symlinks: a symlinked directory or ref file is
-        refused instead of traversed, so enumeration cannot leave the
-        contained metadata tree."""
-        stack = [heads]
-        while stack:
-            directory = stack.pop()
-            try:
-                entries = sorted(directory.iterdir())
-            except OSError as exc:
-                raise CapabilityError(f"git refs unreadable: {exc}") from exc
-            for entry in entries:
-                if entry.is_symlink():
-                    raise CapabilityError(
-                        f"git metadata path is a symlink (refused): "
-                        f"{entry.name!r}"
-                    )
-                if entry.is_dir():
-                    stack.append(entry)
-                elif entry.is_file():
-                    yield entry
-
     # ------------------------------------------------------------------ #
     # actions
     # ------------------------------------------------------------------ #
@@ -190,12 +309,12 @@ class GitLogCapability:
         limit = params.get("limit")
         if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 1):
             raise CapabilityError("'limit' must be a positive integer")
-        git = self._git_dir(rel)
-        current_branch = self._current_branch(git)
-        reflog = self._metadata_path(git, "logs", "HEAD")
+        repo_parts = self._validated_repo_parts(rel)
+        current_branch = self._current_branch(repo_parts)
+        reflog = self._read_meta(repo_parts, "logs", "HEAD")
         commits: list[dict[str, Any]] = []
-        if reflog.is_file():
-            lines = reflog.read_text(encoding="utf-8", errors="replace").splitlines()
+        if reflog is not None:
+            lines = reflog.splitlines()
             for line in lines[-_MAX_REF_LINES:]:
                 parts = line.split("\t", 1)
                 fields = parts[0].split()
@@ -228,17 +347,20 @@ class GitLogCapability:
         rel = params.get("repo")
         if not isinstance(rel, str) or not rel:
             raise CapabilityError("branches requires string param 'repo'")
-        git = self._git_dir(rel)
+        repo_parts = self._validated_repo_parts(rel)
         branches: list[dict[str, str]] = []
-        heads = self._metadata_path(git, "refs", "heads")
-        if heads.is_dir():
-            for ref in self._iter_ref_files(heads):
-                sha = ref.read_text(encoding="utf-8", errors="replace").strip()
-                if sha:
-                    branches.append({"name": str(ref.relative_to(heads)), "sha": sha})
-        packed = self._metadata_path(git, "packed-refs")
-        if packed.is_file():
-            for line in packed.read_text(encoding="utf-8", errors="replace").splitlines():
+        heads_fd = self._open_meta_dir(repo_parts, "refs", "heads")
+        if heads_fd is not None:
+            try:
+                for name, text in self._iter_ref_files_fd(heads_fd):
+                    sha = text.strip()
+                    if sha:
+                        branches.append({"name": name, "sha": sha})
+            finally:
+                os.close(heads_fd)
+        packed = self._read_meta(repo_parts, "packed-refs")
+        if packed is not None:
+            for line in packed.splitlines():
                 line = line.strip()
                 if not line or line.startswith("#") or line.startswith("^"):
                     continue
@@ -257,11 +379,11 @@ class GitLogCapability:
             "branches": branches,
         }
 
-    def _current_branch(self, git: Path) -> str | None:
-        head = self._metadata_path(git, "HEAD")
-        if not head.is_file():
+    def _current_branch(self, repo_parts: tuple[str, ...]) -> str | None:
+        content = self._read_meta(repo_parts, "HEAD")
+        if content is None:
             return None
-        content = head.read_text(encoding="utf-8", errors="replace").strip()
+        content = content.strip()
         if content.startswith("ref: refs/heads/"):
             return content[len("ref: refs/heads/"):]
         return None
