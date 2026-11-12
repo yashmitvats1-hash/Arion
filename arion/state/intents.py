@@ -20,6 +20,12 @@ Security model:
 - Settlement is tied to durable outcome state (the task snapshot's terminal
   step status or a recovery record).  A settled row is bookkeeping; the
   durable task snapshot remains the restart authority.
+- Settlement with outcome ``recovery`` is ONLY valid together with the id
+  of the durable recovery record that took over the obligation - the
+  journal cannot be closed with a recovery claim that has no record (no
+  fake recovery settlement; issue #23 third-pass review).  Outcomes are
+  validated against the closed set below; anything else fails closed and
+  leaves the row open.
 - Rows carry bounded identifiers and classification metadata only - never
   file contents, secrets, or capability output.
 """
@@ -66,6 +72,7 @@ class MutationIntent:
     outcome: str | None = None
     created_at: str = ""
     settled_at: str | None = None
+    recovery_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.created_at:
@@ -88,7 +95,13 @@ class MutationIntent:
             outcome=d.get("outcome"),
             created_at=d.get("created_at", ""),
             settled_at=d.get("settled_at"),
+            recovery_id=d.get("recovery_id"),
         )
+
+
+#: The closed set of durable settlement outcomes.  Anything else is refused
+#: (fail closed) by ``settle_mutation_intent``.
+INTENT_OUTCOMES = (OUTCOME_SUCCEEDED, OUTCOME_FAILED, OUTCOME_RECOVERY)
 
 
 class MutationIntentStore(Protocol):
@@ -102,10 +115,24 @@ class MutationIntentStore(Protocol):
 
     def settle_mutation_intent(
         self, task_id: str, step_index: int, outcome: str,
+        recovery_id: str | None = None,
         now: str | None = None,
     ) -> int:
         """Close open intent rows for one (task, step) with a durable
-        outcome.  Idempotent; returns the number of rows settled."""
+        outcome.  Idempotent; returns the number of rows settled.
+
+        ``outcome`` MUST be one of ``INTENT_OUTCOMES`` (anything else fails
+        closed and leaves the row open).  ``outcome="recovery"`` requires
+        ``recovery_id``: the journal can only be closed by a recovery claim
+        backed by the durable recovery record that took over the
+        obligation, and that record's id is stored on the row.
+        """
+        ...
+
+    def get_mutation_intent(
+        self, task_id: str, step_index: int,
+    ) -> MutationIntent | None:
+        """Point query: the journal row for one (task, step), or None."""
         ...
 
     def list_mutation_intents(

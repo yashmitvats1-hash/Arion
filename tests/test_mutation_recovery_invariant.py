@@ -225,6 +225,12 @@ def test_resume_with_recovery_mechanism_fences_into_recovery(tmp_path):
         recoveries = engine.recovery_store.list_recoveries(task_id=task.id)
         assert len(recoveries) == 1
         assert recoveries[0].status.value == "required"
+        # The journal row is settled as 'recovery' WITH the durable linkage
+        # to the recovery record that took over the obligation.
+        row = engine.storage.get_mutation_intent(task.id, 0)
+        assert row is not None
+        assert row.status == "settled" and row.outcome == "recovery"
+        assert row.recovery_id == recoveries[0].recovery_id
 
         engine.acknowledge_recovery(recoveries[0].recovery_id, actor="operator")
         final = engine.run_goal(goal.id)

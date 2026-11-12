@@ -161,7 +161,8 @@ CREATE TABLE IF NOT EXISTS mutation_intents (
     status      TEXT NOT NULL,
     outcome     TEXT,
     created_at  TEXT NOT NULL,
-    settled_at  TEXT
+    settled_at  TEXT,
+    recovery_id TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_intents_task_step ON mutation_intents(task_id, step_index);
 CREATE INDEX IF NOT EXISTS idx_intents_status ON mutation_intents(status);
@@ -387,6 +388,7 @@ class SQLiteStorage:
         self._migrate_goals()
         self._migrate_tasks()
         self._migrate_approvals()
+        self._migrate_intents()
         self._conn.commit()
 
     @_threadsafe
@@ -427,6 +429,24 @@ class SQLiteStorage:
         self._conn.execute(
             "UPDATE tasks SET revision=1 WHERE revision=0"
         )
+
+    @_threadsafe
+    def _migrate_intents(self) -> None:
+        """Add the recovery-linkage column to pre-existing intent journals.
+
+        A settled-with-recovery row must record WHICH recovery record took
+        over the obligation (issue #23 third-pass review: the journal/
+        recovery interface was incomplete without it).
+        """
+        cols = {
+            row[1] for row in self._conn.execute(
+                "PRAGMA table_info(mutation_intents)"
+            ).fetchall()
+        }
+        if "recovery_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE mutation_intents ADD COLUMN recovery_id TEXT"
+            )
 
     @_threadsafe
     def _migrate_approvals(self) -> None:
@@ -1526,6 +1546,7 @@ class SQLiteStorage:
     _INTENT_COLS = (
         "intent_id", "task_id", "step_index", "attempt", "capability",
         "action", "resource", "status", "outcome", "created_at", "settled_at",
+        "recovery_id",
     )
 
     @_threadsafe
@@ -1560,7 +1581,7 @@ class SQLiteStorage:
                     intent.intent_id, intent.task_id, intent.step_index,
                     intent.attempt, intent.capability, intent.action,
                     intent.resource, intent.status, intent.outcome,
-                    intent.created_at, intent.settled_at,
+                    intent.created_at, intent.settled_at, intent.recovery_id,
                 ),
             )
             self._conn.commit()
@@ -1572,20 +1593,64 @@ class SQLiteStorage:
     @_threadsafe
     def settle_mutation_intent(
         self, task_id: str, step_index: int, outcome: str,
+        recovery_id: str | None = None,
         now: str | None = None,
     ) -> int:
         """Close open intent rows for one (task, step) with a durable
         outcome.  Idempotent: already-settled rows are left untouched.
         The durable task snapshot stays authoritative; this row state is
-        bookkeeping for open-intent queries."""
+        bookkeeping for open-intent queries.
+
+        Interface closure (issue #23 third-pass review):
+
+        - ``outcome`` MUST be one of ``INTENT_OUTCOMES``; an unknown string
+          fails closed (row left open) instead of silently corrupting the
+          bookkeeping contract;
+        - ``outcome="recovery"`` REQUIRES ``recovery_id`` - the journal can
+          only be closed by a recovery claim backed by the durable recovery
+          record that took over the obligation, and that record's id is
+          stored on the row (no fake recovery settlement).
+        """
+        from arion.state.intents import (
+            INTENT_OUTCOMES,
+            OUTCOME_RECOVERY,
+            MutationIntentError,
+        )
+
+        if outcome not in INTENT_OUTCOMES:
+            raise MutationIntentError(
+                f"invalid mutation-intent outcome {outcome!r} "
+                f"(expected one of {INTENT_OUTCOMES!r}); refusing to settle"
+            )
+        if outcome == OUTCOME_RECOVERY and not recovery_id:
+            raise MutationIntentError(
+                "settling a mutation intent as 'recovery' requires the id "
+                "of the durable recovery record that took over the "
+                "obligation (refusing a fake recovery settlement)"
+            )
         cursor = self._conn.execute(
             "UPDATE mutation_intents SET status='settled', outcome=?, "
-            "settled_at=? WHERE task_id=? AND step_index=? "
+            "settled_at=?, recovery_id=? WHERE task_id=? AND step_index=? "
             "AND status='in_flight'",
-            (outcome, now or utcnow(), task_id, step_index),
+            (outcome, now or utcnow(), recovery_id, task_id, step_index),
         )
         self._conn.commit()
         return cursor.rowcount
+
+    @_threadsafe
+    def get_mutation_intent(
+        self, task_id: str, step_index: int,
+    ) -> "MutationIntent | None":
+        from arion.state.intents import MutationIntent
+
+        row = self._conn.execute(
+            f"SELECT {', '.join(self._INTENT_COLS)} FROM mutation_intents "
+            "WHERE task_id=? AND step_index=?",
+            (task_id, step_index),
+        ).fetchone()
+        if row is None:
+            return None
+        return MutationIntent.from_dict(dict(zip(self._INTENT_COLS, row)))
 
     @_threadsafe
     def list_mutation_intents(

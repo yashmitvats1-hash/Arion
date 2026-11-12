@@ -534,8 +534,11 @@ class ArionEngine:
                     task.__dict__.update(canonical.__dict__)
 
         # Issue #23 / F10: a durable recovery record IS the settlement of an
-        # uncertain mutation - close the intent row (bookkeeping).
-        self._settle_mutation_intents(task.id, step, OUTCOME_RECOVERY)
+        # uncertain mutation - close the intent row (bookkeeping), linked to
+        # the recovery record's id.
+        self._settle_mutation_intents(
+            task.id, step, OUTCOME_RECOVERY, recovery_id=rec.recovery_id,
+        )
         if created:
             self._emit("recovery.required", task_id=task.id, step_id=_step_id(step),
                        success=False, detail={
@@ -702,16 +705,20 @@ class ArionEngine:
 
     def _settle_mutation_intents(
         self, task_id: str, step: PlanStep, outcome: str,
+        recovery_id: str | None = None,
     ) -> None:
         """Best-effort bookkeeping: close the intent row once the outcome is
         durable.  The in-doubt fence treats a durable terminal step (or a
         recovery record) as authoritative settlement regardless of row
-        state, so a failure here is never unsafe."""
+        state, so a failure here is never unsafe - and settlement as
+        'recovery' passes the durable recovery record's id (the store
+        refuses a fake recovery settlement)."""
         settler = getattr(self.storage, "settle_mutation_intent", None)
         if not callable(settler):
             return
         try:
-            settler(task_id=task_id, step_index=step.index, outcome=outcome)
+            settler(task_id=task_id, step_index=step.index, outcome=outcome,
+                    recovery_id=recovery_id)
         except Exception:
             pass
 
@@ -800,9 +807,10 @@ class ArionEngine:
                 self._fail_in_doubt_without_recovery(task, candidate, reason)
                 fenced = True
                 continue
-            self._record_recovery_required(task, candidate, spec, reason)
+            rec = self._record_recovery_required(task, candidate, spec, reason)
             self._settle_mutation_intents(
-                task.id, candidate, OUTCOME_RECOVERY
+                task.id, candidate, OUTCOME_RECOVERY,
+                recovery_id=getattr(rec, "recovery_id", None),
             )
             fenced = True
         return fenced
