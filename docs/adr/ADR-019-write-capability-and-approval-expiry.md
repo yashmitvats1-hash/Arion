@@ -3,6 +3,23 @@
 - **Status:** Approved & implemented (2026-08-09)
 - **Deciders:** ChatGPT (architect/manager), Arena AI (engineering agent)
 
+- **Amended (issue #23 F06 fourth pass): identity-bound staging
+  publication and its documented residuals.** Publication links the EXACT
+  pinned inode through the still-open staging descriptor
+  (`/proc/self/fd/N` magic symlink + `linkat`): a staging-name
+  substitution after identity verification can never redirect publication
+  - the result is our inode at the destination or a fail-closed error,
+  never the substituted entry.  Overwrite replaces via rename-to-private-
+  trash + descriptor link + rollback; the trash is only unlinked while it
+  still holds the recorded previous identity.  Residuals, stated without
+  sweeping claims: there is NO fd-based atomic replace primitive
+  (`renameat2` lacks `AT_EMPTY_PATH`), so replace is identity-bound, NOT
+  race-proof-atomic - the brief no-destination window rolls back/refuses,
+  never clobbers; without `/proc`/held-descriptor support the name-based
+  fallback is NOT race-proof; crash-orphaned staging/trash entries (random
+  names, 0600/0644) remain a disk-privacy residual and are deliberately
+  never swept - substituted or unowned entries are never unlinked.
+
 ## Context
 
 ADR-018 delivered the durable approval queue, the canonical authorization

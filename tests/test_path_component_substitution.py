@@ -186,7 +186,7 @@ def test_concurrent_creator_wins_against_overwrite_false(
     cap = FilesystemWriteCapability(sb)
     real_publish = dirfs.publish_no_overwrite
 
-    def racing_publish(parent_fd, staging, leaf, identity):
+    def racing_publish(parent_fd, staging, leaf, identity, staging_fd=None):
         # Simulate the concurrent creator winning at the last instant.
         fd = os.open(
             leaf,
@@ -196,7 +196,9 @@ def test_concurrent_creator_wins_against_overwrite_false(
         )
         os.write(fd, b"CONCURRENT")
         os.close(fd)
-        return real_publish(parent_fd, staging, leaf, identity)
+        return real_publish(
+            parent_fd, staging, leaf, identity, staging_fd=staging_fd,
+        )
 
     monkeypatch.setattr(dirfs, "publish_no_overwrite", racing_publish)
     with pytest.raises(CapabilityError, match="exists"):
@@ -249,7 +251,9 @@ def test_swapped_staging_name_never_cleaned_up(tmp_path, monkeypatch):
     cap = FilesystemWriteCapability(sb)
     seen: list[str] = []
 
-    def swapping_failing_replace(parent_fd, staging, leaf, identity):
+    def swapping_failing_replace(
+        parent_fd, staging, leaf, identity, staging_fd=None,
+    ):
         # Attacker swaps the staging name for a victim file, then the
         # publish fails (e.g. I/O error).
         seen.append(staging)
@@ -279,7 +283,9 @@ def test_failed_publish_leaves_no_staging_residue(tmp_path, monkeypatch):
     sb = _sandbox(tmp_path)
     cap = FilesystemWriteCapability(sb)
 
-    def failing_replace(parent_fd, staging, leaf, identity):
+    def failing_replace(
+        parent_fd, staging, leaf, identity, staging_fd=None,
+    ):
         raise OSError("disk full")
 
     monkeypatch.setattr(dirfs, "publish_replace", failing_replace)
@@ -302,7 +308,9 @@ def test_staging_inode_substitution_refused_at_publish(tmp_path, monkeypatch):
     cap = FilesystemWriteCapability(sb)
     real_replace = dirfs.publish_replace
 
-    def substituting_replace(parent_fd, staging, leaf, identity):
+    def substituting_replace(
+        parent_fd, staging, leaf, identity, staging_fd=None,
+    ):
         # Attacker swaps an innocent victim file ONTO the staging name.
         os.unlink(staging, dir_fd=parent_fd)
         victim_fd = os.open(
@@ -311,7 +319,9 @@ def test_staging_inode_substitution_refused_at_publish(tmp_path, monkeypatch):
         )
         os.write(victim_fd, b"VICTIM_CONTENT")
         os.close(victim_fd)
-        return real_replace(parent_fd, staging, leaf, identity)
+        return real_replace(
+            parent_fd, staging, leaf, identity, staging_fd=staging_fd,
+        )
 
     monkeypatch.setattr(dirfs, "publish_replace", substituting_replace)
     with pytest.raises(CapabilityError, match="substituted"):

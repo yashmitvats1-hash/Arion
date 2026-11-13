@@ -403,8 +403,27 @@ def write_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
+def _proc_self_fd_path(fd: int) -> Optional[str]:
+    """``/proc``-backed path that binds to the EXACT inode behind ``fd``.
+
+    ``linkat`` on this magic symlink (with ``follow_symlinks=True``) hard
+    links the descriptor's own inode - a staging-NAME substitution cannot
+    redirect it.  Returns None when the platform lacks ``/proc/self/fd``:
+    the name-based fallback there is NOT race-proof (documented).  If the
+    pinned inode has been unlinked the link fails closed (ENOENT), which is
+    exactly the substitution case - publication then yields OUR inode or
+    nothing, never the attacker's entry.
+    """
+    link = f"/proc/self/fd/{fd}"
+    return link if os.path.isdir("/proc/self/fd") else None
+
+
 def publish_no_overwrite(
-    parent_fd: int, staging: str, leaf: str, identity: Tuple[int, int],
+    parent_fd: int,
+    staging: str,
+    leaf: str,
+    identity: Tuple[int, int],
+    staging_fd: Optional[int] = None,
 ) -> None:
     """Atomically publish ``staging`` as ``leaf`` WITHOUT replacing anything.
 
@@ -415,6 +434,16 @@ def publish_no_overwrite(
     re-verified against the caller's held descriptor first: a staging name
     substituted for an innocent file after creation is refused, never
     published (issue #23 third-pass review - staging inode substitution).
+
+    With ``staging_fd`` still OPEN, publication is IDENTITY-BOUND (issue
+    #23 F06 fourth pass): the link source is the descriptor itself
+    (``/proc/self/fd/N`` magic symlink), so a staging-name substitution in
+    the verify/publish window can never redirect publication - the result
+    is the exact pinned inode at ``leaf`` or a fail-closed error (the
+    pinned inode was unlinked), NEVER the substituted entry.  Without an
+    open descriptor or without ``/proc`` support the name-based fallback
+    link is used and is NOT race-proof; that residual is documented, not
+    claimed away.
     """
     require_secure_primitives()
     if not identity_matches(parent_fd, staging, identity):
@@ -422,26 +451,52 @@ def publish_no_overwrite(
             f"staging file {staging!r} was substituted after creation "
             f"(refusing to publish it)"
         )
-    os.link(
-        staging,
-        leaf,
-        src_dir_fd=parent_fd,
-        dst_dir_fd=parent_fd,
-        follow_symlinks=False,
-    )
+    src = _proc_self_fd_path(staging_fd) if staging_fd is not None else None
+    if src is not None:
+        os.link(src, leaf, follow_symlinks=True, dst_dir_fd=parent_fd)
+    else:
+        os.link(
+            staging,
+            leaf,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
 
 
 def publish_replace(
-    parent_fd: int, staging: str, leaf: str, identity: Tuple[int, int],
+    parent_fd: int,
+    staging: str,
+    leaf: str,
+    identity: Tuple[int, int],
+    staging_fd: Optional[int] = None,
 ) -> None:
-    """Atomically publish ``staging`` as ``leaf``, replacing the name.
+    """Publish ``staging`` as ``leaf``, replacing the destination NAME.
 
-    ``os.rename`` (same semantics as ``os.replace`` on POSIX) atomically
-    replaces the destination NAME and never follows symlinks: a leaf that
-    was swapped for a symlink has the symlink itself replaced - its target
-    is never opened or written.  The staging entry's identity is
-    re-verified against the caller's held descriptor first (see
-    ``publish_no_overwrite``).
+    ``os.rename`` semantics (atomic name replacement, never follows
+    symlinks: a leaf swapped for a symlink has the symlink itself
+    replaced).  The staging entry's identity is re-verified against the
+    caller's held descriptor first (see ``publish_no_overwrite``).
+
+    With ``staging_fd`` still OPEN the replacement is IDENTITY-BOUND
+    (issue #23 F06 fourth pass): the previous ``leaf`` entry is renamed to
+    a random private trash name, the exact pinned inode is hard-linked to
+    ``leaf`` through the held descriptor (``/proc/self/fd/N``), and on any
+    failure the previous entry is rolled back into place.  The trash name
+    is only unlinked while it still holds the recorded previous identity -
+    a substituted or unowned entry is never unlinked.
+
+    DOCUMENTED RESIDUAL (no sweeping claims): there is NO fd-based atomic
+    replace primitive (``renameat2`` lacks ``AT_EMPTY_PATH``), so full
+    atomicity of REPLACE is unattainable.  Residuals: (1) the brief window
+    where ``leaf`` does not exist between the trash rename and the link -
+    a concurrent same-user creator winning it is rolled back and refused,
+    never clobbered; (2) without ``staging_fd``/``/proc`` the name-based
+    fallback rename is NOT race-proof against a staging-name substitution
+    in the verify/rename window.  Publication is identity-bound, not
+    race-proof-replace; callers must not claim otherwise.  Crash-orphaned
+    staging/trash files (mode 0600/0644 at random names) remain as a
+    disk-privacy residual - they are deliberately never swept.
     """
     require_secure_primitives()
     if not identity_matches(parent_fd, staging, identity):
@@ -449,7 +504,28 @@ def publish_replace(
             f"staging file {staging!r} was substituted after creation "
             f"(refusing to publish it)"
         )
-    os.rename(staging, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    src = _proc_self_fd_path(staging_fd) if staging_fd is not None else None
+    if src is None:
+        os.rename(staging, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        return
+    prev_identity = name_identity(parent_fd, leaf)
+    trash: Optional[str] = None
+    if prev_identity is not None:
+        trash = f".{leaf}.{os.urandom(8).hex()}.arion-replace-tmp"
+        os.rename(leaf, trash, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    try:
+        os.link(src, leaf, follow_symlinks=True, dst_dir_fd=parent_fd)
+    except BaseException:
+        if trash is not None:
+            try:
+                os.rename(
+                    trash, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+                )
+            except OSError:
+                pass  # best-effort rollback; the error below is the truth
+        raise
+    if trash is not None:
+        unlink_if_identity(parent_fd, trash, prev_identity)
 
 
 def cleanup_staging(

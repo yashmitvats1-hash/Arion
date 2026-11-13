@@ -157,17 +157,21 @@ class FilesystemWriteCapability:
                 dirfs.write_all(fd, data)
                 try:
                     if overwrite:
-                        # Atomic replace of the NAME; a leaf swapped for a
-                        # symlink has the symlink itself replaced - its
-                        # target is never opened or written.
-                        dirfs.publish_replace(parent_fd, staging, leaf, identity)
+                        # Identity-bound replace (held staging descriptor):
+                        # the pinned inode is published via /proc/self/fd;
+                        # a staging-name substitution can never redirect it.
+                        dirfs.publish_replace(
+                            parent_fd, staging, leaf, identity,
+                            staging_fd=fd,
+                        )
                     else:
-                        # Atomic no-replace publish (hard link): a
-                        # concurrent creator of `leaf` wins and is never
-                        # clobbered.
+                        # Identity-bound no-replace publish (hard link via
+                        # the held descriptor): a concurrent creator of
+                        # `leaf` wins and is never clobbered.
                         try:
                             dirfs.publish_no_overwrite(
                                 parent_fd, staging, leaf, identity,
+                                staging_fd=fd,
                             )
                         except FileExistsError as exc:
                             raise CapabilityError(
