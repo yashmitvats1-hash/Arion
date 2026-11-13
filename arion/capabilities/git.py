@@ -45,6 +45,66 @@ from arion.capabilities.registry import ActionSpec, CapabilityError
 
 _MAX_REF_LINES = 500
 
+# Explicit bound for a full metadata read (issue #23 fifth pass): content
+# within this bound is returned COMPLETE; oversized reflogs yield the
+# newest-history tail; oversized non-reflog metadata is rejected - data is
+# NEVER silently truncated.
+_MAX_META_BYTES = 4 * 1024 * 1024
+_REFLOG_TAIL_BYTES = 262_144
+
+# Documented depth limit for the refs walk; deeper trees fail cleanly.
+_MAX_REF_DEPTH = 16
+
+
+def _read_fd_bounded(fd: int, label: str, *, tail: bool) -> str:
+    """Read a regular-file descriptor fully within an explicit bound.
+
+    Never silently truncated (issue #23 fifth pass): files within
+    ``_MAX_META_BYTES`` are read completely (looping ``os.read``).
+    Oversized files: with ``tail=True`` (reflogs - the newest history lives
+    at the END of the file) the last ``_REFLOG_TAIL_BYTES`` are returned,
+    dropped to a line boundary; otherwise a clear capability error is
+    raised.
+    """
+    size = os.fstat(fd).st_size
+    if size > _MAX_META_BYTES:
+        if not tail:
+            raise CapabilityError(
+                f"git metadata too large ({size} bytes > {_MAX_META_BYTES}): "
+                f"{label!r}; refusing to return truncated data"
+            )
+        keep = min(size, _REFLOG_TAIL_BYTES)
+        os.lseek(fd, size - keep, os.SEEK_SET)
+        data = bytearray()
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            data += chunk
+        newline = data.find(b"\n")
+        if newline != -1:
+            del data[: newline + 1]
+        return bytes(data).decode("utf-8", errors="replace")
+    data = bytearray()
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        data += chunk
+        if len(data) > _MAX_META_BYTES:
+            # File grew past the bound mid-read: apply the same policy.
+            if not tail:
+                raise CapabilityError(
+                    f"git metadata too large (>{_MAX_META_BYTES} bytes): "
+                    f"{label!r}; refusing to return truncated data"
+                )
+            del data[:-_REFLOG_TAIL_BYTES]
+            newline = data.find(b"\n")
+            if newline != -1:
+                del data[: newline + 1]
+            return bytes(data).decode("utf-8", errors="replace")
+    return bytes(data).decode("utf-8", errors="replace")
+
 
 class GitLogCapability:
     """Read-only, sandboxed git repository history inspection."""
@@ -176,7 +236,15 @@ class GitLogCapability:
     def _read_meta(
         self, repo_parts: tuple[str, ...], *parts: str,
     ) -> Optional[str]:
-        """Read one metadata file descriptor-relatively; None when absent."""
+        """Read one metadata file descriptor-relatively; None when absent.
+
+        Opens ``O_NONBLOCK`` (a FIFO substituted for the leaf can never
+        block the engine before the regular-file check - issue #23 fifth
+        pass) and never returns silently truncated data: content is read
+        fully within an explicit bound, oversized reflogs yield the
+        newest-history TAIL, and oversized non-reflog metadata is rejected
+        with a clear capability error.
+        """
         label = "/".join(parts)
         got = self._open_meta_parent(repo_parts, tuple(parts))
         if got is None:
@@ -184,7 +252,11 @@ class GitLogCapability:
         parent_fd, leaf = got
         try:
             try:
-                fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+                fd = os.open(
+                    leaf,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=parent_fd,
+                )
             except FileNotFoundError:
                 return None
             except OSError as exc:
@@ -197,11 +269,12 @@ class GitLogCapability:
                 ) from exc
             try:
                 if not stat_mod.S_ISREG(os.fstat(fd).st_mode):
-                    return None  # directory-substituted leaf: not a ref file
-                data = os.read(fd, 262_144)
+                    return None  # directory/FIFO-substituted leaf: not a ref file
+                return _read_fd_bounded(
+                    fd, label, tail=parts[:1] == ("logs",),
+                )
             finally:
                 os.close(fd)
-            return data.decode("utf-8", errors="replace")
         finally:
             os.close(parent_fd)
 
@@ -245,33 +318,62 @@ class GitLogCapability:
         is refused instead of traversed, so enumeration cannot leave the
         contained metadata tree.  Every entry is examined through the held
         directory descriptor (no name-based re-entry).
+
+        Iterative walk (issue #23 fifth pass): an explicit stack replaces
+        recursion, so deeply nested ref directories cannot hit the Python
+        recursion limit, and a documented depth limit (``_MAX_REF_DEPTH``)
+        fails cleanly on pathological trees.  Ref files are read with the
+        bounded reader - never silently truncated.
         """
+        open_fds: list[int] = []
         try:
-            names = sorted(os.listdir(dir_fd))
-        except OSError as exc:
-            raise CapabilityError(f"git refs unreadable: {exc}") from exc
-        for name in names:
-            st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-            if stat_mod.S_ISLNK(st.st_mode):
-                raise CapabilityError(
-                    f"git metadata path is a symlink (refused): {name!r}"
-                )
-            if stat_mod.S_ISDIR(st.st_mode):
-                sub = os.open(
-                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=dir_fd,
-                )
+            stack: list[tuple[int, str, int]] = [(dir_fd, prefix, 0)]
+            while stack:
+                fd, pref, depth = stack.pop()
                 try:
-                    yield from self._iter_ref_files_fd(sub, f"{prefix}{name}/")
-                finally:
-                    os.close(sub)
-            elif stat_mod.S_ISREG(st.st_mode):
-                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+                    names = sorted(os.listdir(fd))
+                except OSError as exc:
+                    raise CapabilityError(f"git refs unreadable: {exc}") from exc
+                for name in names:
+                    st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    if stat_mod.S_ISLNK(st.st_mode):
+                        raise CapabilityError(
+                            f"git metadata path is a symlink (refused): {name!r}"
+                        )
+                    if stat_mod.S_ISDIR(st.st_mode):
+                        if depth + 1 > _MAX_REF_DEPTH:
+                            raise CapabilityError(
+                                f"git refs nested deeper than {_MAX_REF_DEPTH} "
+                                f"levels (refusing to traverse): {pref}{name}/"
+                            )
+                        sub = os.open(
+                            name,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=fd,
+                        )
+                        open_fds.append(sub)
+                        stack.append((sub, f"{pref}{name}/", depth + 1))
+                    elif stat_mod.S_ISREG(st.st_mode):
+                        rfd = os.open(
+                            name,
+                            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                            dir_fd=fd,
+                        )
+                        try:
+                            if not stat_mod.S_ISREG(os.fstat(rfd).st_mode):
+                                continue  # substituted non-regular leaf
+                            text = _read_fd_bounded(
+                                rfd, f"{pref}{name}", tail=False,
+                            )
+                        finally:
+                            os.close(rfd)
+                        yield f"{pref}{name}", text
+        finally:
+            for stale in open_fds:
                 try:
-                    data = os.read(fd, 262_144)
-                finally:
-                    os.close(fd)
-                yield f"{prefix}{name}", data.decode("utf-8", errors="replace")
+                    os.close(stale)
+                except OSError:
+                    pass
 
     def _git_dir(self, rel_repo: str) -> Path:
         """Locate the repository's real ``.git`` metadata directory.

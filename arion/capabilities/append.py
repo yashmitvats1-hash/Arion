@@ -25,6 +25,7 @@ orchestration authorization layer (scope/boundary/risk/approval), never here.
 from __future__ import annotations
 
 import os
+import stat as stat_mod
 from pathlib import Path
 from typing import Any
 
@@ -129,15 +130,18 @@ class FilesystemAppendCapability:
             root_identity=self._root_identity,
         )
         try:
-            flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW
+            flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
             if create:
                 flags |= os.O_CREAT
             try:
                 # O_APPEND positions every write atomically at the end
                 # (same semantics as open("ab")); O_NOFOLLOW refuses a
                 # leaf swapped for a symlink instead of appending through
-                # it.  0o666 matches the historical open("ab") creation
-                # mode (umask applies).
+                # it.  O_NONBLOCK ensures a leaf swapped for a FIFO can
+                # never block the engine (issue #23 fifth pass) - the
+                # descriptor type check below then refuses it.  0o666
+                # matches the historical open("ab") creation mode (umask
+                # applies).
                 fd = os.open(leaf, flags, 0o666, dir_fd=parent_fd)
             except FileNotFoundError as exc:
                 raise CapabilityError(
@@ -146,6 +150,13 @@ class FilesystemAppendCapability:
             except OSError as exc:
                 raise CapabilityError(f"append failed: {exc}") from exc
             try:
+                # Verify the opened DESCRIPTOR is a regular file: a FIFO
+                # or directory substituted between the path check and the
+                # open is refused, never appended through (issue #23).
+                if not stat_mod.S_ISREG(os.fstat(fd).st_mode):
+                    raise CapabilityError(
+                        f"append target is not a regular file: {rel!r}"
+                    )
                 # Size BEFORE the append, taken from the held descriptor
                 # (immune to name swaps between stat and open).
                 prior_size = os.fstat(fd).st_size
