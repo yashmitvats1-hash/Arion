@@ -319,61 +319,93 @@ class GitLogCapability:
         contained metadata tree.  Every entry is examined through the held
         directory descriptor (no name-based re-entry).
 
-        Iterative walk (issue #23 fifth pass): an explicit stack replaces
-        recursion, so deeply nested ref directories cannot hit the Python
-        recursion limit, and a documented depth limit (``_MAX_REF_DEPTH``)
-        fails cleanly on pathological trees.  Ref files are read with the
-        bounded reader - never silently truncated.
+        Iterative walk (issue #23 fifth pass): an explicit work stack
+        replaces recursion, so deeply nested ref directories cannot hit
+        the Python recursion limit, and a documented depth limit
+        (``_MAX_REF_DEPTH``) fails cleanly on pathological trees.  Each
+        directory descriptor is closed as soon as its entries are consumed
+        (bounded open descriptors even on deep chains).  Ref files are
+        read with the bounded reader - never silently truncated.
         """
-        open_fds: list[int] = []
+        def _frame(fd: int, pref: str, depth: int, owned: bool):
+            try:
+                names = sorted(os.listdir(fd))
+            except OSError as exc:
+                raise CapabilityError(f"git refs unreadable: {exc}") from exc
+            return [fd, pref, depth, owned, names]
+
+        stack = [_frame(dir_fd, prefix, 0, False)]
         try:
-            stack: list[tuple[int, str, int]] = [(dir_fd, prefix, 0)]
             while stack:
-                fd, pref, depth = stack.pop()
-                try:
-                    names = sorted(os.listdir(fd))
-                except OSError as exc:
-                    raise CapabilityError(f"git refs unreadable: {exc}") from exc
-                for name in names:
-                    st = os.stat(name, dir_fd=fd, follow_symlinks=False)
-                    if stat_mod.S_ISLNK(st.st_mode):
-                        raise CapabilityError(
-                            f"git metadata path is a symlink (refused): {name!r}"
-                        )
-                    if stat_mod.S_ISDIR(st.st_mode):
-                        if depth + 1 > _MAX_REF_DEPTH:
-                            raise CapabilityError(
-                                f"git refs nested deeper than {_MAX_REF_DEPTH} "
-                                f"levels (refusing to traverse): {pref}{name}/"
-                            )
-                        sub = os.open(
-                            name,
-                            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                            dir_fd=fd,
-                        )
-                        open_fds.append(sub)
-                        stack.append((sub, f"{pref}{name}/", depth + 1))
-                    elif stat_mod.S_ISREG(st.st_mode):
-                        rfd = os.open(
-                            name,
-                            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                            dir_fd=fd,
-                        )
+                if not stack[-1][4]:
+                    sfd, _, _, sowned, _ = stack.pop()
+                    if sowned:
                         try:
-                            if not stat_mod.S_ISREG(os.fstat(rfd).st_mode):
-                                continue  # substituted non-regular leaf
+                            os.close(sfd)
+                        except OSError:
+                            pass
+                    continue
+                fd, pref, depth, owned, pending = stack[-1]
+                name = pending.pop(0)
+                push_frame = None
+                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if stat_mod.S_ISLNK(st.st_mode):
+                    raise CapabilityError(
+                        f"git metadata path is a symlink (refused): {name!r}"
+                    )
+                if stat_mod.S_ISDIR(st.st_mode):
+                    if depth + 1 > _MAX_REF_DEPTH:
+                        raise CapabilityError(
+                            f"git refs nested deeper than {_MAX_REF_DEPTH} "
+                            f"levels (refusing to traverse): {pref}{name}/"
+                        )
+                    sub = os.open(
+                        name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=fd,
+                    )
+                    push_frame = _frame(sub, f"{pref}{name}/", depth + 1, True)
+                    if not push_frame[4]:
+                        os.close(sub)  # empty directory: nothing to traverse
+                        push_frame = None
+                elif stat_mod.S_ISREG(st.st_mode):
+                    rfd = os.open(
+                        name,
+                        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                        dir_fd=fd,
+                    )
+                    try:
+                        if not stat_mod.S_ISREG(os.fstat(rfd).st_mode):
+                            text = None  # substituted non-regular leaf
+                        else:
                             text = _read_fd_bounded(
                                 rfd, f"{pref}{name}", tail=False,
                             )
-                        finally:
-                            os.close(rfd)
+                    finally:
+                        os.close(rfd)
+                    if text is not None:
                         yield f"{pref}{name}", text
+                # The descriptor is only needed to open MORE entries here:
+                # close it the moment its list is consumed, so deep chains
+                # hold a bounded number of descriptors (~depth).  Pop the
+                # CURRENT frame BEFORE any child push - stack.pop() must
+                # always refer to the frame being processed.
+                if not pending:
+                    stack.pop()
+                    if owned:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                if push_frame is not None:
+                    stack.append(push_frame)
         finally:
-            for stale in open_fds:
-                try:
-                    os.close(stale)
-                except OSError:
-                    pass
+            for stale in stack:
+                if stale[3]:
+                    try:
+                        os.close(stale[0])
+                    except OSError:
+                        pass
 
     def _git_dir(self, rel_repo: str) -> Path:
         """Locate the repository's real ``.git`` metadata directory.
