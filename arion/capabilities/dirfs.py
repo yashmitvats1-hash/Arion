@@ -482,9 +482,14 @@ def publish_replace(
     (issue #23 F06 fourth pass): the previous ``leaf`` entry is renamed to
     a random private trash name, the exact pinned inode is hard-linked to
     ``leaf`` through the held descriptor (``/proc/self/fd/N``), and on any
-    failure the previous entry is rolled back into place.  The trash name
-    is only unlinked while it still holds the recorded previous identity -
-    a substituted or unowned entry is never unlinked.
+    failure the previous destination is restored NO-REPLACE (hard link,
+    never ``rename``): a concurrent creator that landed at ``leaf`` in the
+    window is never clobbered (issue #23 fifth pass - rollback collision),
+    and if the previous destination cannot be restored without replacing
+    such an entry it stays preserved under its private trash name and the
+    conflict is reported - neither party's data is ever discarded.  The
+    trash name is only unlinked while it still holds the recorded previous
+    identity - a substituted or unowned entry is never unlinked.
 
     DOCUMENTED RESIDUAL (no sweeping claims): there is NO fd-based atomic
     replace primitive (``renameat2`` lacks ``AT_EMPTY_PATH``), so full
@@ -515,14 +520,47 @@ def publish_replace(
         os.rename(leaf, trash, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
     try:
         os.link(src, leaf, follow_symlinks=True, dst_dir_fd=parent_fd)
-    except BaseException:
-        if trash is not None:
+    except BaseException as exc:
+        if trash is None:
+            if isinstance(exc, FileExistsError):
+                # A concurrent creator landed `leaf` while the name was
+                # free: their entry is never clobbered (issue #23 fifth
+                # pass).  Nothing of ours existed to roll back.
+                raise CapabilityError(
+                    f"publication of {leaf!r} failed: a concurrent entry "
+                    f"occupies it (nothing was overwritten)"
+                ) from exc
+            raise
+        # NO-REPLACE rollback (issue #23 fifth pass): a hard link refuses
+        # to replace an entry a concurrent creator landed at `leaf` while
+        # the destination name was free.  Neither party's data is ever
+        # discarded: on conflict the concurrent entry stays and the
+        # previous destination is preserved under its private trash name.
+        restored = False
+        try:
+            os.link(
+                trash,
+                leaf,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            restored = True
+        except FileExistsError:
+            raise CapabilityError(
+                f"publication of {leaf!r} failed ({exc}) and the previous "
+                f"destination could not be restored without replacing a "
+                f"concurrent entry: the concurrent entry is untouched and "
+                f"the previous destination is preserved at {trash!r} "
+                f"(recoverable private name); nothing was overwritten"
+            ) from exc
+        except OSError:
+            pass  # previous destination preserved at trash; error below
+        if restored:
             try:
-                os.rename(
-                    trash, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
-                )
+                os.unlink(trash, dir_fd=parent_fd)
             except OSError:
-                pass  # best-effort rollback; the error below is the truth
+                pass  # both names hold the old destination; harmless
         raise
     if trash is not None:
         unlink_if_identity(parent_fd, trash, prev_identity)

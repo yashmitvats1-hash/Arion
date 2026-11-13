@@ -225,3 +225,129 @@ def test_cleanup_never_unlinks_substituted_entry(tmp_path, monkeypatch):
     assert (sb / state["staging"]).is_symlink()
     assert victim.read_bytes() == VICTIM
     monkeypatch.undo()
+
+
+# --------------------------------------------------------------------- #
+# fifth pass item A: destination rollback must never clobber a
+# concurrent creator (window: after trash rename, before fd link)
+# --------------------------------------------------------------------- #
+
+OLD_DEST = b"OLD_DESTINATION"
+CONCURRENT = b"CONCURRENT_ENTRY"
+
+
+def _racing_link_at_publish(monkeypatch, *, leaf, occupant, victim_path):
+    """One-shot interposition at the publication link: a concurrent actor
+    lands ``leaf`` (regular file or symlink) AFTER the old destination was
+    moved to trash and BEFORE the descriptor-bound link, forcing EEXIST."""
+    real_link = os.link
+    state = {"fired": False}
+
+    def racing_link(src, dst, **kwargs):
+        if (
+            not state["fired"]
+            and dst == leaf
+            and str(src).startswith("/proc/self/fd/")
+        ):
+            state["fired"] = True
+            parent_fd = kwargs.get("dst_dir_fd")
+            if occupant == "file":
+                fd = os.open(
+                    leaf,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o644,
+                    dir_fd=parent_fd,
+                )
+                os.write(fd, CONCURRENT)
+                os.close(fd)
+            else:
+                os.symlink(victim_path, leaf, dir_fd=parent_fd)
+        return real_link(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "link", racing_link)
+    return state
+
+
+@pytest.mark.parametrize("occupant", ["file", "symlink"], ids=["concurrent-file", "concurrent-symlink"])
+def test_rollback_never_clobbers_concurrent_creator_dest_present(
+    tmp_path, monkeypatch, occupant,
+):
+    """Old destination present: publication fails EEXIST after the trash
+    rename; the rollback must NOT replace the concurrent entry.  The old
+    destination is preserved under its recoverable private trash name;
+    neither party's data is discarded."""
+    sb = _sandbox(tmp_path)
+    (sb / "target.txt").write_bytes(OLD_DEST)
+    victim = sb / "victim.txt"
+    victim.write_bytes(VICTIM)
+    cap = FilesystemWriteCapability(sb)
+    _racing_link_at_publish(
+        monkeypatch, leaf="target.txt", occupant=occupant,
+        victim_path=victim,
+    )
+
+    with pytest.raises(CapabilityError) as excinfo:
+        cap.execute("write", {
+            "path": "target.txt", "content": "NEW", "overwrite": True,
+        })
+    message = str(excinfo.value)
+    assert "nothing was overwritten" in message
+    assert "preserved at" in message
+
+    # The concurrent entry is intact at the destination name.
+    if occupant == "file":
+        assert (sb / "target.txt").read_bytes() == CONCURRENT
+    else:
+        assert (sb / "target.txt").is_symlink()
+        assert victim.read_bytes() == VICTIM
+    # The old destination survives under a recoverable private name.
+    trash_entries = [
+        p for p in sb.iterdir() if p.name.endswith(".arion-replace-tmp")
+    ]
+    assert len(trash_entries) == 1
+    assert trash_entries[0].read_bytes() == OLD_DEST
+    # Our staging file was safely cleaned up (never the substituted entry,
+    # which never appeared here).
+    staging_left = [
+        p for p in sb.iterdir() if p.name.endswith(".arion-write-tmp")
+    ]
+    assert staging_left == []
+    monkeypatch.undo()
+
+
+@pytest.mark.parametrize("occupant", ["file", "symlink"], ids=["concurrent-file", "concurrent-symlink"])
+def test_no_rollback_clobber_dest_absent_concurrent_creator(
+    tmp_path, monkeypatch, occupant,
+):
+    """Destination absent: the concurrent creator lands at the free name
+    before the descriptor link.  The link fails EEXIST and there is no
+    rollback - the concurrent entry must survive untouched."""
+    sb = _sandbox(tmp_path)
+    victim = sb / "victim.txt"
+    victim.write_bytes(VICTIM)
+    cap = FilesystemWriteCapability(sb)
+    _racing_link_at_publish(
+        monkeypatch, leaf="target.txt", occupant=occupant,
+        victim_path=victim,
+    )
+
+    with pytest.raises(CapabilityError) as excinfo:
+        cap.execute("write", {
+            "path": "target.txt", "content": "NEW", "overwrite": True,
+        })
+    assert "concurrent entry" in str(excinfo.value)
+    assert "nothing was overwritten" in str(excinfo.value)
+
+    if occupant == "file":
+        assert (sb / "target.txt").read_bytes() == CONCURRENT
+    else:
+        assert (sb / "target.txt").is_symlink()
+        assert victim.read_bytes() == VICTIM
+    # No trash existed; nothing of ours was left behind.
+    assert [
+        p for p in sb.iterdir() if p.name.endswith(".arion-replace-tmp")
+    ] == []
+    assert [
+        p for p in sb.iterdir() if p.name.endswith(".arion-write-tmp")
+    ] == []
+    monkeypatch.undo()
