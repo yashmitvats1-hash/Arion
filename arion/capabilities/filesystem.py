@@ -5,6 +5,18 @@ and uses NO shell execution. All paths are resolved against the configured
 sandbox root and must stay inside it (symlink-safe). Access is allowed only
 for the requested mode.
 
+F05 boundary statement (issue #23 fifth pass): unlike filesystem.write /
+filesystem.append / git.log, this capability is PATH-BASED (``Path.resolve``
+containment + check-then-use), NOT descriptor-relative under the ``dirfs``
+pinned-root/no-follow boundary.  It therefore does not share the dirfs
+root-identity and component-substitution guarantees; the residual
+same-user check-then-use window on read/list is explicitly OUTSIDE the F05
+descriptor guarantee.  What IS enforced here: exact-``.git`` path
+components are refused for read/list (lexical and resolved-through-symlink)
+and ``.git`` entries are filtered from listings - repository metadata is
+exposed only through the dedicated ``git.log`` capability.  Ordinary names
+(``.gitmodules``, ``*.git``) stay accessible.
+
 Mutating filesystem actions live in their OWN capabilities behind the same
 boundary model (filesystem.write - ADR-019, filesystem.append - ADR-020).
 Delete/move/glob/stat are explicitly NOT built yet.
@@ -13,9 +25,10 @@ Delete/move/glob/stat are explicitly NOT built yet.
 from __future__ import annotations
 
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
+from arion.capabilities.dirfs import has_git_metadata_component, refuse_git_metadata_access
 from arion.capabilities.registry import ActionSpec, CapabilityError
 
 _MAX_READ_BYTES = 1_000_000  # 1 MB per file, hard cap
@@ -82,7 +95,13 @@ class FilesystemReadCapability:
         rel = params.get("path")
         if not isinstance(rel, str) or not rel:
             raise CapabilityError("read requires string param 'path'")
+        # F05: refuse Git metadata by lexical component AND by resolved
+        # path (a symlink alias into .git resolves to a .git component).
+        refuse_git_metadata_access(PurePosixPath(rel).parts, action="read")
         path = self._resolve_inside(rel)
+        refuse_git_metadata_access(
+            path.relative_to(self.sandbox_root).parts, action="read",
+        )
         if not path.is_file():
             raise CapabilityError(f"not a file: {rel!r}")
         size = path.stat().st_size
@@ -105,12 +124,18 @@ class FilesystemReadCapability:
         rel = params.get("path", ".")
         if not isinstance(rel, str):
             raise CapabilityError("list param 'path' must be a string")
+        refuse_git_metadata_access(PurePosixPath(rel).parts, action="list")
         path = self._resolve_inside(rel)
+        refuse_git_metadata_access(
+            path.relative_to(self.sandbox_root).parts, action="list",
+        )
         if not path.is_dir():
             raise CapabilityError(f"not a directory: {rel!r}")
         entries = []
         for child in sorted(path.iterdir()):
             try:
+                if has_git_metadata_component((child.name,)):
+                    continue  # .git metadata is never enumerated here
                 entries.append({"name": child.name, "is_dir": child.is_dir()})
             except OSError:
                 continue  # unreadable entry: skip, do not fail the whole listing

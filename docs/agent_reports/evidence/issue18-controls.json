@@ -1,0 +1,38 @@
+[
+  {
+    "control": "model_forbidden_authority_field",
+    "rejected": true
+  },
+  {
+    "control": "model_extra_param",
+    "rejected": true
+  },
+  {
+    "control": "model_omitted_resource",
+    "rejected": true
+  },
+  {
+    "control": "model_oversized_param",
+    "rejected": true
+  },
+  {
+    "control": "model_deep_nesting",
+    "rejected": true
+  },
+  {
+    "control": "tool_output_non_mapping",
+    "rejected": true
+  },
+  {
+    "control": "tool_output_non_string_key",
+    "rejected": true
+  },
+  {
+    "control": "tool_output_cyclic",
+    "rejected": true
+  },
+  {
+    "control": "tool_output_oversize",
+    "rejected": true
+  }
+]

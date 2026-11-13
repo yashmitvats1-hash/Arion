@@ -1,0 +1,144 @@
+[
+  {
+    "case": "deterministic_rename",
+    "episode_outcome": "completed",
+    "executed": [
+      [
+        "filesystem.read",
+        "read",
+        {
+          "path": "source.txt"
+        }
+      ]
+    ],
+    "goal_status": "completed",
+    "reflection_confidence": "high",
+    "reproduced": true,
+    "source_unchanged": true,
+    "target_exists": false,
+    "task_status": "completed"
+  },
+  {
+    "case": "model_rename",
+    "executed": [
+      [
+        "filesystem.read",
+        "read"
+      ]
+    ],
+    "goal_status": "completed",
+    "plan_source": "model",
+    "reproduced": true,
+    "target_exists": false
+  },
+  {
+    "capability_executions": 0,
+    "case": "memory_skip",
+    "goal_status": "completed",
+    "last_step_statuses": [
+      "skipped"
+    ],
+    "reproduced": true,
+    "skipped_reason": "prior failure (execution): not a file: 'notes.txt'",
+    "task_statuses": [
+      "failed",
+      "completed"
+    ]
+  },
+  {
+    "case": "http_500",
+    "goal_status": "completed",
+    "http_status": 500,
+    "reproduced": true,
+    "requests": [
+      "https://allowed.example.invalid/data"
+    ],
+    "verification_policy": "schema_keys"
+  },
+  {
+    "actions": [
+      [
+        "git.log",
+        "log"
+      ],
+      [
+        "git.log",
+        "branches"
+      ]
+    ],
+    "case": "git_dotgit_symlink",
+    "outside_content_observed": true,
+    "reproduced": true,
+    "task_status": "completed"
+  },
+  {
+    "case": "write_temp_symlink",
+    "goal_status": "completed",
+    "inside_is_symlink": true,
+    "outside_after": "AGENT_PAYLOAD",
+    "outside_before": "ORIGINAL",
+    "reproduced": true,
+    "verification_policy": "write_verified"
+  },
+  {
+    "approval_count": 1,
+    "approval_params_keys": [
+      "content",
+      "overwrite",
+      "path"
+    ],
+    "case": "approval_payload_swap",
+    "file_content": "SUBSTITUTED_PAYLOAD",
+    "fingerprint_unchanged": true,
+    "goal_status": "completed",
+    "reproduced": true
+  },
+  {
+    "body": "OFF_POLICY_BODY",
+    "case": "redirect_allowlist_mismatch",
+    "direct_b_allowed_by_policy": false,
+    "goal_status": "completed",
+    "reproduced": true,
+    "requests": [
+      "https://a.example.invalid/start",
+      "https://b.example.invalid/data"
+    ]
+  },
+  {
+    "case": "provider_unbounded_read",
+    "configured_max_bytes": 64,
+    "oversize_rejected_after_read": true,
+    "read_arguments": [
+      null
+    ],
+    "reproduced": true
+  },
+  {
+    "after_crash": "BASEA",
+    "after_restart": "BASEAA",
+    "append_attempts_total": 2,
+    "case": "crash_append_duplicate",
+    "child_returncode": 86,
+    "goal_status": "completed",
+    "recovery_records": 0,
+    "reproduced": true,
+    "resumed_task_status": "completed",
+    "task_status": "completed"
+  },
+  {
+    "case": "declaration_taxonomy_fail_open",
+    "reproduced": true,
+    "unknown_risk_completed_without_approval": true,
+    "unknown_side_effect_completed_without_mutation_lock": true
+  },
+  {
+    "case": "observation_non_finite",
+    "contract": "normalize_observation promises finite JSON but json.dumps allows NaN/Infinity",
+    "finding": "F12",
+    "goal_status": "completed",
+    "persisted_inf": true,
+    "persisted_nan": true,
+    "reproduced": true,
+    "task_status": "completed"
+  }
+]

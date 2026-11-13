@@ -40,6 +40,13 @@ from arion.capabilities.registry import (
 from arion.cognition.goals import GoalPlanLineageError
 from arion.state.approvals import ApprovalError, ApprovalRequest, ApprovalStatus, ApprovalStore
 from arion.state.locks import GOAL_RUN_RESOURCE_KIND
+from arion.state.intents import (
+    MutationIntent,
+    MutationIntentError,
+    OUTCOME_FAILED,
+    OUTCOME_RECOVERY,
+    OUTCOME_SUCCEEDED,
+)
 from arion.state.recovery import MutationRecovery, RecoveryError, RecoveryStatus
 from arion.state.scheduler_work import SchedulerStateError, SchedulerWorkStatus
 from arion.intelligence.plan_schema import PlanValidationError
@@ -319,6 +326,13 @@ class ArionEngine:
         """
         if self.recovery_store is None or not goal_id:
             return False
+        lister = getattr(self.recovery_store, "list_recoveries", None)
+        if not callable(lister):
+            # No recovery API: no durable recovery records can exist here.
+            # The dispatch invariant guarantees journaled replay-unsafe
+            # mutations never ran without a usable registry, and crash
+            # residue is fenced at task execution (issue #23 F10).
+            return False
         return any(
             r.status == RecoveryStatus.REQUIRED
             for r in self.recovery_store.list_recoveries(goal_id=goal_id)
@@ -347,7 +361,7 @@ class ArionEngine:
 
     def _reconcile_missing_recovery_records(self, goal_id: str) -> None:
         """Repair a task-only fallback after recovery-table unavailability."""
-        if self.recovery_store is None:
+        if self.recovery_store is None or not self._recovery_mechanism_usable():
             return
         for task in self.storage.list_tasks(status=TaskStatus.FAILED.value):
             if task.goal_id != goal_id:
@@ -374,6 +388,13 @@ class ArionEngine:
         callers that resume a task directly (ADR-040).
         """
         if task.status in TASK_TERMINAL_STATUSES or self.recovery_store is None:
+            return False
+        lister = getattr(self.recovery_store, "list_recoveries", None)
+        if not callable(lister):
+            # No recovery API at all: no durable recovery records can exist
+            # here (the dispatch invariant guarantees journaled replay-unsafe
+            # mutations never ran without a usable registry).  Crash residue
+            # is fenced - fail closed - at the in-doubt mutation fence.
             return False
         try:
             own = [
@@ -409,6 +430,42 @@ class ArionEngine:
             "recovery_fenced": True,
         })
         return True
+
+    def _fail_task_unreadable_journal(
+        self, task: Task, candidates: list[PlanStep],
+    ) -> None:
+        """Terminalize a task closed when the mutation journal is UNREADABLE.
+
+        Absent/raising/malformed intent enumeration leaves dispatch state
+        UNKNOWN (issue #23 fourth pass).  The task fails with zero further
+        capability invocations; the journal is left completely untouched -
+        an unreadable journal is never interpreted as "no open intents" and
+        its intents are never silently cleared or settled - and no recovery
+        record is created, because an obligation cannot be grounded in
+        evidence we cannot read.  The replay-unsafe steps' outcomes stay
+        unknown (non-terminal), exactly like
+        ``_fail_in_doubt_without_recovery``.
+        """
+        detail = sanitize_error_text(
+            "mutation journal unreadable: cannot verify dispatch state for "
+            f"replay-unsafe step(s) {sorted(c.index for c in candidates)}; "
+            "failing closed - no capability ran, nothing was replayed, and "
+            "the journal was not modified",
+            max_length=500,
+        )
+        for candidate in candidates:
+            candidate.error = candidate.error or detail
+        task.status = TaskStatus.FAILED
+        task.error = detail
+        task.completed_at = task.completed_at or utcnow()
+        try:
+            self.storage.save_task(task)
+        except TaskStateError:
+            canonical = self.storage.load_task(task.id)
+            canonical.status = TaskStatus.FAILED
+            canonical.error = detail
+            canonical.completed_at = canonical.completed_at or utcnow()
+            self.storage.save_task(canonical)
 
     def _record_recovery_required(self, task: Task, step: PlanStep, spec,
                                   reason: str) -> MutationRecovery | None:
@@ -512,6 +569,12 @@ class ArionEngine:
                 if canonical is not None:
                     task.__dict__.update(canonical.__dict__)
 
+        # Issue #23 / F10: a durable recovery record IS the settlement of an
+        # uncertain mutation - close the intent row (bookkeeping), linked to
+        # the recovery record's id.
+        self._settle_mutation_intents(
+            task.id, step, OUTCOME_RECOVERY, recovery_id=rec.recovery_id,
+        )
         if created:
             self._emit("recovery.required", task_id=task.id, step_id=_step_id(step),
                        success=False, detail={
@@ -558,6 +621,14 @@ class ArionEngine:
         and the goal may plan again' - it cannot execute a capability, cannot
         grant authorization, cannot reuse or resurrect approvals, and cannot
         erase the mutation-failure history (the record + audit trail persist).
+
+        Fresh-authorization invariant (issue #23): acknowledgement is NOT
+        authorization for the next attempt.  The re-execution is a NEW task
+        that passes through the full live authorization pipeline - a FRESH
+        approval decision is solicited per execution attempt, and a denial
+        is honored (the mutation does not run).  The ack itself solicits no
+        approval and touches no file (regression-tested in
+        ``tests/test_recovery_ack_fresh_authorization.py``).
         """
         if self.recovery_store is None:
             raise RecoveryError("recovery registry is not available on this engine")
@@ -606,6 +677,291 @@ class ArionEngine:
             except Exception:
                 pass
         return self.recovery_store.get_recovery(recovery_id)
+
+    # ---------- durable mutation intents / crash integrity (issue #23 / F10) ----------
+
+    def _recovery_mechanism_usable(self) -> bool:
+        """True when the engine can durably create, enumerate and acknowledge
+        recovery obligations - the mandatory companion of every journaled
+        replay-unsafe mutation (issue #23 F10 recovery capability invariant).
+
+        A usable mechanism must cover the full lifecycle: create the
+        obligation (``create_recovery`` or ``commit_recovery_requirement``),
+        enumerate it (``list_recoveries``), inspect it (``get_recovery``)
+        and acknowledge it (``transition_recovery``).  Anything less cannot
+        fence an in-doubt mutation after a crash - so such a mutation must
+        never be dispatched in the first place.
+        """
+        store = self.recovery_store
+        if store is None:
+            return False
+        can_create = (
+            callable(getattr(store, "create_recovery", None))
+            or callable(getattr(store, "commit_recovery_requirement", None))
+        )
+        return (
+            can_create
+            and callable(getattr(store, "list_recoveries", None))
+            and callable(getattr(store, "get_recovery", None))
+            and callable(getattr(store, "transition_recovery", None))
+        )
+
+    def _persist_mutation_intent(self, task: Task, step: PlanStep, spec) -> None:
+        """Durably journal a replay-unsafe mutation BEFORE dispatch.
+
+        Called immediately before the capability is invoked for a mutating,
+        non-retry-safe action.  Any failure here fails CLOSED: the capability
+        never executes, so no side effect exists and no recovery record is
+        required (same contract as a refused mutation lock).
+
+        Recovery capability invariant (issue #23 F10): a journaled
+        replay-unsafe mutation must NEVER execute unless the engine has a
+        usable recovery mechanism.  A storage configuration that can journal
+        the mutation but cannot record/enumerate/acknowledge its recovery
+        obligation would leave a crash window with NO way to fence the
+        uncertain side effect - dispatch is refused before the journal row
+        and before the capability runs.
+
+        Journal-interface completeness (issue #23 fourth pass): the storage
+        must expose the COMPLETE journal contract - durable recording AND
+        reliable open-intent enumeration AND point-read AND settlement.  A
+        recorder without an enumerator could take this intent and then hide
+        it after a crash (the resume fence reads the JOURNAL, not the
+        registry), so the journal is probed for readability BEFORE the row
+        is written and long before any capability runs.
+        """
+        if not self._recovery_mechanism_usable():
+            raise MutationIntentError(
+                "no usable recovery mechanism (cannot durably create, "
+                "enumerate and acknowledge recovery obligations); "
+                "refusing to dispatch a journaled replay-unsafe mutation"
+            )
+        for name in (
+            "record_mutation_intent",
+            "list_mutation_intents",
+            "get_mutation_intent",
+            "settle_mutation_intent",
+        ):
+            if not callable(getattr(self.storage, name, None)):
+                raise MutationIntentError(
+                    "storage exposes an incomplete mutation-intent journal "
+                    f"interface (missing {name}): refusing to dispatch a "
+                    "journaled replay-unsafe mutation"
+                )
+        if self._journal_open_steps(task) is None:
+            raise MutationIntentError(
+                "mutation-intent journal enumeration is unusable (absent, "
+                "raising, or malformed): refusing to dispatch a journaled "
+                "replay-unsafe mutation"
+            )
+        recorder = self.storage.record_mutation_intent
+        resource = (
+            step.params.get(spec.resource_param)
+            if getattr(spec, "resource_param", None) else None
+        )
+        recorder(MutationIntent(
+            intent_id=new_id("intent"),
+            task_id=task.id,
+            step_index=step.index,
+            attempt=step.attempts,
+            capability=step.capability,
+            action=step.action,
+            resource=resource if isinstance(resource, str) else None,
+        ))
+
+    def _settle_mutation_intents(
+        self, task_id: str, step: PlanStep, outcome: str,
+        recovery_id: str | None = None,
+    ) -> None:
+        """Best-effort bookkeeping: close the intent row once the outcome is
+        durable.  The in-doubt fence treats a durable terminal step (or a
+        recovery record) as authoritative settlement regardless of row
+        state, so a failure here is never unsafe - and settlement as
+        'recovery' passes the durable recovery record's id (the store
+        refuses a fake recovery settlement)."""
+        settler = getattr(self.storage, "settle_mutation_intent", None)
+        if not callable(settler):
+            return
+        try:
+            settler(task_id=task_id, step_index=step.index, outcome=outcome,
+                    recovery_id=recovery_id)
+        except Exception:
+            pass
+
+    def _journal_open_steps(self, task: Task) -> set[int] | None:
+        """Step indexes with open (in-flight) mutation intents for the task.
+
+        Returns ``None`` when the journal cannot be verified: the enumerator
+        is absent, raises, or returns malformed rows.  ``None`` NEVER means
+        "no open intents" - an unreadable journal is an UNKNOWN, and an
+        unknown fails closed (issue #23 fourth pass): never replay, never
+        silently clear or settle intents one cannot read.
+        """
+        lister = getattr(self.storage, "list_mutation_intents", None)
+        if not callable(lister):
+            return None
+        try:
+            rows = lister(task_id=task.id, open_only=True)
+            if rows is None:
+                return None
+            open_steps: set[int] = set()
+            for row in rows:
+                index = getattr(row, "step_index", None)
+                if isinstance(index, bool) or not isinstance(index, int):
+                    # Malformed row: the enumerator cannot be trusted.
+                    return None
+                open_steps.add(index)
+            return open_steps
+        except Exception:
+            return None
+
+    def _replay_unsafe_unfinished(
+        self, task: Task, step: PlanStep | None = None,
+    ) -> list[PlanStep]:
+        """Replay-unsafe non-terminal steps of the task (or just ``step``)."""
+        candidates = [step] if step is not None else list(task.steps)
+        terminal = (
+            StepStatus.SUCCEEDED, StepStatus.FAILED, StepStatus.SKIPPED
+        )
+        unfinished: list[PlanStep] = []
+        for candidate in candidates:
+            if candidate.status in terminal:
+                continue
+            spec = self.registry.action_spec(
+                candidate.capability, candidate.action
+            )
+            if spec is None:
+                # Unfinished dispatch of an unclassifiable action: replay
+                # safety cannot be proven -> treated as replay-unsafe.
+                unfinished.append(candidate)
+                continue
+            if getattr(spec, "retry_safe", False):
+                continue  # replay after a crash is the declared contract
+            if not is_mutating(spec):
+                continue
+            unfinished.append(candidate)
+        return unfinished
+
+    def _in_doubt_steps(
+        self, task: Task, step: PlanStep | None = None,
+    ) -> list[PlanStep] | None:
+        """Return replay-unsafe steps whose mutation intent is unsettled.
+
+        An open (in_flight) intent with no durable terminal step outcome
+        means the process died in the side-effect/persistence window: the
+        mutation MAY already have applied.  Retry-safe actions are excluded
+        (replay is their declared contract).  An unreadable journal fails
+        closed - uncertainty about dispatch state fences, never replays.
+
+        Recovery-registry availability is deliberately NOT consulted here
+        (issue #23 F10): an engine that journaled the mutation but has no
+        usable recovery mechanism must still detect the in-doubt step and
+        fail closed - never replay it because the fence cannot record a
+        recovery obligation.
+
+        Returns ``None`` when the journal cannot be enumerated (absent,
+        raising, or malformed enumeration) and at least one replay-unsafe
+        step is unfinished (issue #23 fourth pass).  Dispatch state is then
+        UNKNOWN and the caller must fail closed without replaying or
+        settling anything - a recorder without an enumerator can hide an
+        in-flight intent, so a missing/raising/untrusted enumerator is
+        NEVER read as "no open intents".
+        """
+        unfinished = self._replay_unsafe_unfinished(task, step=step)
+        if not unfinished:
+            return []
+        open_steps = self._journal_open_steps(task)
+        if open_steps is None:
+            return None
+        return [c for c in unfinished if c.index in open_steps]
+
+    def _fence_task_on_in_doubt_mutation(
+        self, task: Task, step: PlanStep | None = None,
+    ) -> bool:
+        """Fence in-doubt replay-unsafe mutations into recovery (issue #23).
+
+        A hard crash between side effect and outcome persistence leaves the
+        mutation uncertain.  Blind replay could duplicate a non-retry-safe
+        append; instead each in-doubt step gets a durable REQUIRED recovery
+        record and the task fails closed until an operator acknowledges it
+        (ADR-020 semantics).  When NO usable recovery mechanism exists the
+        task still fails closed (``_fail_in_doubt_without_recovery``): the
+        mutation is never replayed and never marked complete.  Returns True
+        when at least one step fenced.  When the journal itself cannot be
+        enumerated the task fails closed WITHOUT touching it (``None``
+        result from ``_in_doubt_steps``): no capability runs, no intent is
+        cleared or settled, and no recovery record is fabricated from
+        evidence we cannot read (issue #23 fourth pass).
+        """
+        if task.status in TASK_TERMINAL_STATUSES:
+            return False
+        in_doubt = self._in_doubt_steps(task, step=step)
+        if in_doubt is None:
+            self._fail_task_unreadable_journal(
+                task, self._replay_unsafe_unfinished(task, step=step),
+            )
+            return True
+        fenced = False
+        for candidate in in_doubt:
+            spec = self.registry.action_spec(
+                candidate.capability, candidate.action
+            )
+            reason = (
+                "in-doubt non-retry-safe mutation after interruption "
+                "(intent journaled, outcome unknown); recovery required "
+                "instead of blind replay"
+            )
+            if not self._recovery_mechanism_usable():
+                self._fail_in_doubt_without_recovery(task, candidate, reason)
+                fenced = True
+                continue
+            rec = self._record_recovery_required(task, candidate, spec, reason)
+            self._settle_mutation_intents(
+                task.id, candidate, OUTCOME_RECOVERY,
+                recovery_id=getattr(rec, "recovery_id", None),
+            )
+            fenced = True
+        return fenced
+
+    def _fail_in_doubt_without_recovery(
+        self, task: Task, step: PlanStep, reason: str,
+    ) -> None:
+        """Terminalize a task closed around an in-doubt mutation that has NO
+        usable recovery mechanism (issue #23 F10).
+
+        Fail closed, with evidence preserved: the task fails terminal (never
+        re-run); the step stays NON-terminal because its outcome is genuinely
+        unknown; the mutation-intent row stays OPEN as durable evidence that
+        the mutation may exist.  Nothing is replayed and the mutation is
+        never marked complete.  The task itself is terminal (ADR-020: never
+        re-run), so if a usable recovery mechanism is configured later the
+        open intent stands as the durable evidence an operator reconciles
+        explicitly - a fresh plan goes through the full live authorization
+        pipeline and carries its own intent.
+        """
+        error = sanitize_error_text(
+            f"recovery required: {reason}; no usable recovery mechanism is "
+            f"configured ({step.capability}.{step.action} step "
+            f"{step.index}), so the mutation is not replayed and not marked "
+            f"complete",
+            max_length=500,
+        )
+        step.error = step.error or error
+        task.status = TaskStatus.FAILED
+        task.error = error
+        task.completed_at = task.completed_at or utcnow()
+        try:
+            self.storage.save_task(task)
+        except TaskStateError:
+            canonical = self.storage.load_task(task.id)
+            if canonical is not None:
+                task.__dict__.update(canonical.__dict__)
+        self._emit("task.failed", task_id=task.id, detail={
+            "step_index": step.index,
+            "error": error,
+            "recovery_required": True,
+        })
+        self._record_memory(task)
 
     # ---------- per-goal run ownership (ADR-045/052) ----------
 
@@ -2925,6 +3281,13 @@ class ArionEngine:
         if self._fence_task_on_open_recovery(task):
             return task
 
+        # Issue #23 / F10: a journaled mutation intent without a durable
+        # outcome means the side effect may already exist (hard crash in the
+        # side-effect/persistence window).  Fence into recovery - never
+        # blindly replay a non-retry-safe mutation.
+        if self._fence_task_on_in_doubt_mutation(task):
+            return task
+
         if not task.steps:
             task = self._plan(task, goal_run_claim=goal_run_claim)
             if self._goal_is_paused(task):
@@ -2989,6 +3352,8 @@ class ArionEngine:
                     task, phase="execution dispatch"):
                 return task
             if self._fence_task_on_open_recovery(task):
+                return task
+            if self._fence_task_on_in_doubt_mutation(task):
                 return task
 
             pending = [i for i, st in enumerate(task.steps) if st.status == StepStatus.PENDING]
@@ -3235,6 +3600,9 @@ class ArionEngine:
                     results[tid] = task
                     continue
                 if self._fence_task_on_open_recovery(task):
+                    results[tid] = task
+                    continue
+                if self._fence_task_on_in_doubt_mutation(task):
                     results[tid] = task
                     continue
                 if not task.steps:
@@ -4280,6 +4648,15 @@ class ArionEngine:
                         task.__dict__.update(durable.__dict__)
                 except BaseException as exc:
                     persistence_error = exc
+            # Issue #23 / F10: terminal outcome persisted (or adopted) above,
+            # so the mutation-intent journal row can be closed (bookkeeping).
+            if step.status in (
+                    StepStatus.SUCCEEDED, StepStatus.FAILED, StepStatus.SKIPPED):
+                self._settle_mutation_intents(
+                    task.id, step,
+                    OUTCOME_SUCCEEDED if step.status == StepStatus.SUCCEEDED
+                    else OUTCOME_FAILED,
+                )
 
             if work_id is not None and self.scheduler_registry is not None:
                 terminal = (
@@ -4317,6 +4694,12 @@ class ArionEngine:
     ) -> None:
         if not self._goal_run_allows_task(
                 task, goal_run_claim, "capability pipeline"):
+            return
+        # Issue #23 / F10 choke point: NEVER re-dispatch a replay-unsafe
+        # mutation whose journaled intent is unsettled.  A crash between the
+        # side effect and outcome persistence leaves the step in doubt; it
+        # fences into recovery here instead of being replayed blindly.
+        if self._fence_task_on_in_doubt_mutation(task, step=step):
             return
         self._emit(
             "step.started",
@@ -4824,6 +5207,16 @@ class ArionEngine:
                 self._release_mutation_lock(lock, task, step)
                 if persistence_error is not None:
                     raise persistence_error
+            # Issue #23 / F10: once the terminal step outcome is durable,
+            # close the mutation-intent journal row (bookkeeping; the fence
+            # treats the durable snapshot as authoritative regardless).
+            if step.status in (
+                    StepStatus.SUCCEEDED, StepStatus.FAILED, StepStatus.SKIPPED):
+                self._settle_mutation_intents(
+                    task.id, step,
+                    OUTCOME_SUCCEEDED if step.status == StepStatus.SUCCEEDED
+                    else OUTCOME_FAILED,
+                )
 
     def _execute_attempts(
         self,
@@ -4847,6 +5240,27 @@ class ArionEngine:
                 return
             step.attempts += 1
             step.status = StepStatus.RUNNING
+            if mutating and not spec.retry_safe:
+                # Issue #23 / F10: durably journal the mutation intent BEFORE
+                # dispatch.  A hard crash after the side effect but before the
+                # outcome is persisted leaves this row open, and the resume
+                # path fences it into recovery instead of replaying blindly.
+                # If the journal cannot be written, the capability NEVER
+                # executes (fail closed) and no side effect exists.
+                try:
+                    self._persist_mutation_intent(task, step, spec)
+                except Exception as exc:
+                    step.status = StepStatus.FAILED
+                    step.result = None
+                    step.error = sanitize_error_text(
+                        f"mutation intent persistence failed closed: {exc}",
+                        max_length=500,
+                    )
+                    self._emit(
+                        "error", task_id=task.id, step_id=_step_id(step),
+                        success=False, detail={"error": step.error},
+                    )
+                    return
             if mutating:
                 self._emit("mutation.attempted", task_id=task.id, step_id=_step_id(step), detail={
                     "capability": getattr(capability, "name", step.capability),
@@ -5096,6 +5510,10 @@ class ArionEngine:
             # mutation - prior_size + exactly the appended bytes must equal the
             # reported new size, and the appended bytes must match the planned
             # content length. Deterministic, no filesystem re-check needed.
+            # NOTE (issue #23 F10): this is a size-arithmetic postcondition
+            # ONLY - it is NOT an independent duplicate-execution detector.
+            # Duplicate prevention is the mutation-intent journal plus the
+            # in-doubt fence (see ADR-064).
             expected = None
             content = step.params.get("content")
             if isinstance(content, str):

@@ -7,8 +7,10 @@ A restarted scheduler must fail closed and durably:
 - death while work is RUNNING -> stale leases are reclaimed (ABANDONED), no
   immortal RUNNING worker;
 - a crash after mutation-lock acquisition, before mutation execution -> the
-  stale lock is reclaimed through the EXISTING lock store and the step runs
-  the fresh authorization/recovery path exactly once;
+  stale lock is reclaimed through the EXISTING lock store and the step
+  re-enters the fresh authorization/approval/lock pipeline; a replay-unsafe
+  mutation whose dispatch is left in doubt fences into recovery (issue #23
+  / F10) and executes exactly once after explicit acknowledgement;
 - restart with multiple goals pending preserves approval/mutation-lock/FIFO
   state and never blindly replays a completed mutation;
 - one abandoned task is recovered while unrelated goals continue.
@@ -344,7 +346,12 @@ def test_subprocess_crash_running_reclaims_and_reruns_exactly_once(tmp_path):
     assert st.reclaim_stale(now=_iso_future(60)) == [running[0].work_id]
     st.close()
 
-    # fresh engine: run the goal to completion - exactly one mutation
+    # fresh engine: the in-doubt non-retry-safe mutation must NOT be blindly
+    # replayed (issue #23 / F10). The child died INSIDE capability dispatch
+    # after its mutation intent was journaled - whether the side effect
+    # applied is UNCERTAIN - so the reclaimed step re-enters the pipeline and
+    # fences into recovery instead of re-executing (ADR-020 restart
+    # guarantee: each task attempts its mutation at most once).
     from tests.test_cross_goal_concurrency import _env as _env2
     from tests.test_cross_goal_concurrency import _write_step as _ws
 
@@ -354,6 +361,23 @@ def test_subprocess_crash_running_reclaims_and_reruns_exactly_once(tmp_path):
     # the task persisted by the child is loaded by goal_id
     goals = env.gm.list_goals() if hasattr(env.gm, "list_goals") else []
     assert len(goals) == 1
+    results = env.engine.run_goals([goals[0].id])
+    assert results[goals[0].id].status == GoalStatus.BLOCKED
+    # no blind replay: still exactly one dispatch attempt (the child's), and
+    # the uncertain mutation is fenced into a REQUIRED recovery record
+    attempted = [e for e in env.storage.list_events() if e.kind == "mutation.attempted"]
+    assert len(attempted) == 1
+    assert (sb / "a.txt").read_text(encoding="utf-8") == "a"
+    from arion.state.recovery import RecoveryStatus
+    recoveries = env.engine.recovery_store.list_recoveries(goal_id=goals[0].id)
+    assert len(recoveries) == 1
+    assert recoveries[0].status == RecoveryStatus.REQUIRED
+
+    # explicit operator acknowledgement unblocks the goal; the fresh plan is
+    # a NEW task with its own live authorization and runs the mutation
+    # exactly once - the eventual outcome is still exactly-once, now behind
+    # the recovery gate instead of a blind replay.
+    env.engine.acknowledge_recovery(recoveries[0].recovery_id, actor="operator")
     results = env.engine.run_goals([goals[0].id])
     assert results[goals[0].id].status == GoalStatus.COMPLETED
     assert (sb / "a.txt").read_text(encoding="utf-8") == "x"

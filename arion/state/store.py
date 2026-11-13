@@ -150,6 +150,22 @@ CREATE TABLE IF NOT EXISTS mutation_recoveries (
 );
 CREATE INDEX IF NOT EXISTS idx_recoveries_goal ON mutation_recoveries(goal_id, status);
 CREATE INDEX IF NOT EXISTS idx_recoveries_task ON mutation_recoveries(task_id, step_index);
+CREATE TABLE IF NOT EXISTS mutation_intents (
+    intent_id   TEXT PRIMARY KEY,
+    task_id     TEXT NOT NULL,
+    step_index  INTEGER NOT NULL,
+    attempt     INTEGER NOT NULL,
+    capability  TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    resource    TEXT,
+    status      TEXT NOT NULL,
+    outcome     TEXT,
+    created_at  TEXT NOT NULL,
+    settled_at  TEXT,
+    recovery_id TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_intents_task_step ON mutation_intents(task_id, step_index);
+CREATE INDEX IF NOT EXISTS idx_intents_status ON mutation_intents(status);
 CREATE TABLE IF NOT EXISTS mutation_locks (
     lock_id      TEXT PRIMARY KEY,
     resource_kind TEXT NOT NULL,
@@ -368,10 +384,33 @@ class SQLiteStorage:
         self._conn = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=10000")
+        # Durability contract (issue #23 fifth pass): the mutation-intent
+        # journal and the recovery registry are the evidence that guards
+        # against duplicate side effects, so committed rows must survive a
+        # POWER LOSS, not only a process crash.  synchronous=FULL (set
+        # EXPLICITLY - do not rely on build/runtime defaults; measured
+        # value on this build was already 2/FULL) makes every committed
+        # transaction fsync the WAL before commit returns:
+        #   - process crash: WAL replay restores ALL committed rows;
+        #   - power loss: WAL replay restores all committed rows (FULL
+        #     syncs the WAL tail per commit; NORMAL would risk losing the
+        #     latest commits).
+        # Verified below by reading the pragma back; if the engine cannot
+        # obtain FULL durability it fails closed - an unverifiable journal
+        # cannot back the F10 recovery invariant.
+        self._conn.execute("PRAGMA synchronous=FULL")
+        effective = self._conn.execute("PRAGMA synchronous").fetchone()[0]
+        if effective != 2:  # 2 == FULL
+            raise RuntimeError(
+                f"SQLite synchronous={effective} (expected 2/FULL): the "
+                "mutation-intent journal requires power-loss durability; "
+                "refusing to open storage"
+            )
         self._conn.executescript(SCHEMA)
         self._migrate_goals()
         self._migrate_tasks()
         self._migrate_approvals()
+        self._migrate_intents()
         self._conn.commit()
 
     @_threadsafe
@@ -412,6 +451,24 @@ class SQLiteStorage:
         self._conn.execute(
             "UPDATE tasks SET revision=1 WHERE revision=0"
         )
+
+    @_threadsafe
+    def _migrate_intents(self) -> None:
+        """Add the recovery-linkage column to pre-existing intent journals.
+
+        A settled-with-recovery row must record WHICH recovery record took
+        over the obligation (issue #23 third-pass review: the journal/
+        recovery interface was incomplete without it).
+        """
+        cols = {
+            row[1] for row in self._conn.execute(
+                "PRAGMA table_info(mutation_intents)"
+            ).fetchall()
+        }
+        if "recovery_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE mutation_intents ADD COLUMN recovery_id TEXT"
+            )
 
     @_threadsafe
     def _migrate_approvals(self) -> None:
@@ -1505,6 +1562,139 @@ class SQLiteStorage:
         except Exception:
             self._conn.rollback()
             raise
+
+    # ---- durable mutation-intent journal (issue #23 / F10) ----
+
+    _INTENT_COLS = (
+        "intent_id", "task_id", "step_index", "attempt", "capability",
+        "action", "resource", "status", "outcome", "created_at", "settled_at",
+        "recovery_id",
+    )
+
+    @_threadsafe
+    def record_mutation_intent(self, intent: "MutationIntent") -> "MutationIntent":
+        """Durably journal one replay-unsafe mutation BEFORE dispatch.
+
+        One row per (task_id, step_index) for the lifetime of the step: a
+        duplicate is refused (fail closed) because replay-unsafe work may
+        dispatch at most once - a second journal entry would mean an
+        unsettled dispatch is being replayed blindly.
+        """
+        from arion.state.intents import MutationIntentError
+
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                "SELECT intent_id, status FROM mutation_intents "
+                "WHERE task_id=? AND step_index=?",
+                (intent.task_id, intent.step_index),
+            ).fetchone()
+            if row is not None:
+                self._conn.commit()
+                raise MutationIntentError(
+                    f"mutation intent already journaled for task {intent.task_id} "
+                    f"step {intent.step_index} (refusing duplicate dispatch)"
+                )
+            self._conn.execute(
+                "INSERT INTO mutation_intents "
+                f"({', '.join(self._INTENT_COLS)}) "
+                f"VALUES ({', '.join('?' * len(self._INTENT_COLS))})",
+                (
+                    intent.intent_id, intent.task_id, intent.step_index,
+                    intent.attempt, intent.capability, intent.action,
+                    intent.resource, intent.status, intent.outcome,
+                    intent.created_at, intent.settled_at, intent.recovery_id,
+                ),
+            )
+            self._conn.commit()
+            return intent
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_threadsafe
+    def settle_mutation_intent(
+        self, task_id: str, step_index: int, outcome: str,
+        recovery_id: str | None = None,
+        now: str | None = None,
+    ) -> int:
+        """Close open intent rows for one (task, step) with a durable
+        outcome.  Idempotent: already-settled rows are left untouched.
+        The durable task snapshot stays authoritative; this row state is
+        bookkeeping for open-intent queries.
+
+        Interface closure (issue #23 third-pass review):
+
+        - ``outcome`` MUST be one of ``INTENT_OUTCOMES``; an unknown string
+          fails closed (row left open) instead of silently corrupting the
+          bookkeeping contract;
+        - ``outcome="recovery"`` REQUIRES ``recovery_id`` - the journal can
+          only be closed by a recovery claim backed by the durable recovery
+          record that took over the obligation, and that record's id is
+          stored on the row (no fake recovery settlement).
+        """
+        from arion.state.intents import (
+            INTENT_OUTCOMES,
+            OUTCOME_RECOVERY,
+            MutationIntentError,
+        )
+
+        if outcome not in INTENT_OUTCOMES:
+            raise MutationIntentError(
+                f"invalid mutation-intent outcome {outcome!r} "
+                f"(expected one of {INTENT_OUTCOMES!r}); refusing to settle"
+            )
+        if outcome == OUTCOME_RECOVERY and not recovery_id:
+            raise MutationIntentError(
+                "settling a mutation intent as 'recovery' requires the id "
+                "of the durable recovery record that took over the "
+                "obligation (refusing a fake recovery settlement)"
+            )
+        cursor = self._conn.execute(
+            "UPDATE mutation_intents SET status='settled', outcome=?, "
+            "settled_at=?, recovery_id=? WHERE task_id=? AND step_index=? "
+            "AND status='in_flight'",
+            (outcome, now or utcnow(), recovery_id, task_id, step_index),
+        )
+        self._conn.commit()
+        return cursor.rowcount
+
+    @_threadsafe
+    def get_mutation_intent(
+        self, task_id: str, step_index: int,
+    ) -> "MutationIntent | None":
+        from arion.state.intents import MutationIntent
+
+        row = self._conn.execute(
+            f"SELECT {', '.join(self._INTENT_COLS)} FROM mutation_intents "
+            "WHERE task_id=? AND step_index=?",
+            (task_id, step_index),
+        ).fetchone()
+        if row is None:
+            return None
+        return MutationIntent.from_dict(dict(zip(self._INTENT_COLS, row)))
+
+    @_threadsafe
+    def list_mutation_intents(
+        self, task_id: str | None = None, open_only: bool = False,
+    ) -> list["MutationIntent"]:
+        from arion.state.intents import MutationIntent
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if open_only:
+            clauses.append("status = 'in_flight'")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT {', '.join(self._INTENT_COLS)} FROM mutation_intents {where} "
+            "ORDER BY created_at DESC, rowid DESC",
+            params,
+        ).fetchall()
+        return [MutationIntent.from_dict(dict(zip(self._INTENT_COLS, row)))
+                for row in rows]
 
     # ---- advisory mutation locks (ADR-021) ----
 
