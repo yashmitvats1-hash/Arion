@@ -1,0 +1,44 @@
+# Hash-locked test dependencies for the Arion CI lane (.github/workflows/ci.yml).
+#
+# WHY THIS FILE EXISTS
+#   `pyproject.toml` intentionally states only floors (`pytest>=8.0`), which is
+#   right for humans and wrong for CI: a resolver run can silently pick up a
+#   different pytest (or a newer pluggy that breaks pytest's private API) and
+#   turn the same commit into a pass or a fail. CI therefore installs from this
+#   file with `pip install --require-hashes`, which makes every artifact explicit
+#   and fails closed on any version or hash mismatch.
+#
+# SCOPE
+#   * Platform: Linux, CPython 3.11 ONLY (single-platform lock, no cross-platform
+#     universal lock is claimed).
+#   * Pure-Python wheels only (`*-py3-none-any.whl`), so one hash per
+#     distribution is sufficient and portable across Linux architectures.
+#   * `setuptools` is pinned because the project is installed with
+#     `--no-build-isolation`, which uses this interpreter's setuptools.
+#   * `pip` itself is pinned, so the installer is hash-verified too. Installing
+#     it in the same command as everything else keeps a single verified
+#     dependency set and a single source of truth.
+#   * The project itself is NOT listed: it is installed locally from the
+#     checkout and has no runtime dependencies, so there is no remote artifact
+#     to hash.
+#
+# HOW TO UPDATE
+#   Bump a version, then recompute its hash for BOTH wheel and sdist artifacts:
+#     pip download --no-deps --dest /tmp/w <pkg>==<version>
+#     python -c "import hashlib,glob,sys;[print(p,hashlib.sha256(open(p,'rb').read()).hexdigest()) for p in glob.glob('/tmp/w/*')]"
+#   Re-run the full suite after any bump. Never edit a hash to "make CI pass".
+
+pip==26.3 \
+    --hash=sha256:f3b60b20ffaadd4415ed7957212a38ac63fa4c5fa375bd0f4a797777940fad13
+iniconfig==2.3.1 \
+    --hash=sha256:9121e2c1fdb355232495be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7
+packaging==26.3 \
+    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
+pluggy==1.7.0 \
+    --hash=sha256:7dd7b0d8832ba3cb632c306926ded123429211b83641b35dc5c41ad2d34f9bec
+pygments==2.21.0 \
+    --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9
+pytest==9.2.0 \
+    --hash=sha256:07acdcf88ec174f907dc01af70bf52d49b014bbab03faeeade31c96b18c2e588
+setuptools==84.2.1 \
+    --hash=sha256:ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2
