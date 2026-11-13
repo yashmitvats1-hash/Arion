@@ -2,6 +2,14 @@
 
 - **Amended by ADR-064 (issue #23 F10):** "each task attempts its mutation at most once" is enforced by the in-doubt mutation fence (mutation-intent journal); `append_verified` is size arithmetic, not a duplicate-execution detector.
 
+- **Amended (issue #23 fourth pass):** the mutation-intent journal is a
+  complete-interface unit - durable recording AND reliable open-intent
+  enumeration AND point-read AND settlement.  A recorder without a usable
+  enumerator could hide an in-flight intent after a crash, so dispatch
+  probes enumeration and refuses before any capability runs, and the
+  resume fence fails closed on an absent/raising/malformed enumerator
+  (never "no open intents"; never clearing or settling unreadable rows).
+
 - **Status:** Approved & implemented (2026-08-09)
 - **Deciders:** ChatGPT (architect/manager), Arena AI (engineering agent)
 

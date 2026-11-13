@@ -431,6 +431,42 @@ class ArionEngine:
         })
         return True
 
+    def _fail_task_unreadable_journal(
+        self, task: Task, candidates: list[PlanStep],
+    ) -> None:
+        """Terminalize a task closed when the mutation journal is UNREADABLE.
+
+        Absent/raising/malformed intent enumeration leaves dispatch state
+        UNKNOWN (issue #23 fourth pass).  The task fails with zero further
+        capability invocations; the journal is left completely untouched -
+        an unreadable journal is never interpreted as "no open intents" and
+        its intents are never silently cleared or settled - and no recovery
+        record is created, because an obligation cannot be grounded in
+        evidence we cannot read.  The replay-unsafe steps' outcomes stay
+        unknown (non-terminal), exactly like
+        ``_fail_in_doubt_without_recovery``.
+        """
+        detail = sanitize_error_text(
+            "mutation journal unreadable: cannot verify dispatch state for "
+            f"replay-unsafe step(s) {sorted(c.index for c in candidates)}; "
+            "failing closed - no capability ran, nothing was replayed, and "
+            "the journal was not modified",
+            max_length=500,
+        )
+        for candidate in candidates:
+            candidate.error = candidate.error or detail
+        task.status = TaskStatus.FAILED
+        task.error = detail
+        task.completed_at = task.completed_at or utcnow()
+        try:
+            self.storage.save_task(task)
+        except TaskStateError:
+            canonical = self.storage.load_task(task.id)
+            canonical.status = TaskStatus.FAILED
+            canonical.error = detail
+            canonical.completed_at = canonical.completed_at or utcnow()
+            self.storage.save_task(canonical)
+
     def _record_recovery_required(self, task: Task, step: PlanStep, spec,
                                   reason: str) -> MutationRecovery | None:
         """Durably commit recovery authority and its failed-task mirror.
@@ -685,6 +721,14 @@ class ArionEngine:
         obligation would leave a crash window with NO way to fence the
         uncertain side effect - dispatch is refused before the journal row
         and before the capability runs.
+
+        Journal-interface completeness (issue #23 fourth pass): the storage
+        must expose the COMPLETE journal contract - durable recording AND
+        reliable open-intent enumeration AND point-read AND settlement.  A
+        recorder without an enumerator could take this intent and then hide
+        it after a crash (the resume fence reads the JOURNAL, not the
+        registry), so the journal is probed for readability BEFORE the row
+        is written and long before any capability runs.
         """
         if not self._recovery_mechanism_usable():
             raise MutationIntentError(
@@ -692,11 +736,25 @@ class ArionEngine:
                 "enumerate and acknowledge recovery obligations); "
                 "refusing to dispatch a journaled replay-unsafe mutation"
             )
-        recorder = getattr(self.storage, "record_mutation_intent", None)
-        if not callable(recorder):
+        for name in (
+            "record_mutation_intent",
+            "list_mutation_intents",
+            "get_mutation_intent",
+            "settle_mutation_intent",
+        ):
+            if not callable(getattr(self.storage, name, None)):
+                raise MutationIntentError(
+                    "storage exposes an incomplete mutation-intent journal "
+                    f"interface (missing {name}): refusing to dispatch a "
+                    "journaled replay-unsafe mutation"
+                )
+        if self._journal_open_steps(task) is None:
             raise MutationIntentError(
-                "storage has no durable mutation-intent journal"
+                "mutation-intent journal enumeration is unusable (absent, "
+                "raising, or malformed): refusing to dispatch a journaled "
+                "replay-unsafe mutation"
             )
+        recorder = self.storage.record_mutation_intent
         resource = (
             step.params.get(spec.resource_param)
             if getattr(spec, "resource_param", None) else None
@@ -730,7 +788,63 @@ class ArionEngine:
         except Exception:
             pass
 
-    def _in_doubt_steps(self, task: Task, step: PlanStep | None = None) -> list[PlanStep]:
+    def _journal_open_steps(self, task: Task) -> set[int] | None:
+        """Step indexes with open (in-flight) mutation intents for the task.
+
+        Returns ``None`` when the journal cannot be verified: the enumerator
+        is absent, raises, or returns malformed rows.  ``None`` NEVER means
+        "no open intents" - an unreadable journal is an UNKNOWN, and an
+        unknown fails closed (issue #23 fourth pass): never replay, never
+        silently clear or settle intents one cannot read.
+        """
+        lister = getattr(self.storage, "list_mutation_intents", None)
+        if not callable(lister):
+            return None
+        try:
+            rows = lister(task_id=task.id, open_only=True)
+            if rows is None:
+                return None
+            open_steps: set[int] = set()
+            for row in rows:
+                index = getattr(row, "step_index", None)
+                if isinstance(index, bool) or not isinstance(index, int):
+                    # Malformed row: the enumerator cannot be trusted.
+                    return None
+                open_steps.add(index)
+            return open_steps
+        except Exception:
+            return None
+
+    def _replay_unsafe_unfinished(
+        self, task: Task, step: PlanStep | None = None,
+    ) -> list[PlanStep]:
+        """Replay-unsafe non-terminal steps of the task (or just ``step``)."""
+        candidates = [step] if step is not None else list(task.steps)
+        terminal = (
+            StepStatus.SUCCEEDED, StepStatus.FAILED, StepStatus.SKIPPED
+        )
+        unfinished: list[PlanStep] = []
+        for candidate in candidates:
+            if candidate.status in terminal:
+                continue
+            spec = self.registry.action_spec(
+                candidate.capability, candidate.action
+            )
+            if spec is None:
+                # Unfinished dispatch of an unclassifiable action: replay
+                # safety cannot be proven -> treated as replay-unsafe.
+                unfinished.append(candidate)
+                continue
+            if getattr(spec, "retry_safe", False):
+                continue  # replay after a crash is the declared contract
+            if not is_mutating(spec):
+                continue
+            unfinished.append(candidate)
+        return unfinished
+
+    def _in_doubt_steps(
+        self, task: Task, step: PlanStep | None = None,
+    ) -> list[PlanStep] | None:
         """Return replay-unsafe steps whose mutation intent is unsettled.
 
         An open (in_flight) intent with no durable terminal step outcome
@@ -743,47 +857,23 @@ class ArionEngine:
         (issue #23 F10): an engine that journaled the mutation but has no
         usable recovery mechanism must still detect the in-doubt step and
         fail closed - never replay it because the fence cannot record a
-        recovery obligation.  A missing journal means no mutation was ever
-        dispatched through it (the dispatch path fails closed on a missing
-        journal), so an empty result is safe there.
+        recovery obligation.
+
+        Returns ``None`` when the journal cannot be enumerated (absent,
+        raising, or malformed enumeration) and at least one replay-unsafe
+        step is unfinished (issue #23 fourth pass).  Dispatch state is then
+        UNKNOWN and the caller must fail closed without replaying or
+        settling anything - a recorder without an enumerator can hide an
+        in-flight intent, so a missing/raising/untrusted enumerator is
+        NEVER read as "no open intents".
         """
-        lister = getattr(self.storage, "list_mutation_intents", None)
-        if not callable(lister):
-            return []  # stores without a journal never dispatched one
-        candidates = [step] if step is not None else list(task.steps)
-        terminal = (
-            StepStatus.SUCCEEDED, StepStatus.FAILED, StepStatus.SKIPPED
-        )
-        try:
-            open_rows = lister(task_id=task.id, open_only=True)
-        except Exception:
-            # Fail closed: classify every replay-unsafe non-terminal step as
-            # in doubt when dispatch state cannot be verified.
-            open_rows = None
-        open_steps = (
-            {row.step_index for row in open_rows}
-            if open_rows is not None else None
-        )
-        in_doubt: list[PlanStep] = []
-        for candidate in candidates:
-            if candidate.status in terminal:
-                continue
-            if open_steps is not None and candidate.index not in open_steps:
-                continue
-            spec = self.registry.action_spec(
-                candidate.capability, candidate.action
-            )
-            if spec is None:
-                # Unsettled dispatch of an unclassifiable action: replay
-                # safety cannot be proven -> fence.
-                in_doubt.append(candidate)
-                continue
-            if getattr(spec, "retry_safe", False):
-                continue  # replay after a crash is the declared contract
-            if not is_mutating(spec):
-                continue
-            in_doubt.append(candidate)
-        return in_doubt
+        unfinished = self._replay_unsafe_unfinished(task, step=step)
+        if not unfinished:
+            return []
+        open_steps = self._journal_open_steps(task)
+        if open_steps is None:
+            return None
+        return [c for c in unfinished if c.index in open_steps]
 
     def _fence_task_on_in_doubt_mutation(
         self, task: Task, step: PlanStep | None = None,
@@ -797,12 +887,22 @@ class ArionEngine:
         (ADR-020 semantics).  When NO usable recovery mechanism exists the
         task still fails closed (``_fail_in_doubt_without_recovery``): the
         mutation is never replayed and never marked complete.  Returns True
-        when at least one step fenced.
+        when at least one step fenced.  When the journal itself cannot be
+        enumerated the task fails closed WITHOUT touching it (``None``
+        result from ``_in_doubt_steps``): no capability runs, no intent is
+        cleared or settled, and no recovery record is fabricated from
+        evidence we cannot read (issue #23 fourth pass).
         """
         if task.status in TASK_TERMINAL_STATUSES:
             return False
+        in_doubt = self._in_doubt_steps(task, step=step)
+        if in_doubt is None:
+            self._fail_task_unreadable_journal(
+                task, self._replay_unsafe_unfinished(task, step=step),
+            )
+            return True
         fenced = False
-        for candidate in self._in_doubt_steps(task, step=step):
+        for candidate in in_doubt:
             spec = self.registry.action_spec(
                 candidate.capability, candidate.action
             )
