@@ -228,11 +228,21 @@ def test_thousand_deep_refs_no_recursion_limit(tmp_path, monkeypatch):
     monkeypatch.setattr(git_mod, "_MAX_REF_DEPTH", 2000)
     deep = sb / ".git" / "refs" / "heads"
     deep.mkdir(parents=True, exist_ok=True)
+    chain = []
     for i in range(1000):
         deep = deep / "a"
         deep.mkdir()
+        chain.append(deep)
     (deep / "leaf").write_text("f" * 40 + "\n", encoding="utf-8")
 
-    cap = GitLogCapability(sb)
-    result = cap.execute("branches", {"repo": "."})
-    assert "leaf" in repr(result)
+    try:
+        cap = GitLogCapability(sb)
+        result = cap.execute("branches", {"repo": "."})
+        assert "leaf" in repr(result)
+    finally:
+        # Remove the deep chain iteratively: recursive rmtree of a
+        # 1000-deep tree would itself hit the recursion limit.
+        current = chain[-1] / "leaf"
+        current.unlink(missing_ok=True)
+        for level in reversed(chain):
+            level.rmdir()

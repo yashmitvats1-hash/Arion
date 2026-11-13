@@ -351,3 +351,59 @@ def test_no_rollback_clobber_dest_absent_concurrent_creator(
         p for p in sb.iterdir() if p.name.endswith(".arion-write-tmp")
     ] == []
     monkeypatch.undo()
+
+
+# --------------------------------------------------------------------- #
+# fifth pass item B: platform boundary - no name-based fallback
+# --------------------------------------------------------------------- #
+
+def test_unavailable_proc_fails_closed_before_mutation(tmp_path, monkeypatch):
+    """When /proc/self/fd is unavailable the write capability refuses
+    BEFORE any staging file exists - the name-based fallback (not
+    race-proof against staging substitution) is never offered."""
+    monkeypatch.setattr(dirfs, "IDENTITY_BOUND_PUBLISH", False)
+    sb = _sandbox(tmp_path)
+    cap = FilesystemWriteCapability(sb)
+
+    with pytest.raises(CapabilityError) as excinfo:
+        cap.execute("write", {"path": "target.txt", "content": "X"})
+    assert "identity-bound publication" in str(excinfo.value)
+    assert "NOT" in str(excinfo.value) or "not" in str(excinfo.value)
+
+    # refused before mutation: no destination, no staging residue
+    assert list(sb.iterdir()) == []
+
+
+def test_unavailable_proc_publish_functions_fail_closed(tmp_path, monkeypatch):
+    """The publish primitives themselves fail closed when the descriptor
+    primitive is unavailable - a staging substitution can never be
+    published by name."""
+    monkeypatch.setattr(dirfs, "IDENTITY_BOUND_PUBLISH", False)
+    sb = _sandbox(tmp_path)
+    parent_fd = os.open(sb, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fd = os.open(
+            "stg.arion-write-tmp",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        os.write(fd, b"X")
+        identity = dirfs.file_identity(fd)
+        with pytest.raises(CapabilityError) as excinfo:
+            dirfs.publish_no_overwrite(
+                parent_fd, "stg.arion-write-tmp", "target.txt", identity,
+                staging_fd=fd,
+            )
+        assert "identity-bound publication" in str(excinfo.value)
+        with pytest.raises(CapabilityError):
+            dirfs.publish_replace(
+                parent_fd, "stg.arion-write-tmp", "target.txt", identity,
+                staging_fd=fd,
+            )
+        # nothing was published
+        assert dirfs.name_identity(parent_fd, "target.txt") is None
+        os.close(fd)
+    finally:
+        os.close(parent_fd)
+    monkeypatch.undo()

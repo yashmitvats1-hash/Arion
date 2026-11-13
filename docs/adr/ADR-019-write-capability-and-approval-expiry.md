@@ -15,8 +15,11 @@
   sweeping claims: there is NO fd-based atomic replace primitive
   (`renameat2` lacks `AT_EMPTY_PATH`), so replace is identity-bound, NOT
   race-proof-atomic - the brief no-destination window rolls back/refuses,
-  never clobbers; without `/proc`/held-descriptor support the name-based
-  fallback is NOT race-proof; crash-orphaned staging/trash entries (random
+  never clobbers; without `/proc`/held-descriptor support the capability
+  FAILS CLOSED before any staging file is created - the name-based
+  fallback is not race-proof and is not offered as equivalent
+  (supported-platform contract: identity-bound publication requires
+  Linux `/proc/self/fd`); crash-orphaned staging/trash entries (random
   names, 0600/0644) remain a disk-privacy residual and are deliberately
   never swept - substituted or unowned entries are never unlinked.
 

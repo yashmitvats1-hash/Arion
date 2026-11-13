@@ -124,6 +124,10 @@ class FilesystemWriteCapability:
         rel_parts = dirfs.normalize_rel_parts(rel)
         dirfs.refuse_git_metadata(rel_parts)
         dirfs.require_secure_primitives()
+        # Platform boundary (issue #23 F06 fifth pass): refuse BEFORE any
+        # staging file exists when identity-bound publication is
+        # unavailable - no name-based fallback is offered.
+        dirfs.require_identity_bound_publish()
 
         parent_fd, leaf = dirfs.open_contained_parent(
             self.sandbox_root, rel_parts, create=True,

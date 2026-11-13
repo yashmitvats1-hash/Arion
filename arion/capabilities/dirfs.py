@@ -97,6 +97,34 @@ def _probe_secure_primitives() -> bool:
 
 SECURE_DIR_FD = _probe_secure_primitives()
 
+# Supported-platform contract for identity-bound publication (issue #23
+# F06 fifth pass): the exact pinned inode can only be published through a
+# held descriptor via the /proc/self/fd magic symlink (Linux).  Where that
+# primitive is absent the name-based fallback is NOT race-proof against
+# staging substitution and is NOT offered as equivalent - the mutating
+# capability fails closed instead.  Distinct from fully atomic replace,
+# which NO platform provides (renameat2 lacks AT_EMPTY_PATH).
+IDENTITY_BOUND_PUBLISH = os.path.isdir("/proc/self/fd")
+
+
+def require_identity_bound_publish() -> None:
+    """Fail closed when identity-bound publication is unavailable.
+
+    Mutating filesystem publication is supported ONLY where the exact
+    pinned inode can be published through a held descriptor (Linux
+    ``/proc/self/fd``).  Platforms without it are refused BEFORE any
+    staging file is created - there is no name-based fallback, because a
+    name-based check-then-publish window is not race-proof against a
+    staging substitution and must not be presented as equivalent.
+    """
+    if not IDENTITY_BOUND_PUBLISH:
+        raise CapabilityError(
+            "identity-bound publication requires /proc/self/fd (Linux) to "
+            "publish the exact pinned inode through a held descriptor; "
+            "this platform lacks it and the name-based fallback is NOT "
+            "race-proof against staging substitution - refusing to mutate"
+        )
+
 
 def require_secure_primitives() -> None:
     """Fail closed when the platform lacks the directory-relative primitives.
@@ -437,14 +465,15 @@ def _proc_self_fd_path(fd: int) -> Optional[str]:
 
     ``linkat`` on this magic symlink (with ``follow_symlinks=True``) hard
     links the descriptor's own inode - a staging-NAME substitution cannot
-    redirect it.  Returns None when the platform lacks ``/proc/self/fd``:
-    the name-based fallback there is NOT race-proof (documented).  If the
-    pinned inode has been unlinked the link fails closed (ENOENT), which is
-    exactly the substitution case - publication then yields OUR inode or
-    nothing, never the attacker's entry.
+    redirect it.  Returns None when identity-bound publication is
+    unavailable (``IDENTITY_BOUND_PUBLISH``): publication then FAILS
+    CLOSED - there is no name-based fallback.  If the pinned inode has been
+    unlinked the link also fails closed (ENOENT) - publication yields OUR
+    inode or nothing, never the attacker's entry.
     """
-    link = f"/proc/self/fd/{fd}"
-    return link if os.path.isdir("/proc/self/fd") else None
+    if not IDENTITY_BOUND_PUBLISH:
+        return None
+    return f"/proc/self/fd/{fd}"
 
 
 def publish_no_overwrite(
@@ -469,10 +498,11 @@ def publish_no_overwrite(
     (``/proc/self/fd/N`` magic symlink), so a staging-name substitution in
     the verify/publish window can never redirect publication - the result
     is the exact pinned inode at ``leaf`` or a fail-closed error (the
-    pinned inode was unlinked), NEVER the substituted entry.  Without an
-    open descriptor or without ``/proc`` support the name-based fallback
-    link is used and is NOT race-proof; that residual is documented, not
-    claimed away.
+    pinned inode was unlinked), NEVER the substituted entry.  Supported
+    platform contract (fifth pass): without an open descriptor or without
+    ``/proc`` support publication FAILS CLOSED - there is NO name-based
+    fallback, because it is not race-proof and must not be presented as
+    equivalent.
     """
     require_secure_primitives()
     if not identity_matches(parent_fd, staging, identity):
@@ -481,16 +511,13 @@ def publish_no_overwrite(
             f"(refusing to publish it)"
         )
     src = _proc_self_fd_path(staging_fd) if staging_fd is not None else None
-    if src is not None:
-        os.link(src, leaf, follow_symlinks=True, dst_dir_fd=parent_fd)
-    else:
-        os.link(
-            staging,
-            leaf,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=parent_fd,
-            follow_symlinks=False,
+    if src is None:
+        require_identity_bound_publish()  # raises with the platform contract
+        raise CapabilityError(
+            "identity-bound publication requires an open staging "
+            "descriptor (refusing to publish by name)"
         )
+    os.link(src, leaf, follow_symlinks=True, dst_dir_fd=parent_fd)
 
 
 def publish_replace(
@@ -524,13 +551,14 @@ def publish_replace(
     replace primitive (``renameat2`` lacks ``AT_EMPTY_PATH``), so full
     atomicity of REPLACE is unattainable.  Residuals: (1) the brief window
     where ``leaf`` does not exist between the trash rename and the link -
-    a concurrent same-user creator winning it is rolled back and refused,
-    never clobbered; (2) without ``staging_fd``/``/proc`` the name-based
-    fallback rename is NOT race-proof against a staging-name substitution
-    in the verify/rename window.  Publication is identity-bound, not
-    race-proof-replace; callers must not claim otherwise.  Crash-orphaned
-    staging/trash files (mode 0600/0644 at random names) remain as a
-    disk-privacy residual - they are deliberately never swept.
+    a concurrent same-user creator winning it is rolled back NO-REPLACE
+    and the conflict is reported, never clobbered; (2) supported-platform
+    contract: without ``staging_fd``/``/proc`` the operation FAILS CLOSED
+    - the name-based fallback is not race-proof and is not offered.
+    Publication is identity-bound, not race-proof-replace; callers must not
+    claim otherwise.  Crash-orphaned staging/trash files (mode 0600/0644
+    at random names) remain as a disk-privacy residual - they are
+    deliberately never swept.
     """
     require_secure_primitives()
     if not identity_matches(parent_fd, staging, identity):
@@ -540,8 +568,11 @@ def publish_replace(
         )
     src = _proc_self_fd_path(staging_fd) if staging_fd is not None else None
     if src is None:
-        os.rename(staging, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-        return
+        require_identity_bound_publish()  # raises with the platform contract
+        raise CapabilityError(
+            "identity-bound publication requires an open staging "
+            "descriptor (refusing to publish by name)"
+        )
     prev_identity = name_identity(parent_fd, leaf)
     trash: Optional[str] = None
     if prev_identity is not None:
