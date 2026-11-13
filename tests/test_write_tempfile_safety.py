@@ -184,7 +184,7 @@ def test_staging_collision_skips_occupied_entry(tmp_path, monkeypatch):
     sandbox = _sandbox(tmp_path)
     planted = sandbox / f".report.txt.{'11' * 8}{TEMP_SUFFIX}"
     planted.write_text("OCCUPIED", encoding="utf-8")
-    tokens = [b"\x11" * 8, b"\x22" * 8]
+    tokens = [b"\x11" * 8, b"\x22" * 8, b"\x33" * 8]  # 3rd: cleanup tomb
     monkeypatch.setattr(dirfs.os, "urandom", lambda n: tokens.pop(0))
     cap = _cap(sandbox)
     cap.execute("write", {

@@ -430,21 +430,63 @@ def identity_matches(
 def unlink_if_identity(
     parent_fd: int, name: str, identity: Tuple[int, int],
 ) -> bool:
-    """Unlink ``name`` only while it still is the exact file we created.
+    """Unlink ``name`` only when it is provably the exact created entry.
 
-    Identity-gated cleanup: a name that was swapped or reused since creation
-    is left alone.  ``identity`` must come from a descriptor that is STILL
-    OPEN (see ``file_identity``) - only then can the recorded inode not
-    have been freed and reused by an innocent file in the meantime.  A
-    residual same-user race remains between this check and the unlink
-    itself (no atomic "unlink exactly this inode" exists); the boundary's
-    hard guarantee is containment and no-overwrite publish.  Returns True
-    when the staging file was removed.
+    Attacker model (issue #23 fifth pass - cleanup race): processes able
+    to mutate entries in the target parent directory ARE INSIDE the
+    supported attacker model (consistent with the rest of this boundary).
+    POSIX offers NO inode-conditional unlink, so identity-check-then-unlink
+    is NOT claimed to survive a same-user substitution.  The enforceable
+    design is TAKE + verify + leave-uncertain-untouched:
+
+    1. ``os.rename(name -> fresh unpredictable tomb)`` ATOMICALLY takes
+       whatever entry the name holds - there is no check/use gap between
+       the name and the captured entry;
+    2. the TAKEN entry is verified against the held-descriptor identity
+       (``identity`` must come from a STILL-OPEN descriptor, see
+       ``file_identity`` - only then can the recorded inode not have been
+       freed and reused by an innocent file);
+    3. if it is NOT the created entry (substituted/reused), it is restored
+       to its original name NO-REPLACE (hard link, never rename): if a
+       concurrent creator occupies the name, the entry is preserved under
+       the private tomb name instead - uncertain entries are NEVER
+       unlinked and neither party's data is ever discarded;
+    4. only the created entry is deleted (at the tomb name).
+
+    Documented residual (NOT claimed away): the final unlink in step 4 is
+    name-based; a same-user attacker substituting the unpredictable tomb
+    name in that exact window can have their entry removed.  The window is
+    two syscalls on a name invented after the take; deployments requiring
+    a hard guarantee must isolate the directory (separate uid / 0700
+    ownership - the enforceable ownership assumption).  Returns True when
+    the created entry was removed.
     """
-    if not identity_matches(parent_fd, name, identity):
+    tomb = f".{name}.{os.urandom(8).hex()}.arion-unlink-tmp"
+    try:
+        os.rename(name, tomb, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    except OSError:
+        return False  # absent: nothing to clean
+    if name_identity(parent_fd, tomb) != identity:
+        # Uncertain entry: restore NO-REPLACE; never unlink it here.
+        try:
+            os.link(
+                tomb, name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            pass  # concurrent creator owns `name`; entry preserved at tomb
+        except OSError:
+            pass  # preserved at tomb; never discarded
+        else:
+            try:
+                os.unlink(tomb, dir_fd=parent_fd)
+            except OSError:
+                pass  # both names hold the entry; harmless
         return False
     try:
-        os.unlink(name, dir_fd=parent_fd)
+        os.unlink(tomb, dir_fd=parent_fd)
     except OSError:
         return False
     return True

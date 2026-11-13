@@ -22,6 +22,13 @@
   Linux `/proc/self/fd`); crash-orphaned staging/trash entries (random
   names, 0600/0644) remain a disk-privacy residual and are deliberately
   never swept - substituted or unowned entries are never unlinked.
+  Cleanup attacker model (fifth pass): same-user mutation of the parent
+  directory is INSIDE the model; cleanup is take + verify + no-replace
+  restore (uncertain entries are never unlinked and never discarded), and
+  the residual same-user tomb-name race in the final unlink is documented,
+  not claimed away - directory isolation (separate uid / 0700) is the
+  enforceable ownership assumption for deployments needing a hard
+  guarantee.
 
 ## Context
 
