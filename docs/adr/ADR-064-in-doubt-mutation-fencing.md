@@ -129,9 +129,29 @@ file.  Pinned in `tests/test_recovery_ack_fresh_authorization.py`.
 
 ## Consequences
 
-- The reclaimed replay-unsafe in-doubt mutation executes exactly once after
-  explicit `acknowledge_recovery` instead of being blindly re-executed.
-  This is a MANDATED behavior change (issue #23), documented in PR #25.
+- The reclaimed replay-unsafe in-doubt mutation is dispatched AT MOST ONCE
+  per task/attempt after explicit `acknowledge_recovery` instead of being
+  blindly re-executed (issue #23 fifth pass: NOT "exactly once" external
+  side effects).  What is guaranteed: replay-unsafe dispatch is
+  recovery-gated and never automatically replayed.  What is NOT claimed:
+  acknowledging recovery is not evidence the prior side effect did not
+  happen - the external effect of the interrupted attempt may or may not
+  have landed, and a later FRESH authorized attempt (its own intent, its
+  own approval) may therefore duplicate an effect that already existed.
+  Unresolved cases stay fenced; disposition is only taken when grounded in
+  the product contract and auditable.  This is a MANDATED behavior change
+  (issue #23), documented in PR #25.
+
+- Durability of the F10 evidence (issue #23 fifth pass): the journal and
+  recovery registry are stored in SQLite (WAL, `synchronous=FULL` set
+  explicitly and verified on the connection).  Process crash: WAL replay
+  restores all committed rows.  Power loss: `FULL` fsyncs the WAL per
+  commit, so committed rows survive; with `NORMAL` the latest commits
+  could be lost, which would erase the very in-doubt evidence the fence
+  relies on - the store therefore refuses to open if `FULL` cannot be
+  obtained.  Measured on the reference build (Python 3.11): the effective
+  default was already `synchronous=2` (FULL); the pragma is now set
+  explicitly rather than assumed.
 - Engines configured with an intent journal but no recovery registry can no
   longer dispatch replay-unsafe mutations at all (fail closed, no side
   effect).  Retry-safe work is unaffected.

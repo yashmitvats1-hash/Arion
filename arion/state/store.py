@@ -384,6 +384,28 @@ class SQLiteStorage:
         self._conn = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=10000")
+        # Durability contract (issue #23 fifth pass): the mutation-intent
+        # journal and the recovery registry are the evidence that guards
+        # against duplicate side effects, so committed rows must survive a
+        # POWER LOSS, not only a process crash.  synchronous=FULL (set
+        # EXPLICITLY - do not rely on build/runtime defaults; measured
+        # value on this build was already 2/FULL) makes every committed
+        # transaction fsync the WAL before commit returns:
+        #   - process crash: WAL replay restores ALL committed rows;
+        #   - power loss: WAL replay restores all committed rows (FULL
+        #     syncs the WAL tail per commit; NORMAL would risk losing the
+        #     latest commits).
+        # Verified below by reading the pragma back; if the engine cannot
+        # obtain FULL durability it fails closed - an unverifiable journal
+        # cannot back the F10 recovery invariant.
+        self._conn.execute("PRAGMA synchronous=FULL")
+        effective = self._conn.execute("PRAGMA synchronous").fetchone()[0]
+        if effective != 2:  # 2 == FULL
+            raise RuntimeError(
+                f"SQLite synchronous={effective} (expected 2/FULL): the "
+                "mutation-intent journal requires power-loss durability; "
+                "refusing to open storage"
+            )
         self._conn.executescript(SCHEMA)
         self._migrate_goals()
         self._migrate_tasks()
