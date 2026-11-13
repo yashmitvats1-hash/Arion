@@ -116,12 +116,68 @@ def split_rooted(rel_parts: Sequence[str]) -> None:
     """Reject components that could leave the root when walked by descriptor.
 
     ``.`` is normalized away by PurePosixPath already; ``..`` is not, and
-    opening ``..`` through a held descriptor would escape the root.
+    opening ``..`` through a held descriptor would escape the root.  An
+    absolute component is equally fatal: ``os.open`` treats an absolute
+    name as absolute even with ``dir_fd`` set, silently IGNORING the
+    descriptor anchor (issue #23 F05).
     """
     for part in rel_parts:
         if part in ("", ".", ".."):
             raise CapabilityError(
                 f"invalid path component {part!r}; refusing to traverse"
+            )
+        if part.startswith("/") or os.sep in part or (
+            os.altsep is not None and os.altsep in part
+        ):
+            raise CapabilityError(
+                f"invalid path component {part!r}; absolute or "
+                "separator-bearing components are refused"
+            )
+
+
+def root_identity(root) -> Tuple[int, int]:
+    """Pin the identity of the authorized root directory (issue #23 F05).
+
+    Captured once (capability construction) through a no-follow directory
+    open + fstat.  Every later operation re-opens the root BY NAME and
+    compares against this pinned identity: a root replaced by another
+    directory (rename dance) or redirected through a swapped ancestor
+    resolves to a different inode and is refused, never silently re-anchored.
+    Documented residual boundary: an attacker who can forge mount
+    namespaces / device-inode pairs is outside this threat model; the
+    guarantee is against same-user name substitution, which is the model
+    the rest of the boundary assumes.  Construction must NOT gate on
+    ``require_secure_primitives()`` (capabilities may be constructed on
+    any platform; every OPERATION refuses there instead).
+    """
+    try:
+        fd = os.open(str(root), _DIR_OPEN_FLAGS)
+    except OSError as exc:
+        raise CapabilityError(
+            f"sandbox root {root} is not a secure directory: {exc}"
+        ) from exc
+    try:
+        st = os.fstat(fd)
+        return (st.st_dev, st.st_ino)
+    finally:
+        os.close(fd)
+
+
+def refuse_git_metadata(rel_parts: Sequence[str]) -> None:
+    """Refuse write targets that address Git metadata (issue #23 F05).
+
+    Any path component naming ``.git`` - at any depth - targets repository
+    metadata and is refused for general write/append capabilities.  The
+    read-only Git capability walks ``.git`` descriptor-relatively by
+    design; this guard is only for the mutating general filesystem
+    capabilities.
+    """
+    for part in rel_parts:
+        if part == ".git":
+            raise CapabilityError(
+                f"refusing to write Git metadata (path component {part!r}); "
+                "repository metadata is read-only for general filesystem "
+                "writes"
             )
 
 
@@ -130,6 +186,7 @@ def open_contained_parent(
     rel_parts: Sequence[str],
     *,
     create: bool,
+    root_identity: Optional[Tuple[int, int]] = None,
 ) -> Tuple[int, Optional[str]]:
     """Open the parent directory of ``rel_parts`` under ``root``, no-follow.
 
@@ -139,6 +196,14 @@ def open_contained_parent(
     created (mode 0o755); every created *and* existing component is then
     re-opened with ``O_NOFOLLOW | O_DIRECTORY`` so a symlinked or
     file-substituted component is refused, never followed.
+
+    When ``root_identity`` (pinned at capability construction via
+    ``root_identity()``) is given, the root opened here is fstat-verified
+    against it (issue #23 F05): a root name replaced between operations -
+    or a root path redirected through a swapped ANCESTOR - lands on a
+    different inode and is refused before any traversal.  Residual
+    boundary: a mount-capable attacker forging (st_dev, st_ino) is out of
+    threat model; same-user name substitution is caught.
     """
     require_secure_primitives()
     parts = tuple(rel_parts)
@@ -151,6 +216,13 @@ def open_contained_parent(
         raise CapabilityError(
             f"repository root {root} is not a secure directory: {exc}"
         ) from exc
+    if root_identity is not None:
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != root_identity:
+            os.close(fd)
+            raise CapabilityError(
+                f"sandbox root was replaced (refusing to operate): {root}"
+            )
     try:
         for name in parts[:-1]:
             try:
@@ -201,8 +273,17 @@ def normalize_rel_parts(rel: str) -> tuple[str, ...]:
 
     Collapses harmless in-root ``.``/``a/../b`` segments exactly as
     ``Path.resolve`` normalization used to, then rejects any component that
-    could leave the root when walked by descriptor (``..``, empty).
+    could leave the root when walked by descriptor (``..``, empty).  An
+    ABSOLUTE target is rejected outright (issue #23 F05): it must never be
+    silently reinterpreted as relative - ``os.open`` ignores the ``dir_fd``
+    anchor for absolute names, so an absolute component would escape the
+    root entirely.
     """
+    if os.path.isabs(rel) or PurePosixPath(rel).is_absolute():
+        raise CapabilityError(
+            f"absolute path {rel!r} is refused; targets must be relative "
+            "to the root"
+        )
     normalized = posixpath.normpath(rel)
     parts = tuple(PurePosixPath(normalized).parts)
     split_rooted(parts)

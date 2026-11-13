@@ -69,6 +69,7 @@ class FilesystemAppendCapability:
         self.sandbox_root = Path(sandbox_root).resolve()
         if not self.sandbox_root.is_dir():
             raise CapabilityError(f"sandbox root does not exist: {self.sandbox_root}")
+        self._root_identity = dirfs.root_identity(self.sandbox_root)
         if max_bytes <= 0:
             raise CapabilityError("max_bytes must be positive")
         self.max_bytes = max_bytes
@@ -121,9 +122,11 @@ class FilesystemAppendCapability:
                     f"target does not exist and create was not requested: {rel!r}"
                 )
         rel_parts = dirfs.normalize_rel_parts(rel)
+        dirfs.refuse_git_metadata(rel_parts)
         dirfs.require_secure_primitives()
         parent_fd, leaf = dirfs.open_contained_parent(
             self.sandbox_root, rel_parts, create=create,
+            root_identity=self._root_identity,
         )
         try:
             flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW

@@ -76,6 +76,7 @@ class FilesystemWriteCapability:
         self.sandbox_root = Path(sandbox_root).resolve()
         if not self.sandbox_root.is_dir():
             raise CapabilityError(f"sandbox root does not exist: {self.sandbox_root}")
+        self._root_identity = dirfs.root_identity(self.sandbox_root)
         if max_bytes <= 0:
             raise CapabilityError("max_bytes must be positive")
         self.max_bytes = max_bytes
@@ -121,10 +122,12 @@ class FilesystemWriteCapability:
         # name - it runs through held directory descriptors (``dirfs``).
         target = self._resolve_inside(rel)
         rel_parts = dirfs.normalize_rel_parts(rel)
+        dirfs.refuse_git_metadata(rel_parts)
         dirfs.require_secure_primitives()
 
         parent_fd, leaf = dirfs.open_contained_parent(
             self.sandbox_root, rel_parts, create=True,
+            root_identity=self._root_identity,
         )
         try:
             # Fast path preserving the long-standing error contract.  The

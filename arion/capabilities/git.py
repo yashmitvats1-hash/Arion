@@ -89,6 +89,7 @@ class GitLogCapability:
         self.sandbox_root = Path(sandbox_root).resolve()
         if not self.sandbox_root.is_dir():
             raise CapabilityError(f"sandbox root does not exist: {self.sandbox_root}")
+        self._root_identity = dirfs.root_identity(self.sandbox_root)
 
     # ------------------------------------------------------------------ #
     # containment
@@ -167,6 +168,7 @@ class GitLogCapability:
         try:
             return dirfs.open_contained_parent(
                 self.sandbox_root, full, create=False,
+                root_identity=self._root_identity,
             )
         except CapabilityError as exc:
             return self._map_walk_error(exc, label)
