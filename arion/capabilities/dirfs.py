@@ -163,6 +163,35 @@ def root_identity(root) -> Tuple[int, int]:
         os.close(fd)
 
 
+def has_git_metadata_component(parts: Sequence[str]) -> bool:
+    """True when any path component names Git metadata (exact ``.git``).
+
+    Exact-component match only: ordinary names like ``.gitmodules`` or
+    ``x.git`` are NOT metadata and must stay accessible.
+    """
+    return any(part == ".git" for part in parts)
+
+
+def refuse_git_metadata_access(
+    rel_parts: Sequence[str], *, action: str = "access",
+) -> None:
+    """Refuse generic access to paths addressing Git metadata (F05).
+
+    Any exact ``.git`` component - at any depth, lexical or resolved
+    through a symlink alias - targets repository metadata.  General
+    filesystem capabilities must not read, list, or search it: the
+    dedicated ``git.log`` capability is the narrow read-only metadata
+    interface (descriptor-relative, symlink-refusing).
+    """
+    for part in rel_parts:
+        if part == ".git":
+            raise CapabilityError(
+                f"refusing to {action} Git metadata (path component "
+                f"{part!r}); repository metadata is exposed only through "
+                "the dedicated git.log capability"
+            )
+
+
 def refuse_git_metadata(rel_parts: Sequence[str]) -> None:
     """Refuse write targets that address Git metadata (issue #23 F05).
 
