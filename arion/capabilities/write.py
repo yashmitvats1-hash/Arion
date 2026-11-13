@@ -18,10 +18,17 @@ filesystem.write is the ONLY write path in Arion:
   operation runs through held directory descriptors (``dirfs``) -
   parent components are opened ``O_NOFOLLOW|O_DIRECTORY`` from the root, so
   a component swapped for a symlink after validation is refused, never
-  followed; publish is atomic (``os.link`` - never replaces - for
-  ``overwrite=false``; ``os.rename`` - atomic name replace that never
-  follows symlinks - for ``overwrite=true``), and staging cleanup is
-  identity-gated;
+  followed; publication is IDENTITY-BOUND through the held staging
+  descriptor (``/proc/self/fd`` - the exact pinned inode, never the
+  substituted entry; ``overwrite=false`` never replaces, ``overwrite=true``
+  replaces via trash + descriptor link + no-clobber rollback), staging
+  cleanup is take/verify/restore identity-gated;
+- no-follow leaf semantics (issue #23 fifth pass): publication replaces
+  the leaf ENTRY itself - a leaf symlink is replaced as a NAME and its
+  target is never opened or written; the result's ``canonical_path``
+  reports the lexical entry that changed (the resolved target may be a
+  different file), and resource/approval identity remains the requested
+  relative path;
 - deterministic verification contract: returns the exact byte size so the
   engine can confirm the postcondition without another mutation.
 
@@ -201,6 +208,13 @@ class FilesystemWriteCapability:
         return {
             "written": True,
             "path": str(rel),
-            "canonical_path": str(target),
+            # The entry that actually changed: publication is NO-FOLLOW
+            # and replaces the leaf ENTRY itself (issue #23 fifth pass).
+            # A leaf symlink is replaced as a NAME - its target is never
+            # opened or written - so the resolved path may be a different
+            # file from the one modified; canonical_path therefore reports
+            # the lexical destination, not the resolved target.  Resource
+            # and approval identity remain the requested relative path.
+            "canonical_path": str(self.sandbox_root.joinpath(*rel_parts)),
             "size": len(data),
         }
