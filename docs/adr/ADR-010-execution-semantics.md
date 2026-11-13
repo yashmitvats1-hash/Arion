@@ -1,5 +1,7 @@
 # ADR-010 — Execution semantics (at-least-once, retry safety)
 
+- **Amended by ADR-064 (issue #23 F10):** in-doubt replay-unsafe mutations are never blindly replayed - they fence into explicit recovery; retry-safe replay is unchanged.
+
 - **Status:** Approved (2026-08-09)
 - **Deciders:** ChatGPT (architect/manager), Arena AI (engineering agent)
 

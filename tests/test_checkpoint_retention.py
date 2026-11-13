@@ -284,6 +284,11 @@ def test_retained_latest_snapshot_does_not_replay_completed_mutations(
     first_engine.shutdown()
     first_storage.close()
 
+    # Issue #23 / F10: the crashed step's non-retry-safe mutation is IN
+    # DOUBT (its intent was journaled before dispatch, no outcome was
+    # persisted). Resume must NOT blindly replay it - it fences into
+    # recovery - and the retained snapshot must NOT replay the COMPLETED
+    # mutations either. Nothing executes on this resume.
     resumed_capability = _DurableMutationCapability(log_path)
     resumed_engine, resumed_storage = _engine(
         tmp_path,
@@ -294,12 +299,46 @@ def test_retained_latest_snapshot_does_not_replay_completed_mutations(
     )
     resumed = resumed_engine.run_task(task.id)
 
-    assert resumed.status is TaskStatus.COMPLETED
+    assert resumed.status is TaskStatus.FAILED
+    assert resumed_capability.calls == []
+    assert log_path.read_text(encoding="utf-8").splitlines() == [
+        str(index) for index in range(crash_index)
+    ]
+    from arion.state.recovery import RecoveryStatus
+    recoveries = resumed_engine.recovery_store.list_recoveries(task_id=task.id)
+    assert len(recoveries) == 1
+    assert recoveries[0].status is RecoveryStatus.REQUIRED
+    assert recoveries[0].step_index == crash_index
+
+    # Explicit recovery acknowledgement -> a NEW plan (fresh authorization)
+    # finishes the remaining work exactly once. The log proves the completed
+    # mutations (0..crash_index) were never replayed and the uncertain one
+    # applied exactly once overall.
+    resumed_engine.acknowledge_recovery(recoveries[0].recovery_id, actor="operator")
+
+    class _RemainingPlanner(_ManyStepPlanner):
+        def plan(self, goal_description, task_id, registry, context=None):
+            return [step for step in super().plan(
+                goal_description, task_id, registry, context)
+                if step.index >= crash_index]
+
+    resumed_engine.planner = _RemainingPlanner(
+        count,
+        capability="checkpoint.mutate",
+        action="append",
+        scope="checkpoint:write",
+    )
+    resumed_engine.router = DeterministicRouter(resumed_engine.planner)
+    follow_task = resumed_engine.create_task(goal)
+    resumed_engine.run_task(follow_task.id)
+
     assert resumed_capability.calls == list(range(crash_index, count))
     assert log_path.read_text(encoding="utf-8").splitlines() == [
         str(index) for index in range(count)
     ]
     assert len(resumed_storage.list_checkpoints(task.id)) == DEFAULT_CHECKPOINT_RETENTION
-    assert resumed_engine.recovery_store.list_recoveries() == []
+    assert [r.status for r in resumed_engine.recovery_store.list_recoveries()] == [
+        RecoveryStatus.ACKNOWLEDGED
+    ]
     resumed_engine.shutdown()
     resumed_storage.close()

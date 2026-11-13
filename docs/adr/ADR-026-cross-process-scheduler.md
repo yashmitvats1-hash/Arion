@@ -1,5 +1,7 @@
 # ADR-026 — Cross-Process Shared Scheduler with Lease-Based Worker Ownership
 
+- **Amended by ADR-064 (issue #23 F10):** "completed mutations never replayed" is strengthened - in-doubt (outcome-unknown) replay-unsafe mutations are never blindly replayed either; re-execution only via explicit recovery acknowledgement.
+
 - **Status:** Approved & implemented (2026-08-16)
 - **Deciders:** ChatGPT (architect/manager), Arena AI (engineering agent)
 

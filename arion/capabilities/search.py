@@ -14,10 +14,24 @@ role — so ``PlanValidator._validate_resource`` and the ADR-009 boundary check
 make it effectively MANDATORY for any planned step. That is fail-closed by
 design: an implicit "the whole sandbox" resource is exactly what resource-aware
 authorization exists to prevent. A plan must name the directory it searches.
+
+F05 boundary statement (issue #23 fifth pass): this capability is
+PATH-BASED (``Path.resolve`` containment + check-then-use), NOT
+descriptor-relative under the ``dirfs`` pinned-root/no-follow boundary -
+it does not share the dirfs root-identity/component-substitution
+guarantees (residual same-user window explicitly outside F05).  What IS
+enforced: exact-``.git`` path components are refused as search targets and
+all results whose paths contain a ``.git`` component (lexical or
+resolved-through-symlink) are filtered out - repository metadata is never
+enumerated here; ``.gitmodules`` and ordinary names stay searchable.
 """
 from __future__ import annotations
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
+from arion.capabilities.dirfs import (
+    has_git_metadata_component,
+    refuse_git_metadata_access,
+)
 from arion.capabilities.registry import ActionSpec
 
 
@@ -68,6 +82,16 @@ class FilesystemSearchCapability:
             target.relative_to(self.sandbox_root)
         except ValueError as exc:
             raise ValueError(f"directory outside sandbox: {directory}") from exc
+        # F05: never search Git metadata (lexical or resolved component).
+        try:
+            refuse_git_metadata_access(
+                PurePosixPath(directory or ".").parts, action="search",
+            )
+            refuse_git_metadata_access(
+                target.relative_to(self.sandbox_root).parts, action="search",
+            )
+        except Exception as exc:  # CapabilityError -> ValueError contract
+            raise ValueError(str(exc)) from exc
         if not target.exists() or not target.is_dir():
             raise ValueError(f"directory not found: {directory}")
         results = []
@@ -82,6 +106,13 @@ class FilesystemSearchCapability:
                     rel = p.relative_to(target)
                 except ValueError:
                     rel = p.name
+                # F05: filter any .git component (entry, subtree, alias).
+                if has_git_metadata_component(PurePosixPath(str(rel)).parts):
+                    continue
+                if has_git_metadata_component(
+                    resolved.relative_to(self.sandbox_root).parts
+                ):
+                    continue
                 results.append({"path": str(rel), "absolute": str(resolved)})
             except ValueError:
                 continue
